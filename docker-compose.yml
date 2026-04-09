@@ -6,15 +6,15 @@ services:
     network_mode: "host"
     restart: always
 
-  gps-telematics:
-    build: ./gps-telematics
-    privileged: true # Required for UART/Serial access
-    devices:
-      - "/dev/ttyS0:/dev/ttyS0" # Maps the Pi 3B hardware serial
-    restart: always
+#  gps-telematics:
+#    build: ./gps-telematics
+#    privileged: true # Required for UART/Serial access
+#    devices:
+#      - "/dev/ttyS0:/dev/ttyS0" # Maps the Pi 3B hardware serial
+#    restart: always
 
-  sync-service:
-    build: ./sync-service
-    depends_on:
-      - gps-telematics
-    restart: always
+#  sync-service:
+#    build: ./sync-service
+#    depends_on:
+#      - gps-telematics
+#    restart: always
