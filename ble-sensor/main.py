@@ -32,16 +32,15 @@ async def run():
             }
             
             for d in devices:
-                if "GVH" in d.name:
-                    payload["sensors"].append({
-                        "name": d.name,
-                        "mac_address": d.address,
-                        "rssi": d.rssi,
-                        "metadata": d.metadata
-                    })
+                payload["sensors"].append({
+                    "name": d.name or "Unknown Device",
+                    "mac_address": d.address,
+                    "rssi": d.rssi,
+                    "metadata": d.metadata
+                })
             
             if payload["sensors"]:
-                print(f"Detected {len(payload['sensors'])} sensors. Initiating upload.")
+                print(f"Detected {len(payload['sensors'])} devices. Initiating upload.")
                 await push_to_cloud(session, payload)
             
             await asyncio.sleep(POLL_INTERVAL)
