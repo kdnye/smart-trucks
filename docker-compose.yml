@@ -7,7 +7,9 @@ services:
     restart: always
     labels:
       io.balena.features.dbus: '1'
-    ANONYMIZE_MAC: 'false'
+    environment:
+      - ANONYMIZE_MAC=false
+      - INCLUDE_DEVICE_NAME=true
 
 #  gps-telematics:
 #    build: ./gps-telematics
