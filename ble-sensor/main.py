@@ -3,10 +3,10 @@ import os
 import aiohttp
 from bleak import BleakScanner
 
-# Pull configuration from Balena Environment Variables
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 VEHICLE_ID = os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
+API_KEY = os.getenv("API_KEY", "")
 
 async def push_to_cloud(session, payload):
     if not WEBHOOK_URL:
@@ -14,8 +14,7 @@ async def push_to_cloud(session, payload):
         return
     
     try:
-        # Pass a secret header if routing through your existing GCP webhook function
-        headers = {"X-Api-Key": os.getenv("API_KEY", "")} 
+        headers = {"X-Api-Key": API_KEY} 
         async with session.post(WEBHOOK_URL, json=payload, headers=headers) as response:
             print(f"Payload transmitted. Status: {response.status}")
     except Exception as e:
