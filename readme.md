@@ -69,6 +69,23 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
 
+
+
+### BLE Sensor Service Configuration
+The `ble-sensor` container can run in a privacy-preserving mode by default:
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SCAN_DURATION_SECONDS` | BLE scan window length per cycle. | `15` |
+| `POLL_INTERVAL` | Seconds between each scan/upload cycle. | `60` |
+| `ANONYMIZE_MAC` | Hashes device MAC addresses before upload. | `true` |
+| `MAC_HASH_SALT` | Secret salt used to hash MAC addresses. Set per deployment. | `""` |
+| `INCLUDE_DEVICE_NAME` | Includes BLE local names in payloads when enabled. | `false` |
+| `MAX_DEVICES_PER_SCAN` | Caps payload size in busy RF environments. | `500` |
+| `HTTP_TIMEOUT_SECONDS` | Upload timeout in seconds. | `10` |
+
+> ⚠️ Legal/Privacy note: only collect BLE broadcasts where you have explicit permission and a lawful basis to process device identifiers.
+
 ## Technical Integration Points
 * **Power Management**: Monitors INA219 chip on the UPS HAT via I2C to trigger low-power modes.
 * **Data Optimization**: Uses Balena's binary delta updates to minimize data consumption on limited 2GB monthly cellular plans.
