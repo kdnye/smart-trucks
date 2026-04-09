@@ -5,6 +5,8 @@ services:
     privileged: true # Required for Bluetooth access
     network_mode: "host"
     restart: always
+    labels:
+      io.balena.features.dbus: '1'
 
 #  gps-telematics:
 #    build: ./gps-telematics
