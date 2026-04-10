@@ -392,17 +392,46 @@ def _serialize_metadata(adv_data: Any) -> dict[str, Any]:
 def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> str:
     """
     Enrichment-only tagging:
-    - identify known payload signatures where possible;
-    - otherwise use OUI prefixes as a best-effort manufacturer guess;
+    - identify vendors by Bluetooth SIG Company IDs in manufacturer_data;
+    - fall back to known service UUIDs and payload signatures;
+    - then use OUI prefixes as a best-effort guess for static devices;
     - never drop records based on classification.
     """
-    metadata_text = json.dumps(metadata).upper()
+    mfg_data = metadata.get("manufacturer_data") or {}
+    service_uuids = metadata.get("service_uuids") or []
 
-    if "494E54454C4C49" in metadata_text or "TEMP_F" in metadata_text:
+    # Bleak serialization currently stores company IDs as strings.
+    # We still normalize defensively in case another caller provides ints.
+    mfg_keys = {str(company_id) for company_id in mfg_data.keys()}
+
+    # 1) Bluetooth SIG Company IDs (works even with randomized MAC addresses)
+    if "76" in mfg_keys:
+        return "Apple"
+    if "117" in mfg_keys:
+        return "Samsung"
+    if "6" in mfg_keys:
+        return "Microsoft"
+    if "87" in mfg_keys:
+        return "Garmin"
+
+    # 2) Service UUID hints for background broadcast features
+    normalized_uuids = {str(uuid).lower() for uuid in service_uuids}
+    if "0000fcf1-0000-1000-8000-00805f9b34fb" in normalized_uuids:
+        return "Google / Android"
+    if "0000fe9f-0000-1000-8000-00805f9b34fb" in normalized_uuids:
+        return "Garmin"
+
+    # 3) Payload signature decoding for known sensors
+    mfg_hex_dump = "".join(str(value) for value in mfg_data.values()).upper()
+    if "494E54454C4C49" in mfg_hex_dump:
         return "Govee Temp Sensor"
-    if "0201061AFF4C" in metadata_text:
+
+    metadata_text = json.dumps(metadata).upper()
+    if "TEMP_F" in metadata_text:
+        return "Govee Temp Sensor"
+    if "0201061AFF4C" in mfg_hex_dump:
         return "Apple iBeacon"
-    if "0201060303AAFE" in metadata_text:
+    if "0201060303AAFE" in mfg_hex_dump:
         return "Eddystone Beacon"
 
     oui = mac_address.upper()[:8]
