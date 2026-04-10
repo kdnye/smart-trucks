@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -40,8 +41,22 @@ def load_config() -> Config:
         anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "true"), default=True),
         mac_hash_salt=os.getenv("MAC_HASH_SALT", ""),
         include_name=_to_bool(os.getenv("INCLUDE_DEVICE_NAME", "false"), default=False),
-        max_devices_per_scan=max(1, int(os.getenv("MAX_DEVICES_PER_SCAN", "500"))),
+        max_devices_per_scan=max(0, int(os.getenv("MAX_DEVICES_PER_SCAN", "0"))),
     )
+
+
+# Expanded OUI prefixes for environmental awareness on BLE scans.
+KNOWN_OUIS = {
+    "A4:C1:38": "Govee",
+    "4C:57:CA": "Apple",
+    "04:52:CE": "Apple",
+    "00:11:22": "Sensoro",
+    "CC:7A:00": "Garmin",
+    "00:12:36": "Samsung",
+    "D4:36:39": "Tile",
+    "00:24:E4": "Withings",
+    "00:04:3E": "LG",
+}
 
 
 def _normalize_mac(mac_address: str, config: Config) -> str:
@@ -83,6 +98,26 @@ def _serialize_metadata(adv_data: Any) -> dict[str, Any]:
     }
 
 
+def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> str:
+    """
+    Enrichment-only tagging:
+    - identify known payload signatures where possible;
+    - otherwise use OUI prefixes as a best-effort manufacturer guess;
+    - never drop records based on classification.
+    """
+    metadata_text = json.dumps(metadata).upper()
+
+    if "494E54454C4C49" in metadata_text or "TEMP_F" in metadata_text:
+        return "Govee Temp Sensor"
+    if "0201061AFF4C" in metadata_text:
+        return "Apple iBeacon"
+    if "0201060303AAFE" in metadata_text:
+        return "Eddystone Beacon"
+
+    oui = mac_address.upper()[:8]
+    return KNOWN_OUIS.get(oui, "Unknown")
+
+
 async def push_to_cloud(
     session: aiohttp.ClientSession, payload: dict[str, Any], config: Config
 ) -> None:
@@ -119,13 +154,17 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
     sensors: list[dict[str, Any]] = []
     for _, (device, adv_data) in devices.items():
-        if len(sensors) >= config.max_devices_per_scan:
+        if config.max_devices_per_scan and len(sensors) >= config.max_devices_per_scan:
             break
+
+        metadata = _serialize_metadata(adv_data)
 
         sensor_payload = {
             "device_id": _normalize_mac(device.address, config),
+            "mac_address": device.address,
             "rssi": adv_data.rssi,
-            "metadata": _serialize_metadata(adv_data),
+            "metadata": metadata,
+            "device_type": _device_type_from_metadata(device.address, metadata),
         }
 
         if config.include_name:
