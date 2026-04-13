@@ -20,17 +20,24 @@ class Config:
     webhook_url: str | None
     api_key: str
     sync_interval_seconds: int
-    gps_serial_device: str
+    gps_serial_candidates: tuple[str, ...]
     gps_baud_rate: int
 
 
 def load_config() -> Config:
+    serial_candidates = tuple(
+        candidate.strip()
+        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyAMA0,/dev/ttyS0").split(",")
+        if candidate.strip()
+    )
+    primary_device = os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0")
+    serial_devices: tuple[str, ...] = tuple(dict.fromkeys((primary_device, *serial_candidates)))
     return Config(
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         webhook_url=os.getenv("WEBHOOK_URL"),
         api_key=os.getenv("API_KEY", ""),
         sync_interval_seconds=max(5, int(os.getenv("POLL_INTERVAL", "60"))),
-        gps_serial_device=os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0"),
+        gps_serial_candidates=serial_devices,
         gps_baud_rate=max(1200, int(os.getenv("GPS_BAUD_RATE", "9600"))),
     )
 
@@ -90,34 +97,36 @@ class ImuMonitor:
         return payload
 
 
-def get_latest_gps(serial_device: str, baud_rate: int) -> dict[str, Any]:
-    try:
-        with serial.Serial(serial_device, baud_rate, timeout=2.0) as ser:
-            for _ in range(20):
-                line = ser.readline().decode("ascii", errors="replace").strip()
-                if not line.startswith(("$GPRMC", "$GPGGA", "$GNRMC", "$GNGGA")):
-                    continue
+def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str, Any]:
+    for serial_device in serial_devices:
+        try:
+            with serial.Serial(serial_device, baud_rate, timeout=2.0) as ser:
+                for _ in range(20):
+                    line = ser.readline().decode("ascii", errors="replace").strip()
+                    if not line.startswith(("$GPRMC", "$GPGGA", "$GNRMC", "$GNGGA")):
+                        continue
 
-                try:
-                    msg = pynmea2.parse(line)
-                except pynmea2.ParseError:
-                    continue
+                    try:
+                        msg = pynmea2.parse(line)
+                    except pynmea2.ParseError:
+                        continue
 
-                latitude = getattr(msg, "latitude", 0.0)
-                longitude = getattr(msg, "longitude", 0.0)
-                if not latitude and not longitude:
-                    continue
+                    latitude = getattr(msg, "latitude", 0.0)
+                    longitude = getattr(msg, "longitude", 0.0)
+                    if not latitude and not longitude:
+                        continue
 
-                return {
-                    "fix_status": "locked",
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "altitude_m": getattr(msg, "altitude", None),
-                    "speed_knots": getattr(msg, "spd_over_grnd", None),
-                    "gps_timestamp": str(getattr(msg, "timestamp", "")) or None,
-                }
-    except Exception as exc:
-        print(f"GPS serial error on {serial_device}: {exc}")
+                    return {
+                        "fix_status": "locked",
+                        "device": serial_device,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "altitude_m": getattr(msg, "altitude", None),
+                        "speed_knots": getattr(msg, "spd_over_grnd", None),
+                        "gps_timestamp": str(getattr(msg, "timestamp", "")) or None,
+                    }
+        except Exception as exc:
+            print(f"GPS serial error on {serial_device}: {exc}")
 
     return {"fix_status": "searching"}
 
@@ -157,7 +166,10 @@ async def run() -> None:
                 "uptime_seconds": int(time.monotonic()),
                 "power_metrics": power.read(),
                 "imu_metrics": imu.read(),
-                "location": get_latest_gps(config.gps_serial_device, config.gps_baud_rate),
+                "location": get_latest_gps(
+                    config.gps_serial_candidates,
+                    config.gps_baud_rate,
+                ),
             }
 
             print(
