@@ -2,7 +2,7 @@ version: '2.1'
 services:
   ble-sensor:
     build: ./ble-sensor
-    privileged: true # Required for Bluetooth access
+    privileged: true
     network_mode: "host"
     restart: always
     labels:
@@ -10,16 +10,18 @@ services:
     environment:
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - VEHICLE_ID=${VEHICLE_ID}
+      - API_KEY=${API_KEY}
 
-#  gps-telematics:
-#    build: ./gps-telematics
-#    privileged: true # Required for UART/Serial access
-#    devices:
-#      - "/dev/ttyS0:/dev/ttyS0" # Maps the Pi 3B hardware serial
-#    restart: always
-
-#  sync-service:
-#    build: ./sync-service
-#    depends_on:
-#      - gps-telematics
-#    restart: always
+  telematics-edge:
+    build: ./telematics-edge
+    privileged: true
+    restart: always
+    devices:
+      - "/dev/serial0:/dev/serial0"
+      - "/dev/i2c-1:/dev/i2c-1"
+    environment:
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - VEHICLE_ID=${VEHICLE_ID}
+      - API_KEY=${API_KEY}

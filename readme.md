@@ -7,11 +7,10 @@ This repository contains the containerized telematics stack for independent GPS,
 The system provides a forward-thinking solution for cold-chain logistics, ensuring data integrity across intermittent Wi-Fi connections and power-conscious operation.
 
 ## Architecture Overview
-The stack is structured into three decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization:
+The stack is structured into decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization:
 
 * **`ble-sensor`**: Scans for Govee BLE advertisements. Extracts temperature, humidity, and battery health.
-* **`gps-telematics`**: Interchanges with the BerryGPS-IMU V4 via UART. Processes NMEA sentences and evaluates geofencing logic.
-* **`sync-service`**: Manages the data queue. Synchronizes logs with the cloud dashboard via webhooks when connectivity is available.
+* **`telematics-edge`**: Reads BerryGPS UART data, BerryIMU metrics via I2C, and Solar UPS HAT power telemetry, then syncs unified payloads to the cloud.
 
 ## Project Structure
 ```text
@@ -21,13 +20,9 @@ telematics-fleet/
 │   ├── Dockerfile
 │   ├── main.py
 │   └── requirements.txt
-├── gps-telematics/
-│   ├── Dockerfile
-│   ├── process_data.py
-│   └── requirements.txt
-└── sync-service/
+└── telematics-edge/
     ├── Dockerfile
-    ├── sync.py
+    ├── main.py
     └── requirements.txt
 ```
 
@@ -56,8 +51,8 @@ balena push <fleet-name>
 
 ### 3. Device Configuration
 Set the following variables in the **Balena Dashboard > Device Configuration** to enable hardware interfaces:
-* `RESIN_HOST_CONFIG_dtparam`: `"i2c_arm=on","spi=on"`
-* `RESIN_HOST_CONFIG_enable_uart`: `1`
+* `BALENA_HOST_CONFIG_dtparam`: `"i2c_arm=on","spi=on"`
+* `BALENA_HOST_CONFIG_enable_uart`: `1`
 
 ## Fleet Variables
 Use **Environment Variables** in Balena to manage unique truck settings without code changes:
