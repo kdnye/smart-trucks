@@ -2,6 +2,7 @@ version: '2.1'
 services:
   ble-sensor:
     build: ./ble-sensor
+    image: smart-truck/ble-sensor:latest
     privileged: true
     network_mode: "host"
     restart: always
@@ -16,6 +17,7 @@ services:
 
   telematics-edge:
     build: ./telematics-edge
+    image: smart-truck/telematics-edge:latest
     privileged: true
     restart: always
     devices:
