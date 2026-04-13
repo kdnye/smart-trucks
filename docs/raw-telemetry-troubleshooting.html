@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Truck - Raw Telemetry Troubleshooting</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ok: #23a55a;
+        --warn: #d29922;
+        --err: #da3633;
+      }
+      body {
+        font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        margin: 0;
+        padding: 1.25rem;
+      }
+      .container {
+        max-width: 1200px;
+        margin: 0 auto;
+        display: grid;
+        gap: 1rem;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+        gap: 1rem;
+      }
+      .card {
+        border: 1px solid #8884;
+        border-radius: 0.75rem;
+        padding: 0.85rem;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        font-size: 0.85rem;
+        font-weight: 700;
+      }
+      .dot {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 99px;
+      }
+      .ok { background: var(--ok); }
+      .warn { background: var(--warn); }
+      .err { background: var(--err); }
+      pre {
+        overflow: auto;
+        max-height: 340px;
+        background: #00000012;
+        border-radius: 0.5rem;
+        padding: 0.75rem;
+        font-size: 0.8rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.85rem;
+      }
+      th, td {
+        border-bottom: 1px solid #9994;
+        text-align: left;
+        padding: 0.4rem;
+      }
+      button {
+        cursor: pointer;
+        border-radius: 0.5rem;
+        border: 1px solid #8887;
+        padding: 0.45rem 0.65rem;
+        background: transparent;
+      }
+      .actions {
+        display: flex;
+        gap: 0.5rem;
+      }
+      .muted { opacity: 0.8; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Raw Telemetry Troubleshooting</h1>
+        <p class="muted">Use this page to inspect exact edge payloads from GPS, IMU, and BLE scans.</p>
+      </header>
+
+      <section class="grid">
+        <article class="card">
+          <h2>Heartbeat Status</h2>
+          <p><span id="gps-status" class="status"><span class="dot warn"></span>GPS: unknown</span></p>
+          <p><span id="imu-status" class="status"><span class="dot warn"></span>IMU: unknown</span></p>
+          <p><span id="power-status" class="status"><span class="dot warn"></span>Power: unknown</span></p>
+          <div class="actions">
+            <button id="copy-heartbeat">Copy Heartbeat JSON</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <h2>BLE Scan Status</h2>
+          <p id="ble-summary" class="muted">No scan loaded.</p>
+          <div class="actions">
+            <button id="copy-ble">Copy BLE JSON</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h3>Heartbeat Payload</h3>
+          <pre id="heartbeat-json"></pre>
+        </article>
+        <article class="card">
+          <h3>BLE Payload</h3>
+          <pre id="ble-json"></pre>
+        </article>
+      </section>
+
+      <section class="card">
+        <h3>BLE Devices (latest scan)</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>device_id</th>
+              <th>mac_address</th>
+              <th>rssi</th>
+              <th>device_type</th>
+              <th>tx_power</th>
+            </tr>
+          </thead>
+          <tbody id="ble-table-body"></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script>
+      const sampleHeartbeat = {
+        event_type: "edge_telematics_heartbeat",
+        vehicle_id: "TRK-905",
+        timestamp_utc: new Date().toISOString(),
+        uptime_seconds: 10542,
+        power_metrics: { status: "ok", voltage_v: 4.122, current_ma: 146.31, power_mw: 603.2, is_charging: true },
+        imu_metrics: {
+          status: "ok",
+          timestamp: new Date().toISOString(),
+          accel_x: 0.032,
+          accel_y: 0.388,
+          accel_z: 0.972,
+          magnitude_2d: 0.389,
+          is_harsh_event: false
+        },
+        location: {
+          fix_status: "locked",
+          device: "/dev/serial0",
+          latitude: 33.749,
+          longitude: -84.388,
+          altitude_m: 320.2,
+          speed_knots: 21.2,
+          gps_timestamp: "12:31:45"
+        }
+      };
+
+      const sampleBle = {
+        vehicle_id: "TRK-905",
+        event_type: "ble_sensor_scan",
+        scan_duration_seconds: 15,
+        sensor_count: 2,
+        sensors: [
+          {
+            device_id: "a12ec3420b4dd7f0a711",
+            mac_address: "E4:5F:01:AA:BB:CC",
+            rssi: -62,
+            device_type: "Raspberry Pi Trading Ltd",
+            metadata: { manufacturer_data: { "76": "0201061AFF4C" }, service_uuids: [], service_data: {}, tx_power: -7 }
+          },
+          {
+            device_id: "c4de1065c9d0afedaa4e",
+            mac_address: "A4:C1:38:10:20:30",
+            rssi: -71,
+            device_type: "Govee",
+            metadata: { manufacturer_data: { "348": "00112233" }, service_uuids: ["0000fe9f-0000-1000-8000-00805f9b34fb"], service_data: {}, tx_power: null }
+          }
+        ]
+      };
+
+      function statusClassFromValue(value) {
+        if (["ok", "locked"].includes(String(value).toLowerCase())) return "ok";
+        if (["searching", "initializing"].includes(String(value).toLowerCase())) return "warn";
+        return "err";
+      }
+
+      function setStatus(el, label, value) {
+        const cls = statusClassFromValue(value);
+        el.innerHTML = `<span class="dot ${cls}"></span>${label}: ${value}`;
+      }
+
+      function render() {
+        const heartbeatJsonEl = document.getElementById("heartbeat-json");
+        const bleJsonEl = document.getElementById("ble-json");
+        heartbeatJsonEl.textContent = JSON.stringify(sampleHeartbeat, null, 2);
+        bleJsonEl.textContent = JSON.stringify(sampleBle, null, 2);
+
+        setStatus(document.getElementById("gps-status"), "GPS", sampleHeartbeat.location.fix_status || "unknown");
+        setStatus(document.getElementById("imu-status"), "IMU", sampleHeartbeat.imu_metrics.status || "unknown");
+        setStatus(document.getElementById("power-status"), "Power", sampleHeartbeat.power_metrics.status || "unknown");
+
+        document.getElementById("ble-summary").textContent =
+          `${sampleBle.sensor_count} devices in ${sampleBle.scan_duration_seconds}s.`;
+
+        const tableBody = document.getElementById("ble-table-body");
+        tableBody.innerHTML = "";
+        for (const sensor of sampleBle.sensors) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${sensor.device_id}</td>
+            <td>${sensor.mac_address}</td>
+            <td>${sensor.rssi}</td>
+            <td>${sensor.device_type}</td>
+            <td>${sensor.metadata?.tx_power ?? "-"}</td>
+          `;
+          tableBody.appendChild(tr);
+        }
+      }
+
+      async function copyText(value) {
+        try {
+          await navigator.clipboard.writeText(value);
+          alert("Copied to clipboard");
+        } catch {
+          alert("Clipboard permission denied");
+        }
+      }
+
+      document.getElementById("copy-heartbeat").addEventListener("click", () => {
+        copyText(JSON.stringify(sampleHeartbeat, null, 2));
+      });
+
+      document.getElementById("copy-ble").addEventListener("click", () => {
+        copyText(JSON.stringify(sampleBle, null, 2));
+      });
+
+      render();
+    </script>
+  </body>
+</html>
