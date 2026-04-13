@@ -23,7 +23,7 @@ services:
     privileged: true
     restart: always
     devices:
-      - "/dev/serial0:/dev/serial0"
+      - "/dev/ttyS0:/dev/ttyS0"
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
       - telematics-data:/data

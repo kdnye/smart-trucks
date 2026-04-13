@@ -28,7 +28,7 @@ def load_config() -> Config:
         webhook_url=os.getenv("WEBHOOK_URL"),
         api_key=os.getenv("API_KEY", ""),
         sync_interval_seconds=max(5, int(os.getenv("POLL_INTERVAL", "60"))),
-        gps_serial_device=os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0"),
+        gps_serial_device=os.getenv("GPS_SERIAL_DEVICE", "/dev/ttyS0"),
         gps_baud_rate=max(1200, int(os.getenv("GPS_BAUD_RATE", "9600"))),
     )
 
