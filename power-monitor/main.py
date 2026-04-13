@@ -21,24 +21,64 @@ class Config:
     ina219_shunt_ohms: float
 
 
+def _sanitize_env_value(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    if value.startswith("${") and value.endswith("}"):
+        body = value[2:-1]
+        if ":-" in body:
+            _, fallback = body.split(":-", 1)
+            fallback_value = fallback.strip()
+            return fallback_value or None
+        return None
+
+    return value
+
+
 def _read_int_env(name: str, default: int, *, minimum: int | None = None) -> int:
     raw_value = os.getenv(name)
-    if raw_value is None:
+    value = _sanitize_env_value(raw_value)
+    if value is None:
         parsed = default
     else:
-        value = raw_value.strip()
-        if not value or (value.startswith("${") and value.endswith("}")):
+        try:
+            parsed = int(value)
+        except ValueError:
+            print(f"Warning: invalid {name}={raw_value!r}; using default {default}.")
             parsed = default
-        else:
-            try:
-                parsed = int(value)
-            except ValueError:
-                print(f"Warning: invalid {name}={raw_value!r}; using default {default}.")
-                parsed = default
 
     if minimum is not None:
         return max(minimum, parsed)
     return parsed
+
+
+def _read_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    value = _sanitize_env_value(raw_value)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Warning: invalid {name}={raw_value!r}; using default {default}.")
+        return default
+
+
+def _read_hex_address_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    value = _sanitize_env_value(raw_value)
+    if value is None:
+        return default
+    try:
+        return int(value, 16)
+    except ValueError:
+        print(f"Warning: invalid {name}={raw_value!r}; using default 0x{default:02X}.")
+        return default
 
 
 def load_config() -> Config:
@@ -48,8 +88,8 @@ def load_config() -> Config:
         webhook_url=os.getenv("WEBHOOK_URL"),
         api_key=os.getenv("API_KEY", ""),
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 10, minimum=5),
-        ina219_address=int(os.getenv("UPS_I2C_ADDRESS", "0x43"), 16),
-        ina219_shunt_ohms=float(os.getenv("UPS_SHUNT_OHMS", "0.1")),
+        ina219_address=_read_hex_address_env("UPS_I2C_ADDRESS", 0x43),
+        ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.1),
     )
 
 
