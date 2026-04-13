@@ -9,7 +9,8 @@ import aiohttp
 import pynmea2
 import serial
 from ina219 import INA219, DeviceRangeError
-from smbus2 import SMBus
+
+from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 
 
 @dataclass(frozen=True)
@@ -67,54 +68,25 @@ class PowerMonitor:
 
 
 class ImuMonitor:
-    """Minimal Berry IMU probe/read on I2C bus 1.
+    def __init__(self) -> None:
+        self._reader = IMUReader()
+        self._latest_snapshot: dict[str, Any] = {"status": "initializing"}
+        self._latest_harsh_event: dict[str, Any] | None = None
 
-    This attempts to read the accelerometer from common BerryIMU v4 layouts where the
-    accelerometer/gyro is exposed via LSM6DSL-compatible registers on address 0x6A.
-    If unavailable, telemetry reports IMU as offline without crashing the service.
-    """
+    async def start(self) -> None:
+        async def on_snapshot(snapshot: ImuSnapshot) -> None:
+            self._latest_snapshot = {"status": "ok", **snapshot_as_dict(snapshot)}
 
-    _ADDR = 0x6A
-    _WHO_AM_I = 0x0F
-    _CTRL1_XL = 0x10
-    _OUTX_L_XL = 0x28
+        async def on_harsh_event(snapshot: ImuSnapshot) -> None:
+            self._latest_harsh_event = snapshot_as_dict(snapshot)
 
-    def __init__(self, bus_id: int = 1) -> None:
-        self._bus_id = bus_id
-        self._active = False
-        try:
-            with SMBus(self._bus_id) as bus:
-                whoami = bus.read_byte_data(self._ADDR, self._WHO_AM_I)
-                # Accept common ST responses seen on this register family.
-                if whoami in {0x6A, 0x6C}:
-                    # 104 Hz, ±2g
-                    bus.write_byte_data(self._ADDR, self._CTRL1_XL, 0x40)
-                    self._active = True
-                    print(f"IMU initialized on I2C 0x{self._ADDR:02X} (WHO_AM_I=0x{whoami:02X}).")
-                else:
-                    print(f"Warning: unexpected IMU WHO_AM_I value 0x{whoami:02X}; IMU disabled.")
-        except Exception as exc:
-            print(f"Warning: IMU init failed on I2C bus {self._bus_id}: {exc}")
+        await self._reader.read_loop(on_snapshot, on_harsh_event)
 
     def read(self) -> dict[str, Any]:
-        if not self._active:
-            return {"status": "offline"}
-        try:
-            with SMBus(self._bus_id) as bus:
-                data = bus.read_i2c_block_data(self._ADDR, self._OUTX_L_XL, 6)
-
-            def to_int16(lo: int, hi: int) -> int:
-                value = (hi << 8) | lo
-                return value - 65536 if value > 32767 else value
-
-            # ±2g => 0.061 mg/LSB per datasheet
-            scale_g_per_lsb = 0.000061
-            ax = round(to_int16(data[0], data[1]) * scale_g_per_lsb, 4)
-            ay = round(to_int16(data[2], data[3]) * scale_g_per_lsb, 4)
-            az = round(to_int16(data[4], data[5]) * scale_g_per_lsb, 4)
-            return {"status": "ok", "accel_g": {"x": ax, "y": ay, "z": az}}
-        except Exception as exc:
-            return {"status": "read_error", "message": str(exc)}
+        payload = dict(self._latest_snapshot)
+        if self._latest_harsh_event:
+            payload["latest_harsh_event"] = self._latest_harsh_event
+        return payload
 
 
 def get_latest_gps(serial_device: str, baud_rate: int) -> dict[str, Any]:
@@ -169,6 +141,7 @@ async def run() -> None:
     config = load_config()
     power = PowerMonitor()
     imu = ImuMonitor()
+    asyncio.create_task(imu.start())
 
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
 
