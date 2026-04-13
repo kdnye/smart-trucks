@@ -8,6 +8,8 @@ services:
     restart: always
     labels:
       io.balena.features.dbus: '1'
+    volumes:
+      - telematics-data:/data
     environment:
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true
@@ -23,7 +25,29 @@ services:
     devices:
       - "/dev/serial0:/dev/serial0"
       - "/dev/i2c-1:/dev/i2c-1"
+    volumes:
+      - telematics-data:/data
     environment:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+
+
+  power-monitor:
+    build: ./power-monitor
+    image: smart-truck/power-monitor:latest
+    privileged: true
+    restart: always
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"
+    volumes:
+      - telematics-data:/data
+    environment:
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - VEHICLE_ID=${VEHICLE_ID}
+      - API_KEY=${API_KEY}
+      - POWER_SAMPLE_INTERVAL_SECONDS=${POWER_SAMPLE_INTERVAL_SECONDS:-10}
+      - UPS_I2C_ADDRESS=${UPS_I2C_ADDRESS:-0x43}
+
+volumes:
+  telematics-data:

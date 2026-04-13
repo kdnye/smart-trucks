@@ -10,7 +10,8 @@ The system provides a forward-thinking solution for cold-chain logistics, ensuri
 The stack is structured into decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization:
 
 * **`ble-sensor`**: Scans for Govee BLE advertisements. Extracts temperature, humidity, and battery health.
-* **`telematics-edge`**: Reads BerryGPS UART data, BerryIMU metrics via I2C, and Solar UPS HAT power telemetry, then syncs unified payloads to the cloud.
+* **`telematics-edge`**: Reads BerryGPS UART data and BerryIMU metrics via I2C, then syncs unified payloads to the cloud.
+* **`power-monitor`**: Dedicated UPS HAT (B) telemetry service that reads INA219 battery metrics via I2C, persists snapshots locally, and optionally syncs power events upstream.
 
 ## Project Structure
 ```text
@@ -20,7 +21,11 @@ telematics-fleet/
 │   ├── Dockerfile
 │   ├── main.py
 │   └── requirements.txt
-└── telematics-edge/
+├── telematics-edge/
+│   ├── Dockerfile
+│   ├── main.py
+│   └── requirements.txt
+└── power-monitor/
     ├── Dockerfile
     ├── main.py
     └── requirements.txt
@@ -63,6 +68,8 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `WEBHOOK_URL` | Endpoint for Motive Dashboard sync | `https://api.yourdomain.com/telematics` |
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
+| `UPS_I2C_ADDRESS` | I2C address for UPS INA219 monitor. | `0x43` |
+| `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `10` |
 
 
 
