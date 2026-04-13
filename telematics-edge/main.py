@@ -10,6 +10,7 @@ import pynmea2
 import serial
 from ina219 import INA219, DeviceRangeError
 
+from db import init_db, insert_event
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 
 
@@ -143,6 +144,7 @@ async def run() -> None:
     imu = ImuMonitor()
     asyncio.create_task(imu.start())
 
+    await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
 
     timeout = aiohttp.ClientTimeout(total=10)
@@ -165,6 +167,7 @@ async def run() -> None:
                     imu=payload["imu_metrics"].get("status"),
                 )
             )
+            await insert_event(config.vehicle_id, "edge_telematics_heartbeat", payload)
             await push_telemetry(session, config, payload)
             await asyncio.sleep(config.sync_interval_seconds)
 
