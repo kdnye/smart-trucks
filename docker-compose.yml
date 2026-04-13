@@ -16,6 +16,8 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+      - SCAN_DURATION_SECONDS=30
+      - POLL_INTERVAL=35
 
   telematics-edge:
     build: ./telematics-edge
