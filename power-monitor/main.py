@@ -21,13 +21,33 @@ class Config:
     ina219_shunt_ohms: float
 
 
+def _read_int_env(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        parsed = default
+    else:
+        value = raw_value.strip()
+        if not value or (value.startswith("${") and value.endswith("}")):
+            parsed = default
+        else:
+            try:
+                parsed = int(value)
+            except ValueError:
+                print(f"Warning: invalid {name}={raw_value!r}; using default {default}.")
+                parsed = default
+
+    if minimum is not None:
+        return max(minimum, parsed)
+    return parsed
+
+
 def load_config() -> Config:
     return Config(
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
         webhook_url=os.getenv("WEBHOOK_URL"),
         api_key=os.getenv("API_KEY", ""),
-        sample_interval_seconds=max(5, int(os.getenv("POWER_SAMPLE_INTERVAL_SECONDS", "10"))),
+        sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 10, minimum=5),
         ina219_address=int(os.getenv("UPS_I2C_ADDRESS", "0x43"), 16),
         ina219_shunt_ohms=float(os.getenv("UPS_SHUNT_OHMS", "0.1")),
     )
