@@ -1,5 +1,4 @@
 pyserial==3.5
 pynmea2==1.19.0
 aiohttp==3.9.3
-ina219==0.6.0
-smbus2==0.4.3
+pi-ina219
