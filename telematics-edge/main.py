@@ -242,7 +242,14 @@ async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
             "gps_timestamp": reading.timestamp.isoformat() if reading.timestamp else None,
         }
 
-    await reader.read_loop(on_reading)
+    while True:
+        try:
+            await reader.read_loop(on_reading)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"GPS read_loop exited unexpectedly: {exc}. Restarting in 5 seconds.")
+        await asyncio.sleep(5)
 
 
 async def post_payload(
