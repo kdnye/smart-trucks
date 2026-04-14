@@ -8,7 +8,6 @@ from typing import Awaitable, Callable, Optional
 
 import pynmea2
 import serial
-from shared.hardware_probe import edge_hardware_lock
 
 logger = logging.getLogger(__name__)
 
@@ -114,11 +113,7 @@ class NMEAReader:
                     data_received = False
                     while not stop_event.is_set():
                         try:
-                            if conn.in_waiting <= 0:
-                                time.sleep(0.05)
-                                continue
-                            with edge_hardware_lock(timeout_sec=0.5):
-                                line = conn.readline()
+                            line = conn.readline()
                         except serial.SerialException as exc:
                             if "returned no data" in str(exc).lower():
                                 empty_read_streak = min(empty_read_streak + 1, 3)
