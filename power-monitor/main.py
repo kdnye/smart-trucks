@@ -28,6 +28,23 @@ from shared.hardware_probe import (
 UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health")
 
 
+def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
+    """Executes a hardware-locked combined I2C transaction."""
+    retries = 3
+    for attempt in range(retries):
+        try:
+            with SMBus(bus_num) as bus:
+                write_msg = i2c_msg.write(address, [register])
+                read_msg = i2c_msg.read(address, length)
+                bus.i2c_rdwr(write_msg, read_msg)
+                return list(read_msg)
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.05)
+    raise RuntimeError("I2C read exhausted retries")
+
+
 class Ina219Adapter:
     _SHUNT_VOLTAGE_REGISTER = 0x01
     _BUS_VOLTAGE_REGISTER = 0x02
@@ -45,23 +62,11 @@ class Ina219Adapter:
         self._sensor.configure()
 
     def _read_register_atomic(self, register: int, *, signed: bool = False) -> int:
-        retries = 3
-        for attempt in range(retries):
-            try:
-                with SMBus(self._bus_num) as bus:
-                    write_msg = i2c_msg.write(self.address, [register])
-                    read_msg = i2c_msg.read(self.address, 2)
-                    bus.i2c_rdwr(write_msg, read_msg)
-                    raw_bytes = list(read_msg)
-                    raw_value = (raw_bytes[0] << 8) | raw_bytes[1]
-                    if signed and raw_value >= 0x8000:
-                        return raw_value - 0x10000
-                    return raw_value
-            except OSError:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(0.05)
-        raise RuntimeError("I2C register read exhausted retries")
+        raw_bytes = read_i2c_atomic(self._bus_num, self.address, register, 2)
+        raw_value = (raw_bytes[0] << 8) | raw_bytes[1]
+        if signed and raw_value >= 0x8000:
+            return raw_value - 0x10000
+        return raw_value
 
     def read(self) -> dict[str, Any]:
         bus_voltage_register = self._read_register_atomic(self._BUS_VOLTAGE_REGISTER)
