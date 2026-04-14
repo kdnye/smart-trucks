@@ -61,6 +61,7 @@ class Config:
     api_key: str
     sample_interval_seconds: int
     ina219_addresses: tuple[int, ...]
+    i2c_bus: int
     ina219_shunt_ohms: float
     upload_batch_size: int
     upload_backoff_initial_seconds: int
@@ -171,6 +172,7 @@ def load_config() -> Config:
         api_key=os.getenv("API_KEY", ""),
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 2, minimum=1),
         ina219_addresses=ina219_addresses,
+        i2c_bus=_read_int_env("I2C_BUS", 1, minimum=0),
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
         upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 50, minimum=1),
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
@@ -183,31 +185,40 @@ def load_config() -> Config:
 class UpsMonitor:
     SOC_ESTIMATE_METHOD = "voltage_curve_loaded"
 
-    def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float) -> None:
+    def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float, i2c_bus: int) -> None:
         self._i2c_addresses = i2c_addresses
         self._shunt_ohms = shunt_ohms
+        self._i2c_bus = i2c_bus
         self._ina: Ina219Adapter | None = None
         self.reinitialize()
 
     def reinitialize(self) -> bool:
         self._ina = None
         last_error: str | None = None
+        candidate_list = ", ".join(f"0x{address:02X}" for address in self._i2c_addresses)
+        print(
+            "UPS monitor startup probe: "
+            f"bus={self._i2c_bus} "
+            f"addresses=[{candidate_list}]"
+        )
         for address in self._i2c_addresses:
             try:
                 self._ina = Ina219Adapter(
-                    INA219(shunt_ohms=self._shunt_ohms, address=address),
+                    INA219(shunt_ohms=self._shunt_ohms, address=address, busnum=self._i2c_bus),
                     address,
                 )
                 self._ina.configure()
-                print(f"UPS monitor initialized at I2C address 0x{address:02X}.")
+                print(f"UPS monitor initialized. bus={self._i2c_bus} address=0x{address:02X}.")
                 return True
             except Exception as exc:
                 last_error = str(exc)
-                print(f"Warning: UPS monitor unavailable on 0x{address:02X}: {exc}")
+                print(f"Warning: UPS monitor unavailable. bus={self._i2c_bus} address=0x{address:02X} error={exc}")
 
         if last_error:
-            candidate_list = ", ".join(f"0x{address:02X}" for address in self._i2c_addresses)
-            print(f"Warning: UPS monitor unavailable on all candidate I2C addresses ({candidate_list}).")
+            print(
+                "Warning: UPS monitor unavailable on all candidate I2C addresses. "
+                f"bus={self._i2c_bus} addresses=[{candidate_list}]"
+            )
         return False
 
     def calibrate(self) -> bool:
@@ -737,7 +748,7 @@ async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats:
 
 async def run() -> None:
     config = load_config()
-    monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms)
+    monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms, config.i2c_bus)
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
