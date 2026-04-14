@@ -37,6 +37,8 @@ class NMEAReader:
         self.serial_conn: Optional[serial.Serial] = None
         self.current_reading = GpsReading()
         self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self._reader_stop_event: Optional[threading.Event] = None
+        self._reader_thread: Optional[threading.Thread] = None
 
     def connect(self) -> bool:
         """Attempt to open the serial port."""
@@ -57,14 +59,7 @@ class NMEAReader:
                     await asyncio.sleep(5)
                     continue
 
-            stop_event = threading.Event()
-            reader_thread = threading.Thread(
-                target=self._serial_reader_thread,
-                args=(asyncio.get_running_loop(), stop_event),
-                daemon=True,
-                name="gps-serial-reader",
-            )
-            reader_thread.start()
+            self._start_reader_thread(asyncio.get_running_loop())
 
             try:
                 while self.serial_conn and self.serial_conn.is_open:
@@ -86,13 +81,32 @@ class NMEAReader:
                 logger.error("Unexpected error in NMEA read loop: %s", exc)
                 await asyncio.sleep(1)
             finally:
-                stop_event.set()
+                self._stop_reader_thread()
                 if self.serial_conn:
                     try:
                         self.serial_conn.close()
                     except Exception:  # pylint: disable=broad-except
                         pass
                 self.serial_conn = None
+
+    def _start_reader_thread(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start a fresh reader thread for the current serial connection."""
+        self._stop_reader_thread()
+        self._reader_stop_event = threading.Event()
+        self._reader_thread = threading.Thread(
+            target=self._serial_reader_thread,
+            args=(loop, self._reader_stop_event),
+            daemon=True,
+            name="gps-serial-reader",
+        )
+        self._reader_thread.start()
+
+    def _stop_reader_thread(self) -> None:
+        """Stop and clear the reader thread state."""
+        if self._reader_stop_event:
+            self._reader_stop_event.set()
+        self._reader_stop_event = None
+        self._reader_thread = None
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
