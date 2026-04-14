@@ -10,6 +10,8 @@ import aiohttp
 import aiosqlite
 from ina219 import INA219, DeviceRangeError
 
+UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health")
+
 
 class Ina219Adapter:
     _BUS_VOLTAGE_REGISTER = 0x02
@@ -339,16 +341,22 @@ async def enqueue_event(
     await conn.commit()
 
 
-async def get_pending_events(conn: aiosqlite.Connection, limit: int) -> list[tuple[int, str, str, str, str]]:
+async def get_pending_events(
+    conn: aiosqlite.Connection,
+    limit: int,
+    event_types: tuple[str, ...] = UPLOADABLE_EVENT_TYPES,
+) -> list[tuple[int, str, str, str, str]]:
+    placeholders = ",".join("?" for _ in event_types)
     cursor = await conn.execute(
-        """
+        f"""
         SELECT id, vehicle_id, event_type, occurred_at, payload
         FROM events
         WHERE synced = 0
+          AND event_type IN ({placeholders})
         ORDER BY id ASC
         LIMIT ?
         """,
-        (limit,),
+        (*event_types, limit),
     )
     rows = await cursor.fetchall()
     await cursor.close()
@@ -400,7 +408,7 @@ async def publish_event(
 
 
 async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session: aiohttp.ClientSession) -> tuple[bool, int]:
-    pending = await get_pending_events(conn, config.upload_batch_size)
+    pending = await get_pending_events(conn, config.upload_batch_size, UPLOADABLE_EVENT_TYPES)
     if not pending:
         return True, 0
 
@@ -443,15 +451,44 @@ class RuntimeStats:
     last_upload_attempt_at: str | None = None
 
 
-def _derive_power_state(payload: dict[str, Any]) -> str:
+def _derive_power_flags(payload: dict[str, Any]) -> dict[str, bool]:
     status = payload.get("read_status", payload.get("status"))
-    if status != "ok":
-        return "sensor_fault"
-    if bool(payload.get("is_charging")):
-        return "charging"
+    sensor_fault = status != "ok"
+    overflow_fault = bool(payload.get("ovf"))
     current_ma = float(payload.get("current_ma", 0.0))
-    if current_ma < -20:
+    bus_voltage_v = float(payload.get("bus_voltage_v", 0.0))
+    external_input_present = (not sensor_fault) and bus_voltage_v >= 4.5
+    charging = (not sensor_fault) and current_ma > 20
+    discharging = (not sensor_fault) and current_ma < -20
+    battery_only = (not sensor_fault) and (not external_input_present)
+    brownout_risk = (not sensor_fault) and bus_voltage_v <= 3.45
+
+    return {
+        "external_input_present": external_input_present,
+        "battery_only": battery_only,
+        "charging": charging,
+        "discharging": discharging,
+        "brownout_risk": brownout_risk,
+        "sensor_fault": sensor_fault,
+        "overflow_fault": overflow_fault,
+    }
+
+
+def _derive_power_state(flags: dict[str, bool]) -> str:
+    if flags["sensor_fault"]:
+        return "sensor_fault"
+    if flags["overflow_fault"]:
+        return "overflow_fault"
+    if flags["brownout_risk"]:
+        return "brownout_risk"
+    if flags["charging"]:
+        return "charging"
+    if flags["discharging"]:
         return "discharging"
+    if flags["battery_only"]:
+        return "battery_only"
+    if flags["external_input_present"]:
+        return "external_input_present"
     return "idle"
 
 
@@ -487,12 +524,15 @@ async def state_engine_loop(
     stats: RuntimeStats,
 ) -> None:
     previous_state: str | None = None
+    previous_flags: dict[str, bool] | None = None
     while True:
         event = await in_queue.get()
         occurred_at = str(event["occurred_at"])
         payload = dict(event["payload"])
         payload["sensor_latency_ms"] = event["sensor_latency_ms"]
-        current_state = _derive_power_state(payload)
+        current_flags = _derive_power_flags(payload)
+        payload.update(current_flags)
+        current_state = _derive_power_state(current_flags)
         payload["power_state"] = current_state
 
         await write_reading(conn, config.vehicle_id, occurred_at, payload)
@@ -501,20 +541,37 @@ async def state_engine_loop(
         if previous_state is not None and current_state != previous_state:
             stats.state_transitions += 1
             transition_payload = {
-                "from_state": previous_state,
-                "to_state": current_state,
-                "snapshot": payload,
+                "state": current_state,
+                "previous_state": previous_state,
+                "flags": current_flags,
             }
             await enqueue_event(
                 conn,
                 config.vehicle_id,
-                "power_state_transition",
+                "power_state",
                 occurred_at,
                 transition_payload,
                 config.queue_max_events,
             )
             print(f"Power state transition: {previous_state} -> {current_state} at {occurred_at}")
 
+        if previous_flags is None or any(previous_flags.get(key) != value for key, value in current_flags.items()):
+            health_payload = {
+                "state": current_state,
+                "previous_state": previous_state,
+                "flags": current_flags,
+                "previous_flags": previous_flags or {},
+            }
+            await enqueue_event(
+                conn,
+                config.vehicle_id,
+                "power_health",
+                occurred_at,
+                health_payload,
+                config.queue_max_events,
+            )
+
+        previous_flags = current_flags
         previous_state = current_state
         await conn.commit()
         in_queue.task_done()
