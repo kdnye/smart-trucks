@@ -11,6 +11,46 @@ import aiosqlite
 from ina219 import INA219, DeviceRangeError
 
 
+class Ina219Adapter:
+    _BUS_VOLTAGE_REGISTER = 0x02
+    _CNVR_BIT = 2
+    _OVF_BIT = 1
+
+    def __init__(self, sensor: INA219, address: int) -> None:
+        self._sensor = sensor
+        self.address = address
+
+    def configure(self) -> None:
+        self._sensor.configure()
+
+    def _read_bus_voltage_register(self) -> int:
+        register_reader = getattr(self._sensor, "_read_voltage_register", None)
+        if callable(register_reader):
+            return int(register_reader())
+
+        fallback_reader = getattr(self._sensor, "_INA219__read_register", None)
+        if callable(fallback_reader):
+            return int(fallback_reader(self._BUS_VOLTAGE_REGISTER))
+
+        raise RuntimeError("INA219 register read is unavailable")
+
+    def read(self) -> dict[str, Any]:
+        bus_voltage_register = self._read_bus_voltage_register()
+        bus_voltage_v = round(float(self._sensor.voltage()), 3)
+        current_ma = round(float(self._sensor.current()), 3)
+        power_mw = round(float(self._sensor.power()), 3)
+        shunt_voltage_mv = round(float(self._sensor.shunt_voltage()), 3)
+        return {
+            "bus_voltage_v": bus_voltage_v,
+            "current_ma": current_ma,
+            "power_mw": power_mw,
+            "shunt_voltage_mv": shunt_voltage_mv,
+            "cnvr": bool((bus_voltage_register >> self._CNVR_BIT) & 0x1),
+            "ovf": bool((bus_voltage_register >> self._OVF_BIT) & 0x1),
+            "ina219_address": f"0x{self.address:02X}",
+        }
+
+
 @dataclass(frozen=True)
 class Config:
     vehicle_id: str
@@ -142,7 +182,7 @@ class UpsMonitor:
     def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float) -> None:
         self._i2c_addresses = i2c_addresses
         self._shunt_ohms = shunt_ohms
-        self._ina: INA219 | None = None
+        self._ina: Ina219Adapter | None = None
         self.reinitialize()
 
     def reinitialize(self) -> bool:
@@ -150,7 +190,10 @@ class UpsMonitor:
         last_error: str | None = None
         for address in self._i2c_addresses:
             try:
-                self._ina = INA219(shunt_ohms=self._shunt_ohms, address=address)
+                self._ina = Ina219Adapter(
+                    INA219(shunt_ohms=self._shunt_ohms, address=address),
+                    address,
+                )
                 self._ina.configure()
                 print(f"UPS monitor initialized at I2C address 0x{address:02X}.")
                 return True
@@ -185,25 +228,29 @@ class UpsMonitor:
         return 0
 
     def read(self) -> dict[str, Any]:
+        read_started = asyncio.get_running_loop().time()
+
+        def _finalize(payload: dict[str, Any]) -> dict[str, Any]:
+            payload["read_latency_ms"] = round((asyncio.get_running_loop().time() - read_started) * 1000, 2)
+            payload["read_status"] = str(payload.get("status", "unknown"))
+            return payload
+
         if not self._ina:
-            return {"status": "offline"}
+            return _finalize({"status": "offline"})
 
         try:
-            voltage = round(self._ina.voltage(), 3)
-            current = round(self._ina.current(), 3)
-            power = round(self._ina.power(), 3)
-            return {
+            metrics = self._ina.read()
+            current_ma = float(metrics["current_ma"])
+            return _finalize({
                 "status": "ok",
-                "bus_voltage_v": voltage,
-                "current_ma": current,
-                "power_mw": power,
-                "state_of_charge_pct": self._estimate_soc(voltage),
-                "is_charging": current > 0,
-            }
+                **metrics,
+                "state_of_charge_pct": self._estimate_soc(float(metrics["bus_voltage_v"])),
+                "is_charging": current_ma > 0,
+            })
         except DeviceRangeError:
-            return {"status": "range_error"}
+            return _finalize({"status": "range_error"})
         except Exception as exc:
-            return {"status": "read_error", "message": str(exc)}
+            return _finalize({"status": "read_error", "message": str(exc)})
 
 
 async def init_db(conn: aiosqlite.Connection) -> None:
@@ -393,7 +440,7 @@ class RuntimeStats:
 
 
 def _derive_power_state(payload: dict[str, Any]) -> str:
-    status = payload.get("status")
+    status = payload.get("read_status", payload.get("status"))
     if status != "ok":
         return "sensor_fault"
     if bool(payload.get("is_charging")):
