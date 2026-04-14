@@ -20,7 +20,9 @@ services:
       - POLL_INTERVAL=35
 
   telematics-edge:
-    build: ./telematics-edge
+    build:
+      context: .
+      dockerfile: telematics-edge/Dockerfile
     image: smart-truck/telematics-edge:latest
     privileged: true
     restart: always
@@ -37,7 +39,9 @@ services:
 
 
   power-monitor:
-    build: ./power-monitor
+    build:
+      context: .
+      dockerfile: power-monitor/Dockerfile
     image: smart-truck/power-monitor:latest
     privileged: true
     restart: always
