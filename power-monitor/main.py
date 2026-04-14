@@ -184,16 +184,16 @@ def load_config() -> Config:
     ina219_addresses = _dedupe_preserve_order([primary_address, *configured_candidates, *fallback_candidates])
     gps_serial_candidates = tuple(
         candidate.strip()
-        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0").split(",")
+        for candidate in (_sanitize_env_value(os.getenv("GPS_SERIAL_CANDIDATES")) or "").split(",")
         if candidate.strip()
     )
     i2c_bus = _read_int_env("I2C_BUS", 1, minimum=0)
 
     return Config(
-        vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
-        db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
-        webhook_url=os.getenv("WEBHOOK_URL"),
-        api_key=os.getenv("API_KEY", ""),
+        vehicle_id=_sanitize_env_value(os.getenv("VEHICLE_ID")) or "UNKNOWN_TRUCK",
+        db_path=_sanitize_env_value(os.getenv("TELEMATICS_DB_PATH")) or "/data/telematics.db",
+        webhook_url=_sanitize_env_value(os.getenv("WEBHOOK_URL")),
+        api_key=_sanitize_env_value(os.getenv("API_KEY")) or "",
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 2, minimum=1),
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,

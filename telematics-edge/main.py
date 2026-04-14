@@ -61,33 +61,64 @@ class Config:
     imu_required: bool
 
 
+def _sanitize_env_value(raw_value: str | None) -> str | None:
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    if value.startswith("${") and value.endswith("}"):
+        body = value[2:-1]
+        if ":-" in body:
+            _, fallback = body.split(":-", 1)
+            fallback_value = fallback.strip()
+            return fallback_value or None
+        return None
+
+    return value
+
+
+def _read_str_env(name: str, default: str | None = None) -> str | None:
+    value = _sanitize_env_value(os.getenv(name))
+    if value is not None:
+        return value
+    return default
+
+
 def load_config() -> Config:
+    raw_candidates = _read_str_env("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0") or ""
     serial_candidates = tuple(
         candidate.strip()
-        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0").split(",")
+        for candidate in raw_candidates.split(",")
         if candidate.strip()
     )
-    primary_device = os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0")
-    probe_all_candidates = os.getenv("GPS_PROBE_ALL_CANDIDATES", "false").strip().lower() in {"1", "true", "yes"}
+    primary_device = _read_str_env("GPS_SERIAL_DEVICE", "/dev/serial0") or "/dev/serial0"
+    probe_all_candidates = (_read_str_env("GPS_PROBE_ALL_CANDIDATES", "false") or "false").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     serial_devices: tuple[str, ...]
     if probe_all_candidates:
         serial_devices = tuple(dict.fromkeys((primary_device, *serial_candidates)))
     else:
         serial_devices = (primary_device,)
     return Config(
-        vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
-        webhook_url=os.getenv("WEBHOOK_URL"),
-        api_key=os.getenv("API_KEY", ""),
-        gps_sample_interval_seconds=max(1, int(os.getenv("GPS_SAMPLE_INTERVAL_SECONDS", "5"))),
-        heartbeat_interval_seconds=max(10, int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60"))),
-        sync_interval_seconds=max(5, int(os.getenv("SYNC_INTERVAL_SECONDS", "20"))),
+        vehicle_id=_read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
+        webhook_url=_read_str_env("WEBHOOK_URL"),
+        api_key=_read_str_env("API_KEY", "") or "",
+        gps_sample_interval_seconds=max(1, int(_read_str_env("GPS_SAMPLE_INTERVAL_SECONDS", "5") or "5")),
+        heartbeat_interval_seconds=max(10, int(_read_str_env("HEARTBEAT_INTERVAL_SECONDS", "60") or "60")),
+        sync_interval_seconds=max(5, int(_read_str_env("SYNC_INTERVAL_SECONDS", "20") or "20")),
         gps_serial_candidates=serial_devices,
         gps_probe_all_candidates=probe_all_candidates,
-        gps_baud_rate=max(1200, int(os.getenv("GPS_BAUD_RATE", "9600"))),
-        sync_batch_size=max(10, int(os.getenv("SYNC_BATCH_SIZE", "50"))),
-        sync_backoff_max_seconds=max(30, int(os.getenv("SYNC_BACKOFF_MAX_SECONDS", "300"))),
-        queue_alert_depth=max(100, int(os.getenv("QUEUE_ALERT_DEPTH", "1000"))),
-        power_snapshot_max_age_seconds=max(5, int(os.getenv("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30"))),
+        gps_baud_rate=max(1200, int(_read_str_env("GPS_BAUD_RATE", "9600") or "9600")),
+        sync_batch_size=max(10, int(_read_str_env("SYNC_BATCH_SIZE", "50") or "50")),
+        sync_backoff_max_seconds=max(30, int(_read_str_env("SYNC_BACKOFF_MAX_SECONDS", "300") or "300")),
+        queue_alert_depth=max(100, int(_read_str_env("QUEUE_ALERT_DEPTH", "1000") or "1000")),
+        power_snapshot_max_age_seconds=max(5, int(_read_str_env("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30") or "30")),
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", 1, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=parse_bool_env("IMU_REQUIRED", True),
