@@ -29,6 +29,7 @@ services:
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
       - telematics-data:/data
+    cpuset: "1,2"
     environment:
       - UDEV=1
       - WEBHOOK_URL=${WEBHOOK_URL}
@@ -46,6 +47,7 @@ services:
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
       - telematics-data:/data
+    cpuset: "3"
     environment:
       - UDEV=1
       - WEBHOOK_URL=${WEBHOOK_URL}

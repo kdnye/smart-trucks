@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 
+async def _connect_db() -> aiosqlite.Connection:
+    """Open SQLite connection with Pi-friendly pragmas."""
+    db = await aiosqlite.connect(DB_PATH)
+    await db.execute("PRAGMA journal_mode=WAL;")
+    await db.execute("PRAGMA synchronous=NORMAL;")
+    await db.execute("PRAGMA temp_store=MEMORY;")
+    return db
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -22,10 +30,7 @@ async def init_db() -> None:
         os.makedirs(db_dir, exist_ok=True)
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("PRAGMA journal_mode=WAL;")
-            await db.execute("PRAGMA synchronous=NORMAL;")
-
+        async with (await _connect_db()) as db:
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS gps_points (
@@ -102,7 +107,7 @@ async def insert_gps_point(
     payload_json = json.dumps(payload)
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 """
                 INSERT INTO gps_points (
@@ -138,7 +143,7 @@ async def insert_heartbeat(
     payload_json = json.dumps(payload)
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 """
                 INSERT INTO heartbeats (vehicle_id, heartbeat_type, captured_at_utc, payload_json)
@@ -153,7 +158,7 @@ async def insert_heartbeat(
 
 async def record_edge_health(payload: dict[str, Any]) -> None:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 """
                 INSERT INTO edge_health (
@@ -186,7 +191,7 @@ async def record_edge_health(payload: dict[str, Any]) -> None:
 async def get_pending_gps_points(limit: int = 100) -> list[tuple[int, str, str, int]]:
     """Return pending gps rows: (id, captured_at_utc, payload_json, local_sequence)."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             async with db.execute(
                 """
                 SELECT id, captured_at_utc, payload_json, local_sequence
@@ -206,7 +211,7 @@ async def get_pending_gps_points(limit: int = 100) -> list[tuple[int, str, str, 
 async def get_pending_heartbeats(limit: int = 50) -> list[tuple[int, str, str]]:
     """Return pending heartbeat rows: (id, captured_at_utc, payload_json)."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             async with db.execute(
                 """
                 SELECT id, captured_at_utc, payload_json
@@ -232,7 +237,7 @@ async def mark_gps_points_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 f"UPDATE gps_points SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
                 params,
@@ -251,7 +256,7 @@ async def mark_heartbeats_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 f"UPDATE heartbeats SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
                 params,
@@ -267,7 +272,7 @@ async def increment_gps_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 f"UPDATE gps_points SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
                 row_ids,
@@ -283,7 +288,7 @@ async def increment_heartbeat_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             await db.execute(
                 f"UPDATE heartbeats SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
                 row_ids,
@@ -295,7 +300,7 @@ async def increment_heartbeat_attempts(row_ids: list[int]) -> None:
 
 async def get_db_stats() -> dict[str, int]:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             async with db.execute(
                 "SELECT COUNT(*) FROM gps_points WHERE sent_at_utc IS NULL"
             ) as cursor:
@@ -333,7 +338,7 @@ async def get_db_stats() -> dict[str, int]:
 async def get_latest_power_snapshot(vehicle_id: str) -> dict[str, Any] | None:
     """Return the most recent power snapshot payload for a vehicle, if present."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             async with db.execute(
                 """
                 SELECT occurred_at, payload
@@ -369,7 +374,7 @@ async def purge_old_sent_rows(days: int = 7) -> int:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     deleted_total = 0
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with (await _connect_db()) as db:
             gps_cursor = await db.execute(
                 "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
                 (cutoff,),

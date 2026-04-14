@@ -4,3 +4,4 @@ aiohttp==3.9.3
 pi-ina219
 smbus2==0.4.3
 aiosqlite==0.19.0
+uvloop==0.19.0
