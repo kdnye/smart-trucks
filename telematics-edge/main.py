@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import uvloop
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -499,4 +500,5 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    uvloop.install()
     asyncio.run(run())

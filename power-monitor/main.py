@@ -10,6 +10,7 @@ from typing import Any
 
 import aiohttp
 import aiosqlite
+import uvloop
 from ina219 import INA219, DeviceRangeError
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -297,6 +298,14 @@ class UpsMonitor:
         except Exception as exc:
             return _finalize({"status": "read_error", "message": str(exc)})
 
+
+
+
+async def configure_sqlite(conn: aiosqlite.Connection) -> None:
+    """Apply low-overhead SQLite settings for SD-card backed storage."""
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA synchronous=NORMAL;")
+    await conn.execute("PRAGMA temp_store=MEMORY;")
 
 async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.execute(
@@ -796,6 +805,7 @@ async def run() -> None:
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
     async with aiosqlite.connect(config.db_path) as conn:
+        await configure_sqlite(conn)
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -808,4 +818,5 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    uvloop.install()
     asyncio.run(run())
