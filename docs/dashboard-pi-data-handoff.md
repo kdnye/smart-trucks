@@ -38,14 +38,19 @@ Event shape:
 - `latest_harsh_event`: optional object mirroring a harsh event snapshot
 
 #### Power datapoints (`power_metrics`)
-- `status`: `ok`, `offline`, `overflow_error`, or `read_error`
-- `voltage_v`: battery/bus voltage in volts
-- `current_ma`: current in milliamps
-- `power_mw`: power in milliwatts
+- `status`: inherited from latest `power_snapshot` record; `absent` when no snapshot row exists
+- `voltage_v`: battery/bus voltage in volts (when available)
+- `current_ma`: current in milliamps (when available)
+- `power_mw`: power in milliwatts (when available)
 - `state_of_charge_pct_estimate`: coarse battery SOC estimate derived from loaded voltage curve
 - `estimate_method`: estimation strategy identifier (`voltage_curve_loaded`)
 - `is_charging`: boolean (`current_ma > 0`)
 - `message`: only present on read errors
+- `source`: always `power_snapshot_db`
+- `snapshot_found`: `true` when a row exists in `power_readings`
+- `snapshot_stale`: `true` when latest row age exceeds edge freshness threshold
+- `snapshot_age_sec`: age in seconds of the latest row, or `null` if unavailable
+- `snapshot_captured_at_utc`: timestamp of the latest row used for heartbeat power metrics
 
 > Dashboard contract note: migrate any field mappings from `state_of_charge_pct` to `state_of_charge_pct_estimate`.
 

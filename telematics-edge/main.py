@@ -11,10 +11,10 @@ from typing import Any
 import aiohttp
 import pynmea2
 import serial
-from ina219 import INA219, DeviceRangeError
 
 from db import (
     get_db_stats,
+    get_latest_power_snapshot,
     get_pending_gps_points,
     get_pending_heartbeats,
     increment_gps_attempts,
@@ -44,6 +44,7 @@ class Config:
     sync_batch_size: int
     sync_backoff_max_seconds: int
     queue_alert_depth: int
+    power_snapshot_max_age_seconds: int
 
 
 def load_config() -> Config:
@@ -72,6 +73,7 @@ def load_config() -> Config:
         sync_batch_size=max(10, int(os.getenv("SYNC_BATCH_SIZE", "50"))),
         sync_backoff_max_seconds=max(30, int(os.getenv("SYNC_BACKOFF_MAX_SECONDS", "300"))),
         queue_alert_depth=max(100, int(os.getenv("QUEUE_ALERT_DEPTH", "1000"))),
+        power_snapshot_max_age_seconds=max(5, int(os.getenv("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30"))),
     )
 
 
@@ -86,39 +88,6 @@ class RuntimeState:
     uploader_ok: bool = True
     power_monitor_ok: bool = True
     wifi_connected: bool = False
-
-
-class PowerMonitor:
-    def __init__(self, i2c_address: int = 0x43, shunt_ohms: float = 0.01) -> None:
-        self._active = False
-        self._ina: INA219 | None = None
-        try:
-            self._ina = INA219(shunt_ohms=shunt_ohms, address=i2c_address)
-            self._ina.configure()
-            self._active = True
-            print(f"UPS HAT battery monitor initialized at I2C 0x{i2c_address:02X}.")
-        except Exception as exc:
-            print(f"Warning: Could not initialize UPS HAT monitor on 0x{i2c_address:02X}: {exc}")
-
-    def read(self) -> dict[str, Any]:
-        if not self._active or not self._ina:
-            return {"status": "offline"}
-
-        try:
-            voltage = self._ina.voltage()
-            current = self._ina.current()
-            power = self._ina.power()
-            return {
-                "status": "ok",
-                "voltage_v": round(voltage, 3),
-                "current_ma": round(current, 3),
-                "power_mw": round(power, 3),
-                "is_charging": current > 0,
-            }
-        except DeviceRangeError:
-            return {"status": "overflow_error"}
-        except Exception as exc:
-            return {"status": "read_error", "message": str(exc)}
 
 
 class ImuMonitor:
@@ -288,13 +257,36 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
         await asyncio.sleep(config.gps_sample_interval_seconds)
 
 
-async def heartbeat_builder_worker(config: Config, state: RuntimeState, power: PowerMonitor, imu: ImuMonitor) -> None:
+async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor) -> None:
     while True:
         captured_at = utc_now_iso()
         state.wifi_connected = is_network_connected()
         db_stats = await get_db_stats()
-        power_metrics = power.read()
-        state.power_monitor_ok = power_metrics.get("status") == "ok"
+        latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
+        power_payload = latest_power_snapshot.get("payload", {}) if latest_power_snapshot else {}
+        snapshot_timestamp = latest_power_snapshot.get("occurred_at") if latest_power_snapshot else None
+        snapshot_age_sec = age_seconds(snapshot_timestamp)
+        snapshot_found = latest_power_snapshot is not None
+        snapshot_stale = (
+            snapshot_age_sec is None
+            or snapshot_age_sec > config.power_snapshot_max_age_seconds
+        )
+        power_metrics = {
+            **power_payload,
+            "source": "power_snapshot_db",
+            "snapshot_found": snapshot_found,
+            "snapshot_stale": snapshot_stale,
+            "snapshot_age_sec": snapshot_age_sec,
+            "snapshot_captured_at_utc": snapshot_timestamp,
+        }
+        if not snapshot_found:
+            power_metrics["status"] = "absent"
+
+        state.power_monitor_ok = (
+            snapshot_found
+            and not snapshot_stale
+            and power_payload.get("status") == "ok"
+        )
 
         heartbeat_payload = {
             "event_type": "edge_telematics_heartbeat",
@@ -455,7 +447,6 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
 
 async def run() -> None:
     config = load_config()
-    power = PowerMonitor()
     imu = ImuMonitor()
     state = RuntimeState(start_monotonic=time.monotonic())
 
@@ -467,7 +458,7 @@ async def run() -> None:
         tasks = [
             asyncio.create_task(imu.start()),
             asyncio.create_task(gps_collector_worker(config, state)),
-            asyncio.create_task(heartbeat_builder_worker(config, state, power, imu)),
+            asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
             asyncio.create_task(sync_worker(config, state, session)),
             asyncio.create_task(maintenance_worker(config, state)),
         ]
