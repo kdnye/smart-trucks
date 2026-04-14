@@ -116,7 +116,7 @@ def probe_nmea_candidates(
         error: str | None = None
         detected = False
         try:
-            with serial.Serial(device, baudrate=baud_rate, timeout=0.25) as handle:
+            with serial.Serial(device, baudrate=baud_rate, timeout=0.25, exclusive=True) as handle:
                 deadline = time.monotonic() + probe_timeout_seconds
                 while time.monotonic() < deadline:
                     line = handle.readline().decode("ascii", errors="ignore").strip()
