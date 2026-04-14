@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -17,8 +18,9 @@ class Config:
     webhook_url: str | None
     api_key: str
     sample_interval_seconds: int
-    ina219_address: int
+    ina219_addresses: tuple[int, ...]
     ina219_shunt_ohms: float
+    ina219_retry_interval_seconds: int
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -81,27 +83,91 @@ def _read_hex_address_env(name: str, default: int) -> int:
         return default
 
 
+def _dedupe_preserve_order(values: list[int]) -> tuple[int, ...]:
+    seen: set[int] = set()
+    deduped: list[int] = []
+    for value in values:
+        if value in seen:
+            continue
+        deduped.append(value)
+        seen.add(value)
+    return tuple(deduped)
+
+
+def _read_hex_address_list_env(name: str) -> tuple[int, ...]:
+    raw_value = os.getenv(name)
+    value = _sanitize_env_value(raw_value)
+    if value is None:
+        return tuple()
+
+    addresses: list[int] = []
+    for token in value.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        try:
+            addresses.append(int(item, 16))
+        except ValueError:
+            print(f"Warning: invalid {name} entry {item!r}; skipping.")
+    return _dedupe_preserve_order(addresses)
+
+
 def load_config() -> Config:
+    primary_address = _read_hex_address_env("UPS_I2C_ADDRESS", 0x43)
+    configured_candidates = _read_hex_address_list_env("UPS_I2C_ADDRESS_CANDIDATES")
+    fallback_candidates = (0x43, 0x40, 0x41, 0x44, 0x45)
+    ina219_addresses = _dedupe_preserve_order([primary_address, *configured_candidates, *fallback_candidates])
+
     return Config(
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
         webhook_url=os.getenv("WEBHOOK_URL"),
         api_key=os.getenv("API_KEY", ""),
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 10, minimum=5),
-        ina219_address=_read_hex_address_env("UPS_I2C_ADDRESS", 0x43),
+        ina219_addresses=ina219_addresses,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.1),
+        ina219_retry_interval_seconds=_read_int_env("UPS_RETRY_INTERVAL_SECONDS", 60, minimum=5),
     )
 
 
 class UpsMonitor:
-    def __init__(self, i2c_address: int, shunt_ohms: float) -> None:
+    def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float, retry_interval_seconds: int) -> None:
         self._ina: INA219 | None = None
-        try:
-            self._ina = INA219(shunt_ohms=shunt_ohms, address=i2c_address)
-            self._ina.configure()
-            print(f"UPS monitor initialized at I2C address 0x{i2c_address:02X}.")
-        except Exception as exc:
-            print(f"Warning: UPS monitor unavailable on 0x{i2c_address:02X}: {exc}")
+        self._i2c_addresses = i2c_addresses
+        self._shunt_ohms = shunt_ohms
+        self._retry_interval_seconds = retry_interval_seconds
+        self._last_init_attempt_monotonic = 0.0
+        self._last_init_error: str | None = None
+        self._last_init_error_address: int | None = None
+        self._attempt_initialize()
+
+    def _attempt_initialize(self, *, force: bool = False) -> None:
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic - self._last_init_attempt_monotonic < self._retry_interval_seconds:
+            return
+
+        self._last_init_attempt_monotonic = now_monotonic
+        last_error: str | None = None
+        last_error_address: int | None = None
+        for address in self._i2c_addresses:
+            try:
+                self._ina = INA219(shunt_ohms=self._shunt_ohms, address=address)
+                self._ina.configure()
+                print(f"UPS monitor initialized at I2C address 0x{address:02X}.")
+                self._last_init_error = None
+                self._last_init_error_address = None
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                last_error_address = address
+                print(f"Warning: UPS monitor unavailable on 0x{address:02X}: {exc}")
+
+        if last_error:
+            self._ina = None
+            self._last_init_error = last_error
+            self._last_init_error_address = last_error_address
+            candidate_list = ", ".join(f"0x{address:02X}" for address in self._i2c_addresses)
+            print(f"Warning: UPS monitor unavailable on all candidate I2C addresses ({candidate_list}).")
 
     @staticmethod
     def _estimate_soc(voltage_v: float) -> int:
@@ -117,7 +183,14 @@ class UpsMonitor:
 
     def read(self) -> dict[str, Any]:
         if not self._ina:
-            return {"status": "offline"}
+            self._attempt_initialize()
+            if not self._ina:
+                payload: dict[str, Any] = {"status": "offline"}
+                if self._last_init_error is not None:
+                    payload["last_error"] = self._last_init_error
+                if self._last_init_error_address is not None:
+                    payload["last_error_address"] = f"0x{self._last_init_error_address:02X}"
+                return payload
 
         try:
             voltage = round(self._ina.voltage(), 3)
@@ -204,7 +277,11 @@ async def publish_snapshot(
 
 async def run() -> None:
     config = load_config()
-    monitor = UpsMonitor(config.ina219_address, config.ina219_shunt_ohms)
+    monitor = UpsMonitor(
+        config.ina219_addresses,
+        config.ina219_shunt_ohms,
+        config.ina219_retry_interval_seconds,
+    )
 
     async with aiosqlite.connect(config.db_path) as conn:
         await init_db(conn)
