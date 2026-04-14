@@ -46,9 +46,11 @@ class Config:
 
 
 def load_config() -> Config:
+    # Default to /dev/serial0 only — the stable alias on Raspberry Pi.
+    # /dev/ttyAMA0 does not exist on Pi Zero W2 and causes Errno 2 errors.
     serial_candidates = tuple(
         candidate.strip()
-        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyAMA0,/dev/ttyS0").split(",")
+        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0").split(",")
         if candidate.strip()
     )
     primary_device = os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0")
@@ -166,6 +168,11 @@ def is_network_connected() -> bool:
 
 def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str, Any]:
     for serial_device in serial_devices:
+        # Skip paths that don't exist in the filesystem to avoid noisy Errno 2 errors.
+        if not os.path.exists(serial_device):
+            print(f"GPS device not present, skipping: {serial_device}")
+            continue
+
         try:
             with serial.Serial(serial_device, baud_rate, timeout=2.0) as ser:
                 for _ in range(20):
@@ -194,6 +201,10 @@ def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str,
                         "speed_kmh": speed_kmh,
                         "gps_timestamp": str(getattr(msg, "timestamp", "")) or None,
                     }
+
+            # Port opened successfully but yielded no parseable fix sentences.
+            print(f"GPS device {serial_device} ready but returned no valid fix data in 20 lines")
+
         except Exception as exc:
             print(f"GPS serial error on {serial_device}: {exc}")
 

@@ -205,17 +205,24 @@ async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
-async def write_reading(conn: aiosqlite.Connection, vehicle_id: str, occurred_at: str, payload: dict[str, Any]) -> None:
+async def write_reading(
+    conn: aiosqlite.Connection,
+    vehicle_id: str,
+    occurred_at: str,
+    payload: dict[str, Any],
+) -> int:
+    """Persist a power reading and return the events table row id."""
     json_payload = json.dumps(payload, separators=(",", ":"))
     await conn.execute(
         "INSERT INTO power_readings(vehicle_id, occurred_at, payload) VALUES(?, ?, ?)",
         (vehicle_id, occurred_at, json_payload),
     )
-    await conn.execute(
+    cursor = await conn.execute(
         "INSERT INTO events(vehicle_id, event_type, occurred_at, payload, synced) VALUES(?, 'power_snapshot', ?, ?, 0)",
         (vehicle_id, occurred_at, json_payload),
     )
     await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
 
 
 async def publish_snapshot(
@@ -225,9 +232,10 @@ async def publish_snapshot(
     vehicle_id: str,
     occurred_at: str,
     payload: dict[str, Any],
-) -> None:
+) -> bool:
+    """Upload a power snapshot, retrying up to 3 times with exponential backoff."""
     if not webhook_url:
-        return
+        return False
 
     body = {
         "event_type": "power_snapshot",
@@ -236,12 +244,67 @@ async def publish_snapshot(
         "power_metrics": payload,
     }
     headers = {"X-Api-Key": api_key} if api_key else {}
-    try:
-        async with session.post(webhook_url, json=body, headers=headers) as response:
-            if response.status >= 400:
-                print(f"Power snapshot upload failed with status={response.status}")
-    except Exception as exc:
-        print(f"Power snapshot upload error: {exc}")
+
+    backoff = 2
+    for attempt in range(4):
+        try:
+            async with session.post(webhook_url, json=body, headers=headers) as response:
+                if response.status < 400:
+                    return True
+                error_body = await response.text()
+                print(
+                    f"Power snapshot upload failed: status={response.status} "
+                    f"body={error_body[:200]!r} (attempt {attempt + 1})"
+                )
+                if response.status < 500:
+                    # 4xx client error — retrying won't help.
+                    return False
+        except Exception as exc:
+            print(f"Power snapshot upload error (attempt {attempt + 1}): {exc}")
+
+        if attempt < 3:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    return False
+
+
+async def drain_unsynced_worker(
+    config: Config,
+    conn: aiosqlite.Connection,
+    session: aiohttp.ClientSession,
+) -> None:
+    """Periodically drain events buffered offline (synced=0), oldest-first."""
+    while True:
+        await asyncio.sleep(60)
+        if not config.webhook_url:
+            continue
+
+        async with conn.execute(
+            "SELECT id, vehicle_id, occurred_at, payload FROM events WHERE synced=0 ORDER BY id LIMIT 50"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        for row_id, vehicle_id, occurred_at, payload_json in rows:
+            try:
+                payload = json.loads(payload_json)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            uploaded = await publish_snapshot(
+                session,
+                config.webhook_url,
+                config.api_key,
+                vehicle_id,
+                occurred_at,
+                payload,
+            )
+            if uploaded:
+                await conn.execute("UPDATE events SET synced=1 WHERE id=?", (row_id,))
+                await conn.commit()
+            else:
+                # Stop draining on persistent failure; retry next cycle.
+                break
 
 
 async def run() -> None:
@@ -252,11 +315,12 @@ async def run() -> None:
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            asyncio.create_task(drain_unsynced_worker(config, conn, session))
             while True:
                 occurred_at = datetime.now(timezone.utc).isoformat()
                 payload = monitor.read()
-                await write_reading(conn, config.vehicle_id, occurred_at, payload)
-                await publish_snapshot(
+                event_id = await write_reading(conn, config.vehicle_id, occurred_at, payload)
+                uploaded = await publish_snapshot(
                     session,
                     config.webhook_url,
                     config.api_key,
@@ -264,6 +328,9 @@ async def run() -> None:
                     occurred_at,
                     payload,
                 )
+                if uploaded:
+                    await conn.execute("UPDATE events SET synced=1 WHERE id=?", (event_id,))
+                    await conn.commit()
                 print(f"Stored power reading: {payload.get('status')} at {occurred_at}")
                 await asyncio.sleep(config.sample_interval_seconds)
 

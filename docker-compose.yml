@@ -34,6 +34,8 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+      - GPS_SERIAL_DEVICE=/dev/serial0
+      - GPS_SERIAL_CANDIDATES=/dev/serial0
 
 
   power-monitor:
