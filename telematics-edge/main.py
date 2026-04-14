@@ -89,7 +89,7 @@ class RuntimeState:
 
 
 class PowerMonitor:
-    def __init__(self, i2c_address: int = 0x43, shunt_ohms: float = 0.1) -> None:
+    def __init__(self, i2c_address: int = 0x43, shunt_ohms: float = 0.01) -> None:
         self._active = False
         self._ina: INA219 | None = None
         try:

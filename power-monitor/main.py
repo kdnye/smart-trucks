@@ -128,7 +128,7 @@ def load_config() -> Config:
         api_key=os.getenv("API_KEY", ""),
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 10, minimum=5),
         ina219_addresses=ina219_addresses,
-        ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.1),
+        ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
         upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 25, minimum=1),
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
         upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
