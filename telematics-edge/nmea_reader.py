@@ -34,60 +34,39 @@ class NMEAReader:
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600) -> None:
         self.port = port
         self.baudrate = baudrate
-        self.serial_conn: Optional[serial.Serial] = None
         self.current_reading = GpsReading()
         self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
         self._reader_stop_event: Optional[threading.Event] = None
         self._reader_thread: Optional[threading.Thread] = None
 
-    def connect(self) -> bool:
-        """Attempt to open the serial port."""
-        try:
-            # timeout keeps reader thread responsive to reconnects and shutdown.
-            self.serial_conn = serial.Serial(self.port, self.baudrate, timeout=1)
-            logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
-            return True
-        except serial.SerialException as exc:
-            logger.error("GPS serial error on %s: %s", self.port, exc)
-            return False
-
     async def read_loop(self, callback: Callable[[GpsReading], Awaitable[None]]) -> None:
         """Continuously read and parse NMEA lines, invoking callback on each RMC tick."""
-        while True:
-            if not self.serial_conn or not self.serial_conn.is_open:
-                if not self.connect():
-                    await asyncio.sleep(5)
+        self._start_reader_thread(asyncio.get_running_loop())
+
+        try:
+            while True:
+                decoded_line = await self._line_queue.get()
+                if not decoded_line.startswith("$"):
                     continue
 
-            self._start_reader_thread(asyncio.get_running_loop())
-
-            try:
-                while self.serial_conn and self.serial_conn.is_open:
-                    decoded_line = await self._line_queue.get()
-                    if not decoded_line.startswith("$"):
-                        continue
-
+                try:
                     msg = pynmea2.parse(decoded_line)
-                    self._update_reading(msg)
+                except pynmea2.ParseError as exc:
+                    logger.debug("Malformed NMEA sentence ignored: %s", exc)
+                    continue
 
-                    if msg.sentence_type == "RMC":
-                        await callback(self.current_reading)
+                self._update_reading(msg)
 
-            except pynmea2.ParseError as exc:
-                logger.debug("Malformed NMEA sentence ignored: %s", exc)
-            except serial.SerialException as exc:
-                logger.error("Serial connection lost: %s", exc)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error("Unexpected error in NMEA read loop: %s", exc)
-                await asyncio.sleep(1)
-            finally:
-                self._stop_reader_thread()
-                if self.serial_conn:
-                    try:
-                        self.serial_conn.close()
-                    except Exception:  # pylint: disable=broad-except
-                        pass
-                self.serial_conn = None
+                if msg.sentence_type == "RMC":
+                    await callback(self.current_reading)
+        except asyncio.CancelledError:
+            logger.info("NMEA reader loop cancelled")
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Unexpected error in NMEA read loop: %s", exc)
+            await asyncio.sleep(1)
+        finally:
+            self._stop_reader_thread()
 
     def _start_reader_thread(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start a fresh reader thread for the current serial connection."""
@@ -111,23 +90,27 @@ class NMEAReader:
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
         while not stop_event.is_set():
-            conn = self.serial_conn
-            if not conn or not conn.is_open:
-                return
             try:
-                line = conn.readline()
+                with serial.Serial(self.port, self.baudrate, timeout=1) as conn:
+                    logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
+                    while not stop_event.is_set():
+                        line = conn.readline()
+                        if not line:
+                            continue
+
+                        decoded_line = line.decode("ascii", errors="ignore").strip()
+                        if not decoded_line:
+                            continue
+
+                        loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
             except serial.SerialException as exc:
-                logger.error("Serial read failed: %s", exc)
-                return
-
-            if not line:
-                continue
-
-            decoded_line = line.decode("ascii", errors="ignore").strip()
-            if not decoded_line:
-                continue
-
-            loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
+                logger.warning("Serial read failed on %s: %s. Reconnecting in 3 seconds.", self.port, exc)
+                if stop_event.wait(3.0):
+                    break
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Unexpected GPS reader error: %s. Reconnecting in 3 seconds.", exc)
+                if stop_event.wait(3.0):
+                    break
 
     def _enqueue_line(self, line: str) -> None:
         """Enqueue latest NMEA line without blocking event loop."""
@@ -162,4 +145,6 @@ class NMEAReader:
             self.current_reading.pdop = float(msg.pdop) if getattr(msg, "pdop", None) else None
 
         elif msg.sentence_type == "VTG":
-            self.current_reading.speed_kmh = float(msg.spd_over_grnd_kmph) if getattr(msg, "spd_over_grnd_kmph", None) else None
+            self.current_reading.speed_kmh = (
+                float(msg.spd_over_grnd_kmph) if getattr(msg, "spd_over_grnd_kmph", None) else None
+            )
