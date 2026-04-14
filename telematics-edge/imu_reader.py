@@ -39,6 +39,7 @@ class IMUReader:
         self.bus: SMBus | None = None
 
         self.harsh_threshold_g = float(os.getenv("HARSH_EVENT_G_THRESHOLD", "0.4"))
+        self.gravity_baseline_g = float(os.getenv("GRAVITY_BASELINE_G", "1.0"))
         # LSM6DSL sensitivity at +/-2g scale.
         self.accel_sensitivity_g = 0.061 / 1000.0
 
@@ -52,10 +53,11 @@ class IMUReader:
             # 208Hz ODR, +/-2g scale, anti-aliasing 100Hz.
             self.bus.write_byte_data(LSM6DSL_ADDRESS, CTRL1_XL, 0x50)
             logger.info(
-                "IMU initialized on I2C 0x%02X (WHO_AM_I=0x%02X). Threshold=%0.2fg",
+                "IMU initialized on I2C 0x%02X (WHO_AM_I=0x%02X). Threshold=%0.2fg, Gravity baseline=%0.2fg",
                 LSM6DSL_ADDRESS,
                 whoami,
                 self.harsh_threshold_g,
+                self.gravity_baseline_g,
             )
             return True
         except Exception as exc:  # pylint: disable=broad-except
@@ -103,7 +105,9 @@ class IMUReader:
             try:
                 accel_x, accel_y, accel_z = await asyncio.to_thread(self.get_acceleration)
                 magnitude_2d = math.sqrt(accel_x**2 + accel_y**2)
-                is_harsh = magnitude_2d >= self.harsh_threshold_g
+                magnitude_3d = math.sqrt(accel_x**2 + accel_y**2 + accel_z**2)
+                dynamic_force_g = max(0.0, magnitude_3d - self.gravity_baseline_g)
+                is_harsh = dynamic_force_g >= self.harsh_threshold_g
 
                 snapshot = ImuSnapshot(
                     timestamp=datetime.now(timezone.utc).isoformat(),
@@ -115,7 +119,12 @@ class IMUReader:
                 )
 
                 if is_harsh:
-                    logger.warning("HARSH EVENT DETECTED! Force=%0.2fg", magnitude_2d)
+                    logger.warning(
+                        "HARSH EVENT DETECTED! Dynamic=%0.2fg (total=%0.2fg, baseline=%0.2fg)",
+                        dynamic_force_g,
+                        magnitude_3d,
+                        self.gravity_baseline_g,
+                    )
                     await harsh_event_callback(snapshot)
                     await asyncio.sleep(debounce_seconds)
                     last_snapshot_time = asyncio.get_running_loop().time()
