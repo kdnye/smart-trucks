@@ -2,13 +2,25 @@ import asyncio
 import json
 import random
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 import aiosqlite
 from ina219 import INA219, DeviceRangeError
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from shared.hardware_probe import (
+    build_hardware_inventory,
+    parse_bool_env,
+    parse_hex_list_env,
+    parse_int_env,
+    validate_inventory,
+)
 
 UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health")
 
@@ -68,6 +80,11 @@ class Config:
     upload_backoff_max_seconds: int
     queue_max_events: int
     maintenance_interval_seconds: int
+    gps_serial_candidates: tuple[str, ...]
+    gps_baud_rate: int
+    imu_i2c_bus: int
+    imu_expected_addresses: tuple[int, ...]
+    imu_required: bool
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -164,6 +181,12 @@ def load_config() -> Config:
     configured_candidates = _read_hex_address_list_env("UPS_I2C_ADDRESS_CANDIDATES")
     fallback_candidates = (0x43, 0x40, 0x41, 0x44, 0x45)
     ina219_addresses = _dedupe_preserve_order([primary_address, *configured_candidates, *fallback_candidates])
+    gps_serial_candidates = tuple(
+        candidate.strip()
+        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0").split(",")
+        if candidate.strip()
+    )
+    i2c_bus = _read_int_env("I2C_BUS", 1, minimum=0)
 
     return Config(
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
@@ -172,13 +195,18 @@ def load_config() -> Config:
         api_key=os.getenv("API_KEY", ""),
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 2, minimum=1),
         ina219_addresses=ina219_addresses,
-        i2c_bus=_read_int_env("I2C_BUS", 1, minimum=0),
+        i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
         upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 50, minimum=1),
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
         upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
         queue_max_events=_read_int_env("POWER_QUEUE_MAX_EVENTS", 2000, minimum=100),
         maintenance_interval_seconds=_read_int_env("POWER_MAINTENANCE_INTERVAL_SECONDS", 30, minimum=10),
+        gps_serial_candidates=gps_serial_candidates,
+        gps_baud_rate=parse_int_env("GPS_BAUD_RATE", 9600, minimum=1200),
+        imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
+        imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
+        imu_required=parse_bool_env("IMU_REQUIRED", True),
     )
 
 
@@ -748,6 +776,21 @@ async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats:
 
 async def run() -> None:
     config = load_config()
+    inventory = build_hardware_inventory(
+        gps_candidates=config.gps_serial_candidates,
+        gps_baud_rate=config.gps_baud_rate,
+        i2c_bus=config.i2c_bus,
+        ups_expected_addresses=config.ina219_addresses,
+        imu_expected_addresses=config.imu_expected_addresses,
+    )
+    print(f"Hardware inventory: {inventory.to_json()}")
+    os.makedirs("/data", exist_ok=True)
+    with open("/data/power_hardware_inventory.json", "w", encoding="utf-8") as handle:
+        json.dump(inventory.to_dict(), handle, sort_keys=True)
+    inventory_errors = validate_inventory(inventory, imu_required=config.imu_required, ups_required=True)
+    if inventory_errors:
+        raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
+
     monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms, config.i2c_bus)
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))

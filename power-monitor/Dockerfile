@@ -9,9 +9,11 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements.txt
+COPY power-monitor/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY shared ./shared
+COPY power-monitor ./power-monitor
 
+WORKDIR /usr/src/app/power-monitor
 CMD ["python", "main.py"]

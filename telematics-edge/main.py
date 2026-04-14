@@ -3,12 +3,16 @@ import json
 import os
 import shutil
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from db import (
     get_db_stats,
@@ -27,6 +31,13 @@ from db import (
 )
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 from nmea_reader import GpsReading, NMEAReader
+from shared.hardware_probe import (
+    build_hardware_inventory,
+    parse_bool_env,
+    parse_hex_list_env,
+    parse_int_env,
+    validate_inventory,
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +55,9 @@ class Config:
     sync_backoff_max_seconds: int
     queue_alert_depth: int
     power_snapshot_max_age_seconds: int
+    imu_i2c_bus: int
+    imu_expected_addresses: tuple[int, ...]
+    imu_required: bool
 
 
 def load_config() -> Config:
@@ -73,6 +87,9 @@ def load_config() -> Config:
         sync_backoff_max_seconds=max(30, int(os.getenv("SYNC_BACKOFF_MAX_SECONDS", "300"))),
         queue_alert_depth=max(100, int(os.getenv("QUEUE_ALERT_DEPTH", "1000"))),
         power_snapshot_max_age_seconds=max(5, int(os.getenv("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30"))),
+        imu_i2c_bus=parse_int_env("IMU_I2C_BUS", 1, minimum=0),
+        imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
+        imu_required=parse_bool_env("IMU_REQUIRED", True),
     )
 
 
@@ -91,8 +108,8 @@ class RuntimeState:
 
 
 class ImuMonitor:
-    def __init__(self) -> None:
-        self._reader = IMUReader()
+    def __init__(self, bus_num: int) -> None:
+        self._reader = IMUReader(bus_num=bus_num)
         self._latest_snapshot: dict[str, Any] = {"status": "initializing"}
         self._latest_harsh_event: dict[str, Any] | None = None
 
@@ -447,7 +464,22 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
 
 async def run() -> None:
     config = load_config()
-    imu = ImuMonitor()
+    inventory = build_hardware_inventory(
+        gps_candidates=config.gps_serial_candidates,
+        gps_baud_rate=config.gps_baud_rate,
+        i2c_bus=config.imu_i2c_bus,
+        ups_expected_addresses=tuple(),
+        imu_expected_addresses=config.imu_expected_addresses,
+    )
+    print(f"Hardware inventory: {inventory.to_json()}")
+    os.makedirs("/data", exist_ok=True)
+    with open("/data/telematics_hardware_inventory.json", "w", encoding="utf-8") as handle:
+        json.dump(inventory.to_dict(), handle, sort_keys=True)
+    inventory_errors = validate_inventory(inventory, imu_required=config.imu_required, ups_required=False)
+    if inventory_errors:
+        raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
+
+    imu = ImuMonitor(bus_num=config.imu_i2c_bus)
     state = RuntimeState(start_monotonic=time.monotonic())
 
     await init_db()

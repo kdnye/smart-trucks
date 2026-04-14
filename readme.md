@@ -73,6 +73,9 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `2` |
 | `POWER_UPLOAD_BATCH_SIZE` | Number of power samples uploaded per batch. | `50` |
 | `UPS_SHUNT_OHMS` | INA219 shunt resistor value in ohms for UPS current/power calibration. | `0.01` |
+| `IMU_I2C_BUS` | I2C bus used for IMU probing and telematics IMU reads. | `1` |
+| `IMU_EXPECTED_ADDRESSES` | Comma-separated IMU address candidates (hex) expected on `IMU_I2C_BUS`. | `0x6A` |
+| `IMU_REQUIRED` | Fail fast when no IMU is detected at startup (`true`/`false`). | `true` |
 
 > ⚠️ `UPS_SHUNT_OHMS` must match your UPS HAT hardware. A `0.1` vs `0.01` mismatch causes approximately **10x error** in INA219 current/power telemetry.
 
