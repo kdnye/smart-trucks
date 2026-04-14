@@ -3,6 +3,7 @@ import json
 import random
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import aiohttp
 import aiosqlite
 import uvloop
 from ina219 import INA219, DeviceRangeError
+from smbus2 import SMBus, i2c_msg
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -27,34 +29,52 @@ UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "pow
 
 
 class Ina219Adapter:
+    _SHUNT_VOLTAGE_REGISTER = 0x01
     _BUS_VOLTAGE_REGISTER = 0x02
+    _POWER_REGISTER = 0x03
+    _CURRENT_REGISTER = 0x04
     _CNVR_BIT = 2
     _OVF_BIT = 1
 
-    def __init__(self, sensor: INA219, address: int) -> None:
+    def __init__(self, sensor: INA219, address: int, bus_num: int) -> None:
         self._sensor = sensor
         self.address = address
+        self._bus_num = bus_num
 
     def configure(self) -> None:
         self._sensor.configure()
 
-    def _read_bus_voltage_register(self) -> int:
-        register_reader = getattr(self._sensor, "_read_voltage_register", None)
-        if callable(register_reader):
-            return int(register_reader())
-
-        fallback_reader = getattr(self._sensor, "_INA219__read_register", None)
-        if callable(fallback_reader):
-            return int(fallback_reader(self._BUS_VOLTAGE_REGISTER))
-
-        raise RuntimeError("INA219 register read is unavailable")
+    def _read_register_atomic(self, register: int, *, signed: bool = False) -> int:
+        retries = 3
+        for attempt in range(retries):
+            try:
+                with SMBus(self._bus_num) as bus:
+                    write_msg = i2c_msg.write(self.address, [register])
+                    read_msg = i2c_msg.read(self.address, 2)
+                    bus.i2c_rdwr(write_msg, read_msg)
+                    raw_bytes = list(read_msg)
+                    raw_value = (raw_bytes[0] << 8) | raw_bytes[1]
+                    if signed and raw_value >= 0x8000:
+                        return raw_value - 0x10000
+                    return raw_value
+            except OSError:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(0.05)
+        raise RuntimeError("I2C register read exhausted retries")
 
     def read(self) -> dict[str, Any]:
-        bus_voltage_register = self._read_bus_voltage_register()
-        bus_voltage_v = round(float(self._sensor.voltage()), 3)
-        current_ma = round(float(self._sensor.current()), 3)
-        power_mw = round(float(self._sensor.power()), 3)
-        shunt_voltage_mv = round(float(self._sensor.shunt_voltage()), 3)
+        bus_voltage_register = self._read_register_atomic(self._BUS_VOLTAGE_REGISTER)
+        shunt_voltage_register = self._read_register_atomic(self._SHUNT_VOLTAGE_REGISTER, signed=True)
+        current_register = self._read_register_atomic(self._CURRENT_REGISTER, signed=True)
+        power_register = self._read_register_atomic(self._POWER_REGISTER)
+        current_lsb = float(getattr(self._sensor, "_current_lsb"))
+        power_lsb = float(getattr(self._sensor, "_power_lsb"))
+
+        bus_voltage_v = round(float((bus_voltage_register >> 3) * 4) / 1000.0, 3)
+        current_ma = round(float(current_register * current_lsb * 1000.0), 3)
+        power_mw = round(float(power_register * power_lsb * 1000.0), 3)
+        shunt_voltage_mv = round(float(shunt_voltage_register * 0.01), 3)
         return {
             "bus_voltage_v": bus_voltage_v,
             "current_ma": current_ma,
@@ -235,6 +255,7 @@ class UpsMonitor:
                 self._ina = Ina219Adapter(
                     INA219(shunt_ohms=self._shunt_ohms, address=address, busnum=self._i2c_bus),
                     address,
+                    self._i2c_bus,
                 )
                 self._ina.configure()
                 print(f"UPS monitor initialized. bus={self._i2c_bus} address=0x{address:02X}.")

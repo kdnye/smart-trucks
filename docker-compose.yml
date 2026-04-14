@@ -45,9 +45,9 @@ services:
       - gps-multiplexer
     devices:
       - "/dev/i2c-1:/dev/i2c-1"
+      - "/dev/serial0:/dev/serial0"
     volumes:
       - telematics-data:/data
-      - virtual-serial:/dev/virtual
     cpuset: "1,2"
     environment:
       - UDEV=1
@@ -76,4 +76,3 @@ services:
 
 volumes:
   telematics-data:
-  virtual-serial:
