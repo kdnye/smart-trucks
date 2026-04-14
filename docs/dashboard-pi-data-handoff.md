@@ -42,8 +42,12 @@ Event shape:
 - `voltage_v`: battery/bus voltage in volts
 - `current_ma`: current in milliamps
 - `power_mw`: power in milliwatts
+- `state_of_charge_pct_estimate`: coarse battery SOC estimate derived from loaded voltage curve
+- `estimate_method`: estimation strategy identifier (`voltage_curve_loaded`)
 - `is_charging`: boolean (`current_ma > 0`)
 - `message`: only present on read errors
+
+> Dashboard contract note: migrate any field mappings from `state_of_charge_pct` to `state_of_charge_pct_estimate`.
 
 ---
 
