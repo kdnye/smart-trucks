@@ -103,3 +103,34 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 ---
 **Status**: Development / Testing Phase (Pi 3B)  
 **Maintainer**: Dave Alexander
+
+## Balena Runtime Troubleshooting (Observed April 14, 2026)
+
+The following patterns are expected during supervised updates and should not be treated as hard failures on their own:
+
+* Transient image fetch aborts like `Failed to download image ... The operation was aborted` immediately followed by successful retries/downloads.
+* Repeated `Taking update locks` / `Releasing update locks` while services are replaced.
+* Service `Killing ...` and `Installing ...` lines during delta-based image rollouts.
+
+### High-signal issues to act on
+
+1. **UART contention or unstable GPS serial stream**
+   * Signature: `Serial read failed: device reports readiness to read but returned no data` in `telematics-edge`.
+   * First checks:
+     * Ensure only one process owns `/dev/serial0`.
+     * Verify GPS wiring and power stability.
+     * Confirm `GPS_SERIAL_DEVICE` and `GPS_SERIAL_CANDIDATES` are set consistently.
+
+2. **Missing optional pyserial dependency in power-monitor probe path**
+   * Signature: `pyserial unavailable: No module named 'serial'` inside `power-monitor` hardware inventory output.
+   * Interpretation: This only affects NMEA probe diagnostics in `power-monitor`; UPS telemetry can still be healthy.
+
+3. **Power state stuck at `overflow_fault`**
+   * Signature: `Stored power reading: ok state=overflow_fault` on every sample.
+   * First checks:
+     * Validate `UPS_SHUNT_OHMS` matches your physical INA219 shunt value.
+     * Reconfirm INA219 address and wiring (default candidate list: `0x43,0x40,0x41,0x44,0x45`).
+
+### Alerting policy reminder
+
+Operational alert transport should remain account-managed and routed through **Postmark**.
