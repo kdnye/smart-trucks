@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 async def init_db() -> None:
     """Initialize SQLite schema and enable WAL for concurrent readers/writers."""
     db_dir = os.path.dirname(DB_PATH)
@@ -20,20 +24,61 @@ async def init_db() -> None:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("PRAGMA journal_mode=WAL;")
+            await db.execute("PRAGMA synchronous=NORMAL;")
+
             await db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS events (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    vehicle_id  TEXT NOT NULL,
-                    event_type  TEXT NOT NULL,
-                    occurred_at TEXT NOT NULL,
-                    payload     TEXT NOT NULL,
-                    synced      INTEGER DEFAULT 0
+                CREATE TABLE IF NOT EXISTS gps_points (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vehicle_id        TEXT NOT NULL,
+                    captured_at_utc   TEXT NOT NULL,
+                    lat               REAL,
+                    lon               REAL,
+                    speed_kmh         REAL,
+                    fix_status        TEXT NOT NULL,
+                    source_device     TEXT,
+                    trip_id           TEXT,
+                    local_sequence    INTEGER NOT NULL,
+                    sent_at_utc       TEXT,
+                    attempt_count     INTEGER NOT NULL DEFAULT 0,
+                    payload_json      TEXT NOT NULL
                 );
                 """
             )
             await db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_synced ON events(synced);"
+                """
+                CREATE TABLE IF NOT EXISTS heartbeats (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vehicle_id        TEXT NOT NULL,
+                    heartbeat_type    TEXT NOT NULL,
+                    captured_at_utc   TEXT NOT NULL,
+                    payload_json      TEXT NOT NULL,
+                    sent_at_utc       TEXT,
+                    attempt_count     INTEGER NOT NULL DEFAULT 0
+                );
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS edge_health (
+                    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    captured_at_utc          TEXT NOT NULL,
+                    last_gps_fix_utc         TEXT,
+                    last_upload_success_utc  TEXT,
+                    queue_depth              INTEGER NOT NULL,
+                    disk_free_mb             REAL,
+                    wifi_state               TEXT,
+                    process_state            TEXT,
+                    payload_json             TEXT NOT NULL
+                );
+                """
+            )
+
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_gps_points_pending ON gps_points(sent_at_utc, captured_at_utc);"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_heartbeats_pending ON heartbeats(sent_at_utc, captured_at_utc);"
             )
             await db.commit()
             logger.info("Database initialized at %s with WAL mode enabled", DB_PATH)
@@ -41,80 +86,269 @@ async def init_db() -> None:
         logger.error("Failed to initialize database at %s: %s", DB_PATH, exc)
 
 
-async def insert_event(vehicle_id: str, event_type: str, payload: dict[str, Any]) -> None:
-    """Persist an event in the local queue for later sync to cloud."""
-    occurred_at = datetime.now(timezone.utc).isoformat()
+async def insert_gps_point(
+    *,
+    vehicle_id: str,
+    captured_at_utc: str,
+    lat: float | None,
+    lon: float | None,
+    speed_kmh: float | None,
+    fix_status: str,
+    source_device: str | None,
+    trip_id: str | None,
+    local_sequence: int,
+    payload: dict[str, Any],
+) -> None:
     payload_json = json.dumps(payload)
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT INTO events (vehicle_id, event_type, occurred_at, payload) VALUES (?, ?, ?, ?)",
-                (vehicle_id, event_type, occurred_at, payload_json),
+                """
+                INSERT INTO gps_points (
+                    vehicle_id, captured_at_utc, lat, lon, speed_kmh,
+                    fix_status, source_device, trip_id, local_sequence, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vehicle_id,
+                    captured_at_utc,
+                    lat,
+                    lon,
+                    speed_kmh,
+                    fix_status,
+                    source_device,
+                    trip_id,
+                    local_sequence,
+                    payload_json,
+                ),
             )
             await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to insert '%s' event into %s: %s", event_type, DB_PATH, exc)
+        logger.error("Failed to insert GPS point into %s: %s", DB_PATH, exc)
 
 
-async def get_unsynced_events(limit: int = 50) -> list[tuple[int, str, str]]:
-    """Retrieve a batch of unsynced events from the local database, oldest first."""
+async def insert_heartbeat(
+    *,
+    vehicle_id: str,
+    heartbeat_type: str,
+    captured_at_utc: str,
+    payload: dict[str, Any],
+) -> None:
+    payload_json = json.dumps(payload)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO heartbeats (vehicle_id, heartbeat_type, captured_at_utc, payload_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (vehicle_id, heartbeat_type, captured_at_utc, payload_json),
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to insert heartbeat into %s: %s", DB_PATH, exc)
+
+
+async def record_edge_health(payload: dict[str, Any]) -> None:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO edge_health (
+                    captured_at_utc,
+                    last_gps_fix_utc,
+                    last_upload_success_utc,
+                    queue_depth,
+                    disk_free_mb,
+                    wifi_state,
+                    process_state,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("captured_at_utc", _utc_now_iso()),
+                    payload.get("last_gps_fix_utc"),
+                    payload.get("last_upload_success_utc"),
+                    payload.get("queue_depth", 0),
+                    payload.get("disk_free_mb"),
+                    payload.get("wifi_state"),
+                    payload.get("process_state"),
+                    json.dumps(payload),
+                ),
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to record edge health: %s", exc)
+
+
+async def get_pending_gps_points(limit: int = 100) -> list[tuple[int, str, str, int]]:
+    """Return pending gps rows: (id, captured_at_utc, payload_json, local_sequence)."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT id, event_type, payload FROM events WHERE synced = 0 ORDER BY occurred_at ASC LIMIT ?",
+                """
+                SELECT id, captured_at_utc, payload_json, local_sequence
+                FROM gps_points
+                WHERE sent_at_utc IS NULL
+                ORDER BY captured_at_utc ASC
+                LIMIT ?
+                """,
                 (limit,),
             ) as cursor:
                 return await cursor.fetchall()
     except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to fetch unsynced events: %s", exc)
+        logger.error("Failed to fetch pending gps points: %s", exc)
         return []
 
 
-async def mark_event_synced(event_id: int) -> None:
-    """Mark a specific event as successfully synced to the cloud."""
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE events SET synced = 1 WHERE id = ?", (event_id,))
-            await db.commit()
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to mark event %s as synced: %s", event_id, exc)
-
-
-async def get_db_stats() -> dict[str, int]:
-    """Return counts of pending and synced events for health monitoring."""
+async def get_pending_heartbeats(limit: int = 50) -> list[tuple[int, str, str]]:
+    """Return pending heartbeat rows: (id, captured_at_utc, payload_json)."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute(
-                "SELECT synced, COUNT(*) FROM events GROUP BY synced"
+                """
+                SELECT id, captured_at_utc, payload_json
+                FROM heartbeats
+                WHERE sent_at_utc IS NULL
+                ORDER BY captured_at_utc ASC
+                LIMIT ?
+                """,
+                (limit,),
             ) as cursor:
-                rows = await cursor.fetchall()
-        stats: dict[str, int] = {"pending": 0, "synced": 0}
-        for synced_flag, count in rows:
-            if synced_flag == 0:
-                stats["pending"] = count
-            else:
-                stats["synced"] = count
-        return stats
+                return await cursor.fetchall()
     except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to fetch DB stats: %s", exc)
-        return {"pending": -1, "synced": -1}
+        logger.error("Failed to fetch pending heartbeats: %s", exc)
+        return []
 
 
-async def purge_old_synced_events(days: int = 7) -> int:
-    """Delete synced events older than `days` days. Returns the number of rows deleted."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+async def mark_gps_points_sent(row_ids: list[int], sent_at_utc: str | None = None) -> None:
+    if not row_ids:
+        return
+
+    sent_at = sent_at_utc or _utc_now_iso()
+    placeholders = ",".join("?" for _ in row_ids)
+    params = [sent_at, *row_ids]
+
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "DELETE FROM events WHERE synced = 1 AND occurred_at < ?",
+            await db.execute(
+                f"UPDATE gps_points SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
+                params,
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to mark GPS rows sent: %s", exc)
+
+
+async def mark_heartbeats_sent(row_ids: list[int], sent_at_utc: str | None = None) -> None:
+    if not row_ids:
+        return
+
+    sent_at = sent_at_utc or _utc_now_iso()
+    placeholders = ",".join("?" for _ in row_ids)
+    params = [sent_at, *row_ids]
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"UPDATE heartbeats SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
+                params,
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to mark heartbeat rows sent: %s", exc)
+
+
+async def increment_gps_attempts(row_ids: list[int]) -> None:
+    if not row_ids:
+        return
+
+    placeholders = ",".join("?" for _ in row_ids)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"UPDATE gps_points SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
+                row_ids,
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to increment GPS attempts: %s", exc)
+
+
+async def increment_heartbeat_attempts(row_ids: list[int]) -> None:
+    if not row_ids:
+        return
+
+    placeholders = ",".join("?" for _ in row_ids)
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"UPDATE heartbeats SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
+                row_ids,
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to increment heartbeat attempts: %s", exc)
+
+
+async def get_db_stats() -> dict[str, int]:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM gps_points WHERE sent_at_utc IS NULL"
+            ) as cursor:
+                pending_gps_row = await cursor.fetchone()
+            async with db.execute(
+                "SELECT COUNT(*) FROM heartbeats WHERE sent_at_utc IS NULL"
+            ) as cursor:
+                pending_hb_row = await cursor.fetchone()
+
+            async with db.execute("SELECT COUNT(*) FROM gps_points") as cursor:
+                gps_total_row = await cursor.fetchone()
+            async with db.execute("SELECT COUNT(*) FROM heartbeats") as cursor:
+                hb_total_row = await cursor.fetchone()
+
+        pending_gps = pending_gps_row[0] if pending_gps_row else 0
+        pending_heartbeats = pending_hb_row[0] if pending_hb_row else 0
+        return {
+            "pending_gps_points": pending_gps,
+            "pending_heartbeats": pending_heartbeats,
+            "queue_depth": pending_gps + pending_heartbeats,
+            "gps_total": gps_total_row[0] if gps_total_row else 0,
+            "heartbeats_total": hb_total_row[0] if hb_total_row else 0,
+        }
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to fetch DB stats: %s", exc)
+        return {
+            "pending_gps_points": -1,
+            "pending_heartbeats": -1,
+            "queue_depth": -1,
+            "gps_total": -1,
+            "heartbeats_total": -1,
+        }
+
+
+async def purge_old_sent_rows(days: int = 7) -> int:
+    """Delete rows already sent to cloud and older than `days` days."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    deleted_total = 0
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            gps_cursor = await db.execute(
+                "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            hb_cursor = await db.execute(
+                "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
                 (cutoff,),
             )
             await db.commit()
-            deleted = cursor.rowcount
-            if deleted:
-                logger.info("Purged %d old synced events (older than %d days)", deleted, days)
-            return deleted
+            deleted_total = (gps_cursor.rowcount or 0) + (hb_cursor.rowcount or 0)
+            if deleted_total:
+                logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
+            return deleted_total
     except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to purge old synced events: %s", exc)
-        return 0
+        logger.error("Failed to purge old sent rows: %s", exc)
+        return deleted_total
