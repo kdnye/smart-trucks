@@ -9,8 +9,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
-import pynmea2
-import serial
 
 from db import (
     get_db_stats,
@@ -28,6 +26,7 @@ from db import (
     record_edge_health,
 )
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
+from nmea_reader import GpsReading, NMEAReader
 
 
 @dataclass(frozen=True)
@@ -88,6 +87,7 @@ class RuntimeState:
     uploader_ok: bool = True
     power_monitor_ok: bool = True
     wifi_connected: bool = False
+    latest_valid_gps: dict[str, Any] | None = None
 
 
 class ImuMonitor:
@@ -140,58 +140,60 @@ def is_network_connected() -> bool:
         return False
 
 
-def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str, Any]:
-    for serial_device in serial_devices:
-        if not os.path.exists(serial_device):
-            print(
-                "GPS serial path unavailable. "
-                f"device={serial_device} errno=2 exception_type=FileNotFoundError"
-            )
-            continue
-
-        try:
-            with serial.Serial(serial_device, baud_rate, timeout=2.0) as ser:
-                saw_data = False
-                for _ in range(20):
-                    line = ser.readline().decode("ascii", errors="replace").strip()
-                    if line:
-                        saw_data = True
-                    if not line.startswith(("$GPRMC", "$GPGGA", "$GNRMC", "$GNGGA")):
-                        continue
-
-                    try:
-                        msg = pynmea2.parse(line)
-                    except pynmea2.ParseError:
-                        continue
-
-                    latitude = getattr(msg, "latitude", 0.0)
-                    longitude = getattr(msg, "longitude", 0.0)
-                    if not latitude and not longitude:
-                        continue
-
-                    speed_knots = getattr(msg, "spd_over_grnd", None)
-                    speed_kmh = float(speed_knots) * 1.852 if speed_knots else None
-                    return {
-                        "fix_status": "locked",
-                        "device": serial_device,
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "altitude_m": getattr(msg, "altitude", None),
-                        "speed_kmh": speed_kmh,
-                        "gps_timestamp": str(getattr(msg, "timestamp", "")) or None,
-                    }
-                if not saw_data:
-                    print(
-                        "GPS serial returned no data. "
-                        f"device={serial_device} baud={baud_rate} hint=check_wiring_or_port_contention"
-                    )
-        except Exception as exc:
-            print(
-                "GPS serial error. "
-                f"device={serial_device} baud={baud_rate} exception_type={type(exc).__name__} error={exc}"
-            )
-
+def get_latest_gps(state: RuntimeState) -> dict[str, Any]:
+    if state.latest_valid_gps:
+        return dict(state.latest_valid_gps)
     return {"fix_status": "searching"}
+
+
+def _is_valid_fix(reading: GpsReading) -> bool:
+    if reading.latitude is None or reading.longitude is None:
+        return False
+    return reading.fix_quality > 0 or reading.fix_type >= 2
+
+
+async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
+    candidates = list(config.gps_serial_candidates)
+    if not candidates:
+        print("GPS reader disabled: no serial candidates configured.")
+        return
+
+    selected_device = candidates[0]
+    if config.gps_probe_all_candidates:
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                selected_device = candidate
+                break
+    elif not os.path.exists(selected_device):
+        print(
+            "Primary GPS serial path unavailable. "
+            f"device={selected_device} errno=2 exception_type=FileNotFoundError"
+        )
+
+    reader = NMEAReader(port=selected_device, baudrate=config.gps_baud_rate)
+    print(
+        "Starting GPS reader task. "
+        f"device={selected_device} baud={config.gps_baud_rate} probe_all_candidates={config.gps_probe_all_candidates}"
+    )
+
+    async def on_reading(reading: GpsReading) -> None:
+        if not _is_valid_fix(reading):
+            return
+
+        captured_at = utc_now_iso()
+        state.last_gps_fix_utc = captured_at
+        state.gps_reader_ok = True
+        state.latest_valid_gps = {
+            "fix_status": "locked",
+            "device": selected_device,
+            "latitude": reading.latitude,
+            "longitude": reading.longitude,
+            "altitude_m": reading.altitude,
+            "speed_kmh": reading.speed_kmh,
+            "gps_timestamp": reading.timestamp.isoformat() if reading.timestamp else None,
+        }
+
+    await reader.read_loop(on_reading)
 
 
 async def post_payload(
@@ -222,13 +224,11 @@ async def post_payload(
 async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
     while True:
         captured_at = utc_now_iso()
-        gps = get_latest_gps(config.gps_serial_candidates, config.gps_baud_rate)
+        gps = get_latest_gps(state)
         state.local_sequence += 1
 
         if gps.get("fix_status") == "locked":
-            state.last_gps_fix_utc = captured_at
             state.last_locked_gps_point_utc = captured_at
-            state.gps_reader_ok = True
         else:
             stale_for = age_seconds(state.last_gps_fix_utc)
             state.gps_reader_ok = stale_for is None or stale_for <= 300
@@ -457,6 +457,7 @@ async def run() -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [
             asyncio.create_task(imu.start()),
+            asyncio.create_task(gps_reader_worker(config, state)),
             asyncio.create_task(gps_collector_worker(config, state)),
             asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
             asyncio.create_task(sync_worker(config, state, session)),
