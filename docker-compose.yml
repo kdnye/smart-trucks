@@ -26,9 +26,9 @@ services:
     restart: always
     labels:
       io.balena.features.dbus: '1'
-      io.balena.features.kernel-modules: '1'
     devices:
       - "/dev/i2c-1:/dev/i2c-1"
+      - "/dev/serial0:/dev/serial0"
     volumes:
       - telematics_data:/data
     cpuset: "1,2"
@@ -37,7 +37,7 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
-      - GPS_SERIAL_DEVICE=/dev/ttyAMA0
+      - GPS_SERIAL_DEVICE=/dev/serial0
 
 
   power-monitor:

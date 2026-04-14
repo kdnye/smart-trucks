@@ -100,7 +100,6 @@ class NMEAReader:
 
     def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
-        import time
         import serial
 
         reconnect_backoff_seconds = 1.0
@@ -112,12 +111,11 @@ class NMEAReader:
                     self.port,
                     baudrate=self.baudrate,
                     timeout=1.0,
-                    exclusive=True,
                     bytesize=serial.EIGHTBITS,
                     parity=serial.PARITY_NONE,
                     stopbits=serial.STOPBITS_ONE,
                 ) as conn:
-                    logger.info("Successfully locked %s", self.port)
+                    logger.info("Successfully connected to %s", self.port)
                     conn.reset_input_buffer()
                     reconnect_backoff_seconds = 3.0
 
@@ -135,18 +133,14 @@ class NMEAReader:
                             break
             except serial.SerialException as exc:
                 logger.error(
-                    "Hardware port %s unavailable. Retrying in %.1fs... (%s)",
-                    self.port,
-                    reconnect_backoff_seconds,
-                    exc,
+                    "Hardware port unavailable on %s. Retrying in %.1fs (%s)",
+                    self.port, reconnect_backoff_seconds, exc
                 )
             except Exception as exc:  # pylint: disable=broad-except
-                logger.error("Fatal GPS reader error on %s: %s", self.port, exc)
+                logger.error("Fatal GPS reader error. Retrying in %.1fs (%s)", reconnect_backoff_seconds, exc)
 
-            if stop_event.is_set():
+            if stop_event.wait(reconnect_backoff_seconds):
                 break
-
-            time.sleep(reconnect_backoff_seconds)
             reconnect_backoff_seconds = min(reconnect_backoff_seconds * 2.0, max_backoff_seconds)
 
     def _tcp_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
