@@ -69,6 +69,7 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
 | `UPS_I2C_ADDRESS` | I2C address for UPS INA219 monitor. | `0x43` |
+| `UPS_I2C_ADDRESS_CANDIDATES` | Optional comma-separated fallback INA219 addresses (hex) to try if the primary address is unavailable. | `0x40,0x41` |
 | `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `10` |
 
 
