@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
@@ -55,3 +55,66 @@ async def insert_event(vehicle_id: str, event_type: str, payload: dict[str, Any]
             await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to insert '%s' event into %s: %s", event_type, DB_PATH, exc)
+
+
+async def get_unsynced_events(limit: int = 50) -> list[tuple[int, str, str]]:
+    """Retrieve a batch of unsynced events from the local database, oldest first."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT id, event_type, payload FROM events WHERE synced = 0 ORDER BY occurred_at ASC LIMIT ?",
+                (limit,),
+            ) as cursor:
+                return await cursor.fetchall()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to fetch unsynced events: %s", exc)
+        return []
+
+
+async def mark_event_synced(event_id: int) -> None:
+    """Mark a specific event as successfully synced to the cloud."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE events SET synced = 1 WHERE id = ?", (event_id,))
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to mark event %s as synced: %s", event_id, exc)
+
+
+async def get_db_stats() -> dict[str, int]:
+    """Return counts of pending and synced events for health monitoring."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT synced, COUNT(*) FROM events GROUP BY synced"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        stats: dict[str, int] = {"pending": 0, "synced": 0}
+        for synced_flag, count in rows:
+            if synced_flag == 0:
+                stats["pending"] = count
+            else:
+                stats["synced"] = count
+        return stats
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to fetch DB stats: %s", exc)
+        return {"pending": -1, "synced": -1}
+
+
+async def purge_old_synced_events(days: int = 7) -> int:
+    """Delete synced events older than `days` days. Returns the number of rows deleted."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "DELETE FROM events WHERE synced = 1 AND occurred_at < ?",
+                (cutoff,),
+            )
+            await db.commit()
+            deleted = cursor.rowcount
+            if deleted:
+                logger.info("Purged %d old synced events (older than %d days)", deleted, days)
+            return deleted
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to purge old synced events: %s", exc)
+        return 0
