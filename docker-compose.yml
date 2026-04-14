@@ -16,10 +16,6 @@ services:
       - GPS_TCP_PORT=2947
     volumes:
       - virtual-serial:/dev/virtual
-    command: >
-      sh -c "apk add --no-cache socat &&
-             mkdir -p /dev/virtual &&
-             socat -d -d /dev/serial0,b9600,raw,echo=0,nonblock=1 pty,link=/dev/virtual/gps_stream,raw,echo=0,waitslave"
 
   ble-sensor:
     build: ./ble-sensor
@@ -59,9 +55,6 @@ services:
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
       - GPS_SERIAL_DEVICE=tcp://gps-multiplexer:2947
-      - GPS_SERIAL_DEVICE=/dev/virtual/gps_stream
-    depends_on:
-      - gps-multiplexer
 
 
   power-monitor:
