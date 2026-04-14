@@ -24,6 +24,7 @@ class Config:
     upload_backoff_initial_seconds: int
     upload_backoff_max_seconds: int
     queue_max_events: int
+    maintenance_interval_seconds: int
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -133,26 +134,43 @@ def load_config() -> Config:
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
         upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
         queue_max_events=_read_int_env("POWER_QUEUE_MAX_EVENTS", 2000, minimum=100),
+        maintenance_interval_seconds=_read_int_env("POWER_MAINTENANCE_INTERVAL_SECONDS", 30, minimum=10),
     )
 
 
 class UpsMonitor:
     def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float) -> None:
+        self._i2c_addresses = i2c_addresses
+        self._shunt_ohms = shunt_ohms
         self._ina: INA219 | None = None
+        self.reinitialize()
+
+    def reinitialize(self) -> bool:
+        self._ina = None
         last_error: str | None = None
-        for address in i2c_addresses:
+        for address in self._i2c_addresses:
             try:
-                self._ina = INA219(shunt_ohms=shunt_ohms, address=address)
+                self._ina = INA219(shunt_ohms=self._shunt_ohms, address=address)
                 self._ina.configure()
                 print(f"UPS monitor initialized at I2C address 0x{address:02X}.")
-                return
+                return True
             except Exception as exc:
                 last_error = str(exc)
                 print(f"Warning: UPS monitor unavailable on 0x{address:02X}: {exc}")
 
         if last_error:
-            candidate_list = ", ".join(f"0x{address:02X}" for address in i2c_addresses)
+            candidate_list = ", ".join(f"0x{address:02X}" for address in self._i2c_addresses)
             print(f"Warning: UPS monitor unavailable on all candidate I2C addresses ({candidate_list}).")
+        return False
+
+    def calibrate(self) -> bool:
+        if not self._ina:
+            return False
+        try:
+            self._ina.configure()
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _estimate_soc(voltage_v: float) -> int:
@@ -232,16 +250,26 @@ async def write_reading(
     vehicle_id: str,
     occurred_at: str,
     payload: dict[str, Any],
-    queue_max_events: int,
 ) -> None:
     json_payload = json.dumps(payload, separators=(",", ":"))
     await conn.execute(
         "INSERT INTO power_readings(vehicle_id, occurred_at, payload) VALUES(?, ?, ?)",
         (vehicle_id, occurred_at, json_payload),
     )
+
+
+async def enqueue_event(
+    conn: aiosqlite.Connection,
+    vehicle_id: str,
+    event_type: str,
+    occurred_at: str,
+    payload: dict[str, Any],
+    queue_max_events: int,
+) -> None:
+    json_payload = json.dumps(payload, separators=(",", ":"))
     await conn.execute(
-        "INSERT INTO events(vehicle_id, event_type, occurred_at, payload, synced) VALUES(?, 'power_snapshot', ?, ?, 0)",
-        (vehicle_id, occurred_at, json_payload),
+        "INSERT INTO events(vehicle_id, event_type, occurred_at, payload, synced) VALUES(?, ?, ?, ?, 0)",
+        (vehicle_id, event_type, occurred_at, json_payload),
     )
     await conn.execute(
         """
@@ -260,12 +288,12 @@ async def write_reading(
     await conn.commit()
 
 
-async def get_pending_events(conn: aiosqlite.Connection, limit: int) -> list[tuple[int, str, str, str]]:
+async def get_pending_events(conn: aiosqlite.Connection, limit: int) -> list[tuple[int, str, str, str, str]]:
     cursor = await conn.execute(
         """
-        SELECT id, vehicle_id, occurred_at, payload
+        SELECT id, vehicle_id, event_type, occurred_at, payload
         FROM events
-        WHERE synced = 0 AND event_type = 'power_snapshot'
+        WHERE synced = 0
         ORDER BY id ASC
         LIMIT ?
         """,
@@ -273,7 +301,7 @@ async def get_pending_events(conn: aiosqlite.Connection, limit: int) -> list[tup
     )
     rows = await cursor.fetchall()
     await cursor.close()
-    return [(int(row[0]), str(row[1]), str(row[2]), str(row[3])) for row in rows]
+    return [(int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])) for row in rows]
 
 
 async def mark_event_uploaded(conn: aiosqlite.Connection, event_id: int) -> None:
@@ -289,10 +317,11 @@ async def mark_event_failed(conn: aiosqlite.Connection, event_id: int, error_tex
     await conn.commit()
 
 
-async def publish_snapshot(
+async def publish_event(
     session: aiohttp.ClientSession,
     webhook_url: str | None,
     api_key: str,
+    event_type: str,
     vehicle_id: str,
     occurred_at: str,
     payload: dict[str, Any],
@@ -301,11 +330,13 @@ async def publish_snapshot(
         return False, "webhook_not_configured"
 
     body = {
-        "event_type": "power_snapshot",
+        "event_type": event_type,
         "vehicle_id": vehicle_id,
         "occurred_at": occurred_at,
-        "power_metrics": payload,
+        "payload": payload,
     }
+    if event_type == "power_snapshot":
+        body["power_metrics"] = payload
     headers = {"X-Api-Key": api_key} if api_key else {}
     try:
         async with session.post(webhook_url, json=body, headers=headers) as response:
@@ -322,12 +353,13 @@ async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session
     if not pending:
         return True, 0
 
-    for event_id, vehicle_id, occurred_at, payload_json in pending:
+    for event_id, vehicle_id, event_type, occurred_at, payload_json in pending:
         payload = json.loads(payload_json)
-        success, error_text = await publish_snapshot(
+        success, error_text = await publish_event(
             session=session,
             webhook_url=config.webhook_url,
             api_key=config.api_key,
+            event_type=event_type,
             vehicle_id=vehicle_id,
             occurred_at=occurred_at,
             payload=payload,
@@ -339,45 +371,183 @@ async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session
         reason = error_text or "unknown_error"
         await mark_event_failed(conn, event_id, reason)
         print(
-            "Power snapshot upload error: "
-            f"event_id={event_id} queue_depth={len(pending)} reason={reason}"
+            "Power event upload error: "
+            f"event_id={event_id} event_type={event_type} queue_depth={len(pending)} reason={reason}"
         )
         return False, len(pending)
 
     return True, len(pending)
 
 
+@dataclass
+class RuntimeStats:
+    last_sensor_read_at: str | None = None
+    last_sensor_latency_ms: float | None = None
+    last_sensor_status: str | None = None
+    sensor_reinit_attempts: int = 0
+    sensor_reinit_successes: int = 0
+    state_transitions: int = 0
+    uploader_failure_streak: int = 0
+    last_upload_ok_at: str | None = None
+    last_upload_attempt_at: str | None = None
+
+
+def _derive_power_state(payload: dict[str, Any]) -> str:
+    status = payload.get("status")
+    if status != "ok":
+        return "sensor_fault"
+    if bool(payload.get("is_charging")):
+        return "charging"
+    current_ma = float(payload.get("current_ma", 0.0))
+    if current_ma < -20:
+        return "discharging"
+    return "idle"
+
+
+async def sensor_loop(config: Config, monitor: UpsMonitor, out_queue: asyncio.Queue[dict[str, Any]], stats: RuntimeStats) -> None:
+    while True:
+        started = asyncio.get_running_loop().time()
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        payload = monitor.read()
+        latency_ms = round((asyncio.get_running_loop().time() - started) * 1000, 2)
+        stats.last_sensor_read_at = occurred_at
+        stats.last_sensor_latency_ms = latency_ms
+        stats.last_sensor_status = str(payload.get("status", "unknown"))
+
+        status = str(payload.get("status", "unknown"))
+        if status in {"range_error", "read_error", "offline"}:
+            calibrated = monitor.calibrate()
+            if not calibrated:
+                stats.sensor_reinit_attempts += 1
+                if monitor.reinitialize():
+                    stats.sensor_reinit_successes += 1
+            payload["recovery_attempted"] = True
+            payload["recovery_mode"] = "calibrate" if calibrated else "reinitialize"
+
+        event = {"occurred_at": occurred_at, "payload": payload, "sensor_latency_ms": latency_ms}
+        await out_queue.put(event)
+        await asyncio.sleep(config.sample_interval_seconds)
+
+
+async def state_engine_loop(
+    config: Config,
+    conn: aiosqlite.Connection,
+    in_queue: asyncio.Queue[dict[str, Any]],
+    stats: RuntimeStats,
+) -> None:
+    previous_state: str | None = None
+    while True:
+        event = await in_queue.get()
+        occurred_at = str(event["occurred_at"])
+        payload = dict(event["payload"])
+        payload["sensor_latency_ms"] = event["sensor_latency_ms"]
+        current_state = _derive_power_state(payload)
+        payload["power_state"] = current_state
+
+        await write_reading(conn, config.vehicle_id, occurred_at, payload)
+        await enqueue_event(conn, config.vehicle_id, "power_snapshot", occurred_at, payload, config.queue_max_events)
+
+        if previous_state is not None and current_state != previous_state:
+            stats.state_transitions += 1
+            transition_payload = {
+                "from_state": previous_state,
+                "to_state": current_state,
+                "snapshot": payload,
+            }
+            await enqueue_event(
+                conn,
+                config.vehicle_id,
+                "power_state_transition",
+                occurred_at,
+                transition_payload,
+                config.queue_max_events,
+            )
+            print(f"Power state transition: {previous_state} -> {current_state} at {occurred_at}")
+
+        previous_state = current_state
+        await conn.commit()
+        in_queue.task_done()
+        print(f"Stored power reading: {payload.get('status')} state={current_state} at {occurred_at}")
+
+
+async def uploader_loop(config: Config, conn: aiosqlite.Connection, session: aiohttp.ClientSession, stats: RuntimeStats) -> None:
+    upload_backoff_seconds = config.upload_backoff_initial_seconds
+    while True:
+        stats.last_upload_attempt_at = datetime.now(timezone.utc).isoformat()
+        uploaded, queue_depth = await drain_upload_queue(config, conn, session)
+        if uploaded:
+            upload_backoff_seconds = config.upload_backoff_initial_seconds
+            stats.uploader_failure_streak = 0
+            stats.last_upload_ok_at = datetime.now(timezone.utc).isoformat()
+            await asyncio.sleep(1)
+            continue
+
+        stats.uploader_failure_streak += 1
+        jitter = random.uniform(0, min(1.0, upload_backoff_seconds * 0.2))
+        upload_backoff_seconds = min(
+            config.upload_backoff_max_seconds,
+            max(config.upload_backoff_initial_seconds, upload_backoff_seconds * 2),
+        )
+        delay = upload_backoff_seconds + jitter
+        print(
+            "Uploader backoff active: "
+            f"next_delay={round(delay, 2)}s queue_depth={queue_depth}"
+        )
+        await asyncio.sleep(delay)
+
+
+async def maintenance_loop(config: Config, conn: aiosqlite.Connection, stats: RuntimeStats) -> None:
+    while True:
+        queue_depth_cursor = await conn.execute("SELECT COUNT(*) FROM events WHERE synced = 0")
+        queue_depth_row = await queue_depth_cursor.fetchone()
+        await queue_depth_cursor.close()
+        queue_depth = int(queue_depth_row[0]) if queue_depth_row else 0
+
+        age_cursor = await conn.execute(
+            "SELECT occurred_at FROM events WHERE synced = 0 ORDER BY id ASC LIMIT 1"
+        )
+        age_row = await age_cursor.fetchone()
+        await age_cursor.close()
+        oldest_upload_age_seconds: float | None = None
+        if age_row and age_row[0]:
+            oldest = datetime.fromisoformat(str(age_row[0]))
+            oldest_upload_age_seconds = (datetime.now(timezone.utc) - oldest).total_seconds()
+
+        sensor_staleness_seconds: float | None = None
+        if stats.last_sensor_read_at:
+            last_sensor_dt = datetime.fromisoformat(stats.last_sensor_read_at)
+            sensor_staleness_seconds = (datetime.now(timezone.utc) - last_sensor_dt).total_seconds()
+
+        print(
+            "Maintenance metrics: "
+            f"sensor_status={stats.last_sensor_status} "
+            f"sensor_staleness_s={round(sensor_staleness_seconds, 2) if sensor_staleness_seconds is not None else 'n/a'} "
+            f"sensor_latency_ms={stats.last_sensor_latency_ms if stats.last_sensor_latency_ms is not None else 'n/a'} "
+            f"reinit={stats.sensor_reinit_successes}/{stats.sensor_reinit_attempts} "
+            f"state_transitions={stats.state_transitions} "
+            f"uploader_failure_streak={stats.uploader_failure_streak} "
+            f"queue_depth={queue_depth} "
+            f"oldest_upload_age_s={round(oldest_upload_age_seconds, 2) if oldest_upload_age_seconds is not None else 'n/a'} "
+            f"last_upload_ok_at={stats.last_upload_ok_at or 'n/a'}"
+        )
+        await asyncio.sleep(config.maintenance_interval_seconds)
+
+
 async def run() -> None:
     config = load_config()
     monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms)
+    stats = RuntimeStats()
+    sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
     async with aiosqlite.connect(config.db_path) as conn:
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            upload_backoff_seconds = config.upload_backoff_initial_seconds
-            while True:
-                occurred_at = datetime.now(timezone.utc).isoformat()
-                payload = monitor.read()
-                await write_reading(conn, config.vehicle_id, occurred_at, payload, config.queue_max_events)
-
-                uploaded, queue_depth = await drain_upload_queue(config, conn, session)
-                if uploaded:
-                    upload_backoff_seconds = config.upload_backoff_initial_seconds
-                else:
-                    jitter = random.uniform(0, min(1.0, upload_backoff_seconds * 0.2))
-                    upload_backoff_seconds = min(
-                        config.upload_backoff_max_seconds,
-                        max(config.upload_backoff_initial_seconds, upload_backoff_seconds * 2),
-                    )
-                    print(
-                        "Uploader backoff active: "
-                        f"next_delay={round(upload_backoff_seconds + jitter, 2)}s queue_depth={queue_depth}"
-                    )
-                    await asyncio.sleep(upload_backoff_seconds + jitter)
-
-                print(f"Stored power reading: {payload.get('status')} at {occurred_at}")
-                await asyncio.sleep(config.sample_interval_seconds)
+            async with asyncio.TaskGroup() as task_group:
+                task_group.create_task(sensor_loop(config, monitor, sensor_queue, stats))
+                task_group.create_task(state_engine_loop(config, conn, sensor_queue, stats))
+                task_group.create_task(uploader_loop(config, conn, session, stats))
+                task_group.create_task(maintenance_loop(config, conn, stats))
 
 
 if __name__ == "__main__":
