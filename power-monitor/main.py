@@ -179,6 +179,8 @@ def load_config() -> Config:
 
 
 class UpsMonitor:
+    SOC_ESTIMATE_METHOD = "voltage_curve_loaded"
+
     def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float) -> None:
         self._i2c_addresses = i2c_addresses
         self._shunt_ohms = shunt_ohms
@@ -241,10 +243,12 @@ class UpsMonitor:
         try:
             metrics = self._ina.read()
             current_ma = float(metrics["current_ma"])
+            state_of_charge_pct_estimate = self._estimate_soc(float(metrics["bus_voltage_v"]))
             return _finalize({
                 "status": "ok",
                 **metrics,
-                "state_of_charge_pct": self._estimate_soc(float(metrics["bus_voltage_v"])),
+                "state_of_charge_pct_estimate": state_of_charge_pct_estimate,
+                "estimate_method": self.SOC_ESTIMATE_METHOD,
                 "is_charging": current_ma > 0,
             })
         except DeviceRangeError:
