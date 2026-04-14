@@ -1,5 +1,18 @@
 version: '2.1'
 services:
+  gps-multiplexer:
+    image: alpine:latest
+    privileged: true
+    restart: always
+    devices:
+      - "/dev/serial0:/dev/serial0"
+    volumes:
+      - virtual-serial:/dev/virtual
+    command: >
+      sh -c "apk add --no-cache socat &&
+             mkdir -p /dev/virtual &&
+             socat -d -d /dev/serial0,b9600,raw,echo=0,nonblock=1 pty,link=/dev/virtual/gps_stream,raw,echo=0,waitslave"
+
   ble-sensor:
     build: ./ble-sensor
     privileged: true
@@ -25,16 +38,19 @@ services:
     privileged: true
     restart: always
     devices:
-      - "/dev/serial0:/dev/serial0"
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
       - telematics-data:/data
+      - virtual-serial:/dev/virtual
     cpuset: "1,2"
     environment:
       - UDEV=1
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+      - GPS_SERIAL_DEVICE=/dev/virtual/gps_stream
+    depends_on:
+      - gps-multiplexer
 
 
   power-monitor:
@@ -56,3 +72,4 @@ services:
 
 volumes:
   telematics-data:
+  virtual-serial:
