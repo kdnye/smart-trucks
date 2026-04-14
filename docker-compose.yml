@@ -1,11 +1,19 @@
 version: '2.1'
 services:
   gps-multiplexer:
+    build:
+      context: .
+      dockerfile: gps-multiplexer/Dockerfile
     image: alpine:latest
     privileged: true
     restart: always
     devices:
       - "/dev/serial0:/dev/serial0"
+    environment:
+      - UDEV=1
+      - GPS_SERIAL_DEVICE=/dev/serial0
+      - GPS_BAUD_RATE=9600
+      - GPS_TCP_PORT=2947
     volumes:
       - virtual-serial:/dev/virtual
     command: >
@@ -37,6 +45,8 @@ services:
       dockerfile: telematics-edge/Dockerfile
     privileged: true
     restart: always
+    depends_on:
+      - gps-multiplexer
     devices:
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
@@ -48,6 +58,7 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+      - GPS_SERIAL_DEVICE=tcp://gps-multiplexer:2947
       - GPS_SERIAL_DEVICE=/dev/virtual/gps_stream
     depends_on:
       - gps-multiplexer

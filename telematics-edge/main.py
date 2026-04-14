@@ -511,8 +511,13 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
 
 async def run() -> None:
     config = load_config()
+    # TCP addresses (e.g. tcp://gps-multiplexer:2947) are served by the
+    # gps-multiplexer container and must not be probed as serial ports.
+    serial_probe_candidates = tuple(
+        c for c in config.gps_serial_candidates if not c.startswith("tcp://")
+    )
     inventory = build_hardware_inventory(
-        gps_candidates=config.gps_serial_candidates,
+        gps_candidates=serial_probe_candidates,
         gps_baud_rate=config.gps_baud_rate,
         i2c_bus=config.imu_i2c_bus,
         ups_expected_addresses=tuple(),

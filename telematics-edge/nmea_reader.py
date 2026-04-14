@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket as _socket
 import threading
 import time
 from dataclasses import dataclass
@@ -95,6 +96,13 @@ class NMEAReader:
         self._reader_thread = None
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
+        """Dispatch to the TCP or serial reader depending on the configured port scheme."""
+        if self.port.startswith("tcp://"):
+            self._tcp_reader_loop(loop, stop_event)
+        else:
+            self._serial_reader_loop(loop, stop_event)
+
+    def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
         reconnect_backoff_seconds = 1.0
         max_backoff_seconds = 30.0
@@ -150,6 +158,67 @@ class NMEAReader:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error(
                     "Unexpected GPS reader error: %s. Reconnecting in %.1f seconds.",
+                    exc,
+                    reconnect_backoff_seconds,
+                )
+                if stop_event.wait(reconnect_backoff_seconds):
+                    break
+                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
+
+    def _tcp_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
+        """TCP client reader: connects to gps-multiplexer and forwards NMEA lines to the queue.
+
+        Port format: tcp://host:port  (e.g. tcp://gps-multiplexer:2947)
+        """
+        addr = self.port[len("tcp://"):]
+        host, port_str = addr.rsplit(":", 1)
+        port = int(port_str)
+
+        reconnect_backoff_seconds = 1.0
+        max_backoff_seconds = 30.0
+
+        while not stop_event.is_set():
+            try:
+                with _socket.create_connection((host, port), timeout=10) as sock:
+                    logger.info("GPS TCP connected to %s:%d", host, port)
+                    sock.settimeout(5.0)
+
+                    data_received = False
+                    buf = b""
+                    while not stop_event.is_set():
+                        try:
+                            chunk = sock.recv(4096)
+                        except _socket.timeout:
+                            continue
+                        if not chunk:
+                            logger.warning("GPS TCP connection closed by multiplexer.")
+                            break
+
+                        if not data_received:
+                            data_received = True
+                            reconnect_backoff_seconds = 1.0
+
+                        buf += chunk
+                        while b"\n" in buf:
+                            raw_line, buf = buf.split(b"\n", 1)
+                            decoded_line = raw_line.decode("ascii", errors="ignore").strip()
+                            if decoded_line:
+                                loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
+
+            except (_socket.error, OSError) as exc:
+                logger.warning(
+                    "GPS TCP connection to %s:%d failed: %s. Reconnecting in %.1f seconds.",
+                    host,
+                    port,
+                    exc,
+                    reconnect_backoff_seconds,
+                )
+                if stop_event.wait(reconnect_backoff_seconds):
+                    break
+                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error(
+                    "GPS TCP unexpected error: %s. Reconnecting in %.1f seconds.",
                     exc,
                     reconnect_backoff_seconds,
                 )
