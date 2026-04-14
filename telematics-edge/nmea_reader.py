@@ -96,39 +96,58 @@ class NMEAReader:
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
-        self._event_loop = loop
-        self._reader_stop_event = stop_event
-        self._blocking_read_worker()
+        self._serial_reader_loop(loop, stop_event)
 
-    def _blocking_read_worker(self) -> None:
+    def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
+        """Blocking serial reader that forwards decoded lines into the asyncio queue."""
         import time
         import serial
 
-        while self._reader_stop_event and not self._reader_stop_event.is_set():
+        reconnect_backoff_seconds = 1.0
+        max_backoff_seconds = 30.0
+
+        while not stop_event.is_set():
             try:
-                with serial.Serial(self.device, baudrate=self.baud, timeout=1.0, exclusive=True) as handle:
-                    logger.info(f"Successfully locked {self.device}")
-                    if hasattr(handle, "reset_input_buffer"):
-                        handle.reset_input_buffer()
+                with serial.Serial(
+                    self.port,
+                    baudrate=self.baudrate,
+                    timeout=1.0,
+                    exclusive=True,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                ) as conn:
+                    logger.info("Successfully locked %s", self.port)
+                    conn.reset_input_buffer()
+                    reconnect_backoff_seconds = 3.0
 
-                    while self._reader_stop_event and not self._reader_stop_event.is_set():
+                    while not stop_event.is_set():
                         try:
-                            line = handle.readline().decode("ascii", errors="ignore").strip()
-                            if line and hasattr(self, "_event_loop"):
-                                self._event_loop.call_soon_threadsafe(self._enqueue_line, line)
-                        except serial.SerialException as e:
-                            logger.warning(f"Transient serial read error: {e}")
-                            break  # Break inner loop to force handle closure and reconnect
-            except serial.SerialException as e:
-                logger.error(f"Hardware port locked or unavailable. Retrying in 3s... ({e})")
-                time.sleep(3.0)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f"Fatal GPS reader error: {e}")
-                time.sleep(3.0)
+                            raw_line = conn.readline()
+                            if not raw_line:
+                                continue
 
-    def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Backward-compatible wrapper around the hardened blocking worker."""
-        self._serial_reader_thread(loop, stop_event)
+                            decoded_line = raw_line.decode("ascii", errors="ignore").strip()
+                            if decoded_line:
+                                loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
+                        except serial.SerialException as exc:
+                            logger.warning("Transient serial read error on %s: %s", self.port, exc)
+                            break
+            except serial.SerialException as exc:
+                logger.error(
+                    "Hardware port %s unavailable. Retrying in %.1fs... (%s)",
+                    self.port,
+                    reconnect_backoff_seconds,
+                    exc,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Fatal GPS reader error on %s: %s", self.port, exc)
+
+            if stop_event.is_set():
+                break
+
+            time.sleep(reconnect_backoff_seconds)
+            reconnect_backoff_seconds = min(reconnect_backoff_seconds * 2.0, max_backoff_seconds)
 
     def _tcp_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Legacy TCP mode removed; GPS now uses direct serial hardware access."""
