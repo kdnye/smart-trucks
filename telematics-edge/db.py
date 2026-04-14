@@ -330,6 +330,40 @@ async def get_db_stats() -> dict[str, int]:
         }
 
 
+async def get_latest_power_snapshot(vehicle_id: str) -> dict[str, Any] | None:
+    """Return the most recent power snapshot payload for a vehicle, if present."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """
+                SELECT occurred_at, payload
+                FROM power_readings
+                WHERE vehicle_id = ?
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT 1
+                """,
+                (vehicle_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+
+        occurred_at, payload_json = row
+        return {
+            "occurred_at": str(occurred_at),
+            "payload": json.loads(str(payload_json)),
+        }
+    except aiosqlite.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            logger.warning("Power snapshot table is unavailable: %s", exc)
+            return None
+        logger.error("Failed to fetch latest power snapshot: %s", exc)
+        return None
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to fetch latest power snapshot: %s", exc)
+        return None
+
+
 async def purge_old_sent_rows(days: int = 7) -> int:
     """Delete rows already sent to cloud and older than `days` days."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
