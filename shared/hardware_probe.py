@@ -139,6 +139,9 @@ def probe_nmea_candidates(
             )
         )
 
+    # Give slower UART drivers time to flush and release file descriptors
+    # before the long-running GPS reader reopens the same port.
+    time.sleep(1.0)
     return tuple(results)
 
 

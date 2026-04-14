@@ -14,7 +14,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 @asynccontextmanager
 async def _connect_db() -> Any:
     """Open SQLite connection with Pi-friendly pragmas."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=15.0) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
         await db.execute("PRAGMA temp_store=MEMORY;")
