@@ -69,8 +69,9 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
 | `UPS_I2C_ADDRESS` | I2C address for UPS INA219 monitor. | `0x43` |
-| `UPS_I2C_ADDRESS_CANDIDATES` | Optional comma-separated fallback INA219 addresses (hex) to try if the primary address is unavailable. | `0x40,0x41` |
-| `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `10` |
+| `UPS_I2C_ADDRESS_CANDIDATES` | Optional comma-separated fallback INA219 addresses (hex) to try if the primary address is unavailable. | `0x43,0x40,0x41,0x44,0x45` |
+| `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `2` |
+| `POWER_UPLOAD_BATCH_SIZE` | Number of power samples uploaded per batch. | `50` |
 | `UPS_SHUNT_OHMS` | INA219 shunt resistor value in ohms for UPS current/power calibration. | `0.01` |
 
 > ⚠️ `UPS_SHUNT_OHMS` must match your UPS HAT hardware. A `0.1` vs `0.01` mismatch causes approximately **10x error** in INA219 current/power telemetry.
