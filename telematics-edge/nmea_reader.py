@@ -95,7 +95,7 @@ class NMEAReader:
 
         while not stop_event.is_set():
             try:
-                with serial.Serial(self.port, self.baudrate, timeout=1) as conn:
+                with serial.Serial(self.port, self.baudrate, timeout=2) as conn:
                     logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
                     reconnect_backoff_seconds = 1.0
 
