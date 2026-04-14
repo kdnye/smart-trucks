@@ -786,7 +786,7 @@ async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats:
 async def run() -> None:
     config = load_config()
     inventory = build_hardware_inventory(
-        gps_candidates=config.gps_serial_candidates,
+        gps_candidates=(),  # power-monitor does not own the GPS serial port
         gps_baud_rate=config.gps_baud_rate,
         i2c_bus=config.i2c_bus,
         ups_expected_addresses=config.ina219_addresses,

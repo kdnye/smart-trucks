@@ -95,9 +95,8 @@ class NMEAReader:
 
         while not stop_event.is_set():
             try:
-                with serial.Serial(self.port, self.baudrate, timeout=2) as conn:
+                with serial.Serial(self.port, self.baudrate, timeout=2, exclusive=True) as conn:
                     logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
-                    reconnect_backoff_seconds = 1.0
 
                     try:
                         conn.reset_input_buffer()
@@ -105,6 +104,7 @@ class NMEAReader:
                         logger.debug("Could not flush GPS serial input buffer: %s", exc)
 
                     empty_read_streak = 0
+                    data_received = False
                     while not stop_event.is_set():
                         try:
                             line = conn.readline()
@@ -124,6 +124,12 @@ class NMEAReader:
 
                         if not line:
                             continue
+
+                        # Only reset the reconnect backoff once we have confirmed the
+                        # port is delivering real data, not merely that it opened.
+                        if not data_received:
+                            data_received = True
+                            reconnect_backoff_seconds = 1.0
 
                         empty_read_streak = 0
                         decoded_line = line.decode("ascii", errors="ignore").strip()
