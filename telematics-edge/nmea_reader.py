@@ -82,9 +82,15 @@ class NMEAReader:
         self._reader_thread.start()
 
     def _stop_reader_thread(self) -> None:
-        """Stop and clear the reader thread state."""
+        """Stop and clear the reader thread state, releasing serial resources."""
         if self._reader_stop_event:
             self._reader_stop_event.set()
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=3.0)
+            if self._reader_thread.is_alive():
+                logger.warning("GPS reader thread did not stop cleanly within 3.0s")
+
         self._reader_stop_event = None
         self._reader_thread = None
 
