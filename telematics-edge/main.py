@@ -242,7 +242,22 @@ async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
             "gps_timestamp": reading.timestamp.isoformat() if reading.timestamp else None,
         }
 
-    await reader.read_loop(on_reading)
+    retry_backoff_seconds = 1.0
+    max_retry_backoff_seconds = 30.0
+
+    while True:
+        try:
+            await reader.read_loop(on_reading)
+            state.gps_reader_ok = False
+            print("GPS reader loop exited unexpectedly. Restarting reader.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            state.gps_reader_ok = False
+            print(f"GPS reader worker crashed: {exc}. Restarting in {retry_backoff_seconds:.1f}s.")
+
+        await asyncio.sleep(retry_backoff_seconds)
+        retry_backoff_seconds = min(max_retry_backoff_seconds, retry_backoff_seconds * 2)
 
 
 async def post_payload(

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
@@ -89,28 +90,66 @@ class NMEAReader:
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
+        reconnect_backoff_seconds = 1.0
+        max_backoff_seconds = 30.0
+
         while not stop_event.is_set():
             try:
                 with serial.Serial(self.port, self.baudrate, timeout=1) as conn:
                     logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
+                    reconnect_backoff_seconds = 1.0
+
+                    try:
+                        conn.reset_input_buffer()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.debug("Could not flush GPS serial input buffer: %s", exc)
+
+                    empty_read_streak = 0
                     while not stop_event.is_set():
-                        line = conn.readline()
+                        try:
+                            line = conn.readline()
+                        except serial.SerialException as exc:
+                            if "returned no data" in str(exc).lower():
+                                empty_read_streak += 1
+                                logger.warning(
+                                    "GPS transient empty read on %s (%s/3): %s",
+                                    self.port,
+                                    empty_read_streak,
+                                    exc,
+                                )
+                                if empty_read_streak < 3:
+                                    time.sleep(0.25)
+                                    continue
+                            raise
+
                         if not line:
                             continue
 
+                        empty_read_streak = 0
                         decoded_line = line.decode("ascii", errors="ignore").strip()
                         if not decoded_line:
                             continue
 
                         loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
             except serial.SerialException as exc:
-                logger.warning("Serial read failed on %s: %s. Reconnecting in 3 seconds.", self.port, exc)
-                if stop_event.wait(3.0):
+                logger.warning(
+                    "Serial read failed on %s: %s. Reconnecting in %.1f seconds.",
+                    self.port,
+                    exc,
+                    reconnect_backoff_seconds,
+                )
+                if stop_event.wait(reconnect_backoff_seconds):
                     break
+                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.error("Unexpected GPS reader error: %s. Reconnecting in 3 seconds.", exc)
-                if stop_event.wait(3.0):
+                logger.error(
+                    "Unexpected GPS reader error: %s. Reconnecting in %.1f seconds.",
+                    exc,
+                    reconnect_backoff_seconds,
+                )
+                if stop_event.wait(reconnect_backoff_seconds):
                     break
+                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
 
     def _enqueue_line(self, line: str) -> None:
         """Enqueue latest NMEA line without blocking event loop."""
