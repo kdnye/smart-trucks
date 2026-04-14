@@ -83,9 +83,15 @@ class NMEAReader:
         self._reader_thread.start()
 
     def _stop_reader_thread(self) -> None:
-        """Stop and clear the reader thread state."""
+        """Stop and clear the reader thread state, releasing serial resources."""
         if self._reader_stop_event:
             self._reader_stop_event.set()
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=3.0)
+            if self._reader_thread.is_alive():
+                logger.warning("GPS reader thread did not stop cleanly within 3.0s")
+
         self._reader_stop_event = None
         self._reader_thread = None
 
@@ -103,7 +109,7 @@ class NMEAReader:
 
         while not stop_event.is_set():
             try:
-                with serial.Serial(self.port, self.baudrate, timeout=2, exclusive=True) as conn:
+                with serial.Serial(self.port, self.baudrate, timeout=0.5, exclusive=True) as conn:
                     logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
 
                     try:
@@ -118,16 +124,10 @@ class NMEAReader:
                             line = conn.readline()
                         except serial.SerialException as exc:
                             if "returned no data" in str(exc).lower():
-                                empty_read_streak += 1
-                                logger.warning(
-                                    "GPS transient empty read on %s (%s/3): %s",
-                                    self.port,
-                                    empty_read_streak,
-                                    exc,
-                                )
-                                if empty_read_streak < 3:
-                                    time.sleep(0.25)
-                                    continue
+                                empty_read_streak = min(empty_read_streak + 1, 3)
+                                logger.warning("GPS transient empty read on %s (%s/3): %s", self.port, empty_read_streak, exc)
+                                time.sleep(0.2)
+                                continue
                             raise
 
                         if not line:
