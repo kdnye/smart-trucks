@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -19,6 +20,10 @@ class Config:
     sample_interval_seconds: int
     ina219_addresses: tuple[int, ...]
     ina219_shunt_ohms: float
+    upload_batch_size: int
+    upload_backoff_initial_seconds: int
+    upload_backoff_max_seconds: int
+    queue_max_events: int
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -124,6 +129,10 @@ def load_config() -> Config:
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 10, minimum=5),
         ina219_addresses=ina219_addresses,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.1),
+        upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 25, minimum=1),
+        upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
+        upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
+        queue_max_events=_read_int_env("POWER_QUEUE_MAX_EVENTS", 2000, minimum=100),
     )
 
 
@@ -198,14 +207,33 @@ async def init_db(conn: aiosqlite.Connection) -> None:
             event_type TEXT NOT NULL,
             occurred_at TEXT NOT NULL,
             payload TEXT NOT NULL,
-            synced INTEGER DEFAULT 0
+            synced INTEGER DEFAULT 0,
+            upload_attempts INTEGER DEFAULT 0,
+            last_error TEXT
         )
         """
     )
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_sync_id ON events(synced, id)")
+    await _ensure_column(conn, "events", "upload_attempts", "INTEGER DEFAULT 0")
+    await _ensure_column(conn, "events", "last_error", "TEXT")
     await conn.commit()
 
 
-async def write_reading(conn: aiosqlite.Connection, vehicle_id: str, occurred_at: str, payload: dict[str, Any]) -> None:
+async def _ensure_column(conn: aiosqlite.Connection, table_name: str, column_name: str, column_def: str) -> None:
+    try:
+        await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+    except aiosqlite.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
+async def write_reading(
+    conn: aiosqlite.Connection,
+    vehicle_id: str,
+    occurred_at: str,
+    payload: dict[str, Any],
+    queue_max_events: int,
+) -> None:
     json_payload = json.dumps(payload, separators=(",", ":"))
     await conn.execute(
         "INSERT INTO power_readings(vehicle_id, occurred_at, payload) VALUES(?, ?, ?)",
@@ -214,6 +242,49 @@ async def write_reading(conn: aiosqlite.Connection, vehicle_id: str, occurred_at
     await conn.execute(
         "INSERT INTO events(vehicle_id, event_type, occurred_at, payload, synced) VALUES(?, 'power_snapshot', ?, ?, 0)",
         (vehicle_id, occurred_at, json_payload),
+    )
+    await conn.execute(
+        """
+        DELETE FROM events
+        WHERE id IN (
+            SELECT id FROM events
+            WHERE synced = 0
+            ORDER BY id ASC
+            LIMIT (
+                SELECT CASE WHEN COUNT(*) > ? THEN COUNT(*) - ? ELSE 0 END FROM events WHERE synced = 0
+            )
+        )
+        """,
+        (queue_max_events, queue_max_events),
+    )
+    await conn.commit()
+
+
+async def get_pending_events(conn: aiosqlite.Connection, limit: int) -> list[tuple[int, str, str, str]]:
+    cursor = await conn.execute(
+        """
+        SELECT id, vehicle_id, occurred_at, payload
+        FROM events
+        WHERE synced = 0 AND event_type = 'power_snapshot'
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return [(int(row[0]), str(row[1]), str(row[2]), str(row[3])) for row in rows]
+
+
+async def mark_event_uploaded(conn: aiosqlite.Connection, event_id: int) -> None:
+    await conn.execute("UPDATE events SET synced = 1, last_error = NULL WHERE id = ?", (event_id,))
+    await conn.commit()
+
+
+async def mark_event_failed(conn: aiosqlite.Connection, event_id: int, error_text: str) -> None:
+    await conn.execute(
+        "UPDATE events SET upload_attempts = upload_attempts + 1, last_error = ? WHERE id = ?",
+        (error_text[:300], event_id),
     )
     await conn.commit()
 
@@ -225,9 +296,9 @@ async def publish_snapshot(
     vehicle_id: str,
     occurred_at: str,
     payload: dict[str, Any],
-) -> None:
+) -> tuple[bool, str | None]:
     if not webhook_url:
-        return
+        return False, "webhook_not_configured"
 
     body = {
         "event_type": "power_snapshot",
@@ -239,9 +310,41 @@ async def publish_snapshot(
     try:
         async with session.post(webhook_url, json=body, headers=headers) as response:
             if response.status >= 400:
-                print(f"Power snapshot upload failed with status={response.status}")
+                response_text = (await response.text())[:300]
+                return False, f"http_{response.status}:{response_text}"
+            return True, None
     except Exception as exc:
-        print(f"Power snapshot upload error: {exc}")
+        return False, f"{type(exc).__name__}:{exc}"
+
+
+async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session: aiohttp.ClientSession) -> tuple[bool, int]:
+    pending = await get_pending_events(conn, config.upload_batch_size)
+    if not pending:
+        return True, 0
+
+    for event_id, vehicle_id, occurred_at, payload_json in pending:
+        payload = json.loads(payload_json)
+        success, error_text = await publish_snapshot(
+            session=session,
+            webhook_url=config.webhook_url,
+            api_key=config.api_key,
+            vehicle_id=vehicle_id,
+            occurred_at=occurred_at,
+            payload=payload,
+        )
+        if success:
+            await mark_event_uploaded(conn, event_id)
+            continue
+
+        reason = error_text or "unknown_error"
+        await mark_event_failed(conn, event_id, reason)
+        print(
+            "Power snapshot upload error: "
+            f"event_id={event_id} queue_depth={len(pending)} reason={reason}"
+        )
+        return False, len(pending)
+
+    return True, len(pending)
 
 
 async def run() -> None:
@@ -252,18 +355,27 @@ async def run() -> None:
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            upload_backoff_seconds = config.upload_backoff_initial_seconds
             while True:
                 occurred_at = datetime.now(timezone.utc).isoformat()
                 payload = monitor.read()
-                await write_reading(conn, config.vehicle_id, occurred_at, payload)
-                await publish_snapshot(
-                    session,
-                    config.webhook_url,
-                    config.api_key,
-                    config.vehicle_id,
-                    occurred_at,
-                    payload,
-                )
+                await write_reading(conn, config.vehicle_id, occurred_at, payload, config.queue_max_events)
+
+                uploaded, queue_depth = await drain_upload_queue(config, conn, session)
+                if uploaded:
+                    upload_backoff_seconds = config.upload_backoff_initial_seconds
+                else:
+                    jitter = random.uniform(0, min(1.0, upload_backoff_seconds * 0.2))
+                    upload_backoff_seconds = min(
+                        config.upload_backoff_max_seconds,
+                        max(config.upload_backoff_initial_seconds, upload_backoff_seconds * 2),
+                    )
+                    print(
+                        "Uploader backoff active: "
+                        f"next_delay={round(upload_backoff_seconds + jitter, 2)}s queue_depth={queue_depth}"
+                    )
+                    await asyncio.sleep(upload_backoff_seconds + jitter)
+
                 print(f"Stored power reading: {payload.get('status')} at {occurred_at}")
                 await asyncio.sleep(config.sample_interval_seconds)
 

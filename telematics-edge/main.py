@@ -39,6 +39,7 @@ class Config:
     heartbeat_interval_seconds: int
     sync_interval_seconds: int
     gps_serial_candidates: tuple[str, ...]
+    gps_probe_all_candidates: bool
     gps_baud_rate: int
     sync_batch_size: int
     sync_backoff_max_seconds: int
@@ -48,11 +49,16 @@ class Config:
 def load_config() -> Config:
     serial_candidates = tuple(
         candidate.strip()
-        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyAMA0,/dev/ttyS0").split(",")
+        for candidate in os.getenv("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0").split(",")
         if candidate.strip()
     )
     primary_device = os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0")
-    serial_devices: tuple[str, ...] = tuple(dict.fromkeys((primary_device, *serial_candidates)))
+    probe_all_candidates = os.getenv("GPS_PROBE_ALL_CANDIDATES", "false").strip().lower() in {"1", "true", "yes"}
+    serial_devices: tuple[str, ...]
+    if probe_all_candidates:
+        serial_devices = tuple(dict.fromkeys((primary_device, *serial_candidates)))
+    else:
+        serial_devices = (primary_device,)
     return Config(
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         webhook_url=os.getenv("WEBHOOK_URL"),
@@ -61,6 +67,7 @@ def load_config() -> Config:
         heartbeat_interval_seconds=max(10, int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "60"))),
         sync_interval_seconds=max(5, int(os.getenv("SYNC_INTERVAL_SECONDS", "20"))),
         gps_serial_candidates=serial_devices,
+        gps_probe_all_candidates=probe_all_candidates,
         gps_baud_rate=max(1200, int(os.getenv("GPS_BAUD_RATE", "9600"))),
         sync_batch_size=max(10, int(os.getenv("SYNC_BATCH_SIZE", "50"))),
         sync_backoff_max_seconds=max(30, int(os.getenv("SYNC_BACKOFF_MAX_SECONDS", "300"))),
@@ -166,10 +173,20 @@ def is_network_connected() -> bool:
 
 def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str, Any]:
     for serial_device in serial_devices:
+        if not os.path.exists(serial_device):
+            print(
+                "GPS serial path unavailable. "
+                f"device={serial_device} errno=2 exception_type=FileNotFoundError"
+            )
+            continue
+
         try:
             with serial.Serial(serial_device, baud_rate, timeout=2.0) as ser:
+                saw_data = False
                 for _ in range(20):
                     line = ser.readline().decode("ascii", errors="replace").strip()
+                    if line:
+                        saw_data = True
                     if not line.startswith(("$GPRMC", "$GPGGA", "$GNRMC", "$GNGGA")):
                         continue
 
@@ -194,8 +211,16 @@ def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str,
                         "speed_kmh": speed_kmh,
                         "gps_timestamp": str(getattr(msg, "timestamp", "")) or None,
                     }
+                if not saw_data:
+                    print(
+                        "GPS serial returned no data. "
+                        f"device={serial_device} baud={baud_rate} hint=check_wiring_or_port_contention"
+                    )
         except Exception as exc:
-            print(f"GPS serial error on {serial_device}: {exc}")
+            print(
+                "GPS serial error. "
+                f"device={serial_device} baud={baud_rate} exception_type={type(exc).__name__} error={exc}"
+            )
 
     return {"fix_status": "searching"}
 
