@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ import pynmea2
 import serial
 from ina219 import INA219, DeviceRangeError
 
-from db import init_db, insert_event
+from db import init_db, insert_event, get_unsynced_events, mark_event_synced, get_db_stats, purge_old_synced_events
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 
 
@@ -131,20 +132,40 @@ def get_latest_gps(serial_devices: tuple[str, ...], baud_rate: int) -> dict[str,
     return {"fix_status": "searching"}
 
 
-async def push_telemetry(session: aiohttp.ClientSession, config: Config, payload: dict[str, Any]) -> None:
+async def push_telemetry(session: aiohttp.ClientSession, config: Config, payload: dict[str, Any]) -> bool:
+    """Push a payload to the cloud webhook. Returns True on success."""
     if not config.webhook_url:
-        return
+        return False
 
     headers = {"X-Api-Key": config.api_key} if config.api_key else {}
     try:
         async with session.post(config.webhook_url, json=payload, headers=headers) as response:
             if response.status < 400:
                 print(f"Telematics synced. Status={response.status}")
+                return True
             else:
                 body = await response.text()
                 print(f"Sync failed. Status={response.status} Body={body[:200]}")
+                return False
     except Exception as exc:
         print(f"Cloud connection failed: {exc}")
+        return False
+
+
+_MAINTENANCE_INTERVAL_SECONDS = 3600  # Run maintenance checks every hour
+
+
+async def maintenance_worker() -> None:
+    """Background task: log DB health stats and purge old synced events every hour."""
+    while True:
+        await asyncio.sleep(_MAINTENANCE_INTERVAL_SECONDS)
+        stats = await get_db_stats()
+        print(
+            f"[Maintenance] DB health — pending={stats['pending']} synced={stats['synced']}"
+        )
+        deleted = await purge_old_synced_events(days=7)
+        if deleted:
+            print(f"[Maintenance] Purged {deleted} old synced events from database.")
 
 
 async def run() -> None:
@@ -152,6 +173,7 @@ async def run() -> None:
     power = PowerMonitor()
     imu = ImuMonitor()
     asyncio.create_task(imu.start())
+    asyncio.create_task(maintenance_worker())
 
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
@@ -159,6 +181,7 @@ async def run() -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
+            # 1. Gather current sensor data
             payload = {
                 "event_type": "edge_telematics_heartbeat",
                 "vehicle_id": config.vehicle_id,
@@ -179,8 +202,23 @@ async def run() -> None:
                     imu=payload["imu_metrics"].get("status"),
                 )
             )
+
+            # 2. Always persist locally first — data is never lost even if offline
             await insert_event(config.vehicle_id, "edge_telematics_heartbeat", payload)
-            await push_telemetry(session, config, payload)
+
+            # 3. Drain the backlog (includes the event we just saved, oldest first)
+            unsynced = await get_unsynced_events()
+            for event_id, _event_type, saved_payload_str in unsynced:
+                saved_payload = json.loads(saved_payload_str)
+                success = await push_telemetry(session, config, saved_payload)
+                if success:
+                    await mark_event_synced(event_id)
+                else:
+                    # Stop retrying on the first failure — network is down.
+                    # Remaining events stay queued and will be retried next cycle.
+                    print("Network offline. Keeping data safely in database.")
+                    break
+
             await asyncio.sleep(config.sync_interval_seconds)
 
 
