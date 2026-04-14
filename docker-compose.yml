@@ -1,15 +1,17 @@
 version: '2.1'
 services:
   gps-multiplexer:
-    build:
-      context: ./gps-multiplexer
-      dockerfile: Dockerfile
+    image: alpine:latest
     privileged: true
     restart: always
     devices:
       - "/dev/serial0:/dev/serial0"
     volumes:
       - virtual-serial:/dev/virtual
+    command: >
+      sh -c "apk add --no-cache socat &&
+             mkdir -p /dev/virtual &&
+             socat -d -d /dev/serial0,b9600,raw,echo=0,nonblock=1 pty,link=/dev/virtual/gps_stream,raw,echo=0,waitslave"
 
   ble-sensor:
     build: ./ble-sensor
