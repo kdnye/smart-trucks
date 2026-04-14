@@ -441,8 +441,12 @@ async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session
 @dataclass
 class RuntimeStats:
     last_sensor_read_at: str | None = None
+    last_successful_read_at: str | None = None
     last_sensor_latency_ms: float | None = None
     last_sensor_status: str | None = None
+    last_sensor_marker: str | None = None
+    consecutive_read_failures: int = 0
+    sensor_reinit_count: int = 0
     sensor_reinit_attempts: int = 0
     sensor_reinit_successes: int = 0
     state_transitions: int = 0
@@ -500,17 +504,65 @@ async def sensor_loop(config: Config, monitor: UpsMonitor, out_queue: asyncio.Qu
         latency_ms = round((asyncio.get_running_loop().time() - started) * 1000, 2)
         stats.last_sensor_read_at = occurred_at
         stats.last_sensor_latency_ms = latency_ms
-        stats.last_sensor_status = str(payload.get("status", "unknown"))
-
         status = str(payload.get("status", "unknown"))
+
+        # Recovery ladder:
+        # 1) transient read retry
+        # 2) INA219 reconfigure/recalibrate
+        # 3) I2C re-init of monitor object
+        # 4) keep explicit sensor fault marker if still failing
+        recovered_after_reinit = False
+        recovery_steps: list[str] = []
         if status in {"range_error", "read_error", "offline"}:
-            calibrated = monitor.calibrate()
-            if not calibrated:
-                stats.sensor_reinit_attempts += 1
-                if monitor.reinitialize():
-                    stats.sensor_reinit_successes += 1
-            payload["recovery_attempted"] = True
-            payload["recovery_mode"] = "calibrate" if calibrated else "reinitialize"
+            retry_payload = monitor.read()
+            retry_status = str(retry_payload.get("status", "unknown"))
+            recovery_steps.append("transient_retry")
+            if retry_status == "ok":
+                payload = retry_payload
+                status = retry_status
+                recovery_steps.append("retry_success")
+            else:
+                calibrated = monitor.calibrate()
+                recovery_steps.append("reconfigure_recalibrate")
+                if calibrated:
+                    recalibrated_payload = monitor.read()
+                    recalibrated_status = str(recalibrated_payload.get("status", "unknown"))
+                    if recalibrated_status == "ok":
+                        payload = recalibrated_payload
+                        status = recalibrated_status
+                        recovery_steps.append("recalibration_success")
+                if status != "ok":
+                    stats.sensor_reinit_attempts += 1
+                    recovery_steps.append("i2c_reinitialize")
+                    if monitor.reinitialize():
+                        stats.sensor_reinit_successes += 1
+                        stats.sensor_reinit_count += 1
+                        reinit_payload = monitor.read()
+                        reinit_status = str(reinit_payload.get("status", "unknown"))
+                        if reinit_status == "ok":
+                            payload = reinit_payload
+                            status = reinit_status
+                            recovered_after_reinit = True
+                            recovery_steps.append("reinitialize_success")
+
+        marker_map = {
+            "offline": "sensor_offline",
+            "read_error": "read_error",
+            "range_error": "range_error",
+        }
+        sensor_status_marker = "recovered_after_reinit" if recovered_after_reinit else marker_map.get(status, "ok")
+        payload["sensor_status_marker"] = sensor_status_marker
+        if recovery_steps:
+            payload["recovery_steps"] = recovery_steps
+
+        stats.last_sensor_status = status
+        stats.last_sensor_marker = sensor_status_marker
+        if status == "ok":
+            stats.last_successful_read_at = occurred_at
+            stats.consecutive_read_failures = 0
+        else:
+            stats.consecutive_read_failures += 1
+            payload["sensor_alert"] = True
 
         event = {"occurred_at": occurred_at, "payload": payload, "sensor_latency_ms": latency_ms}
         await out_queue.put(event)
@@ -641,6 +693,48 @@ async def maintenance_loop(config: Config, conn: aiosqlite.Connection, stats: Ru
         await asyncio.sleep(config.maintenance_interval_seconds)
 
 
+async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats: RuntimeStats) -> None:
+    while True:
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        queue_depth_cursor = await conn.execute("SELECT COUNT(*) FROM events WHERE synced = 0")
+        queue_depth_row = await queue_depth_cursor.fetchone()
+        await queue_depth_cursor.close()
+        queue_depth = int(queue_depth_row[0]) if queue_depth_row else 0
+
+        last_upload_success_age_sec: float | None = None
+        if stats.last_upload_ok_at:
+            last_upload_ok_dt = datetime.fromisoformat(stats.last_upload_ok_at)
+            last_upload_success_age_sec = max(0.0, (datetime.now(timezone.utc) - last_upload_ok_dt).total_seconds())
+
+        health_payload: dict[str, Any] = {
+            "queue_depth": queue_depth,
+            "consecutive_read_failures": stats.consecutive_read_failures,
+            "last_upload_success_age_sec": round(last_upload_success_age_sec, 2) if last_upload_success_age_sec is not None else None,
+            "sensor_reinit_count": stats.sensor_reinit_count,
+            "sensor_status_marker": stats.last_sensor_marker or "unknown",
+            "sensor_status": stats.last_sensor_status or "unknown",
+        }
+        if stats.last_successful_read_at:
+            last_successful_read_dt = datetime.fromisoformat(stats.last_successful_read_at)
+            health_payload["last_successful_read_age_sec"] = round(
+                max(0.0, (datetime.now(timezone.utc) - last_successful_read_dt).total_seconds()),
+                2,
+            )
+
+        if stats.consecutive_read_failures > 0:
+            health_payload["sensor_fault"] = True
+
+        await enqueue_event(
+            conn,
+            config.vehicle_id,
+            "power_health",
+            occurred_at,
+            health_payload,
+            config.queue_max_events,
+        )
+        await asyncio.sleep(60)
+
+
 async def run() -> None:
     config = load_config()
     monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms)
@@ -656,6 +750,7 @@ async def run() -> None:
                 task_group.create_task(state_engine_loop(config, conn, sensor_queue, stats))
                 task_group.create_task(uploader_loop(config, conn, session, stats))
                 task_group.create_task(maintenance_loop(config, conn, stats))
+                task_group.create_task(health_emitter_loop(config, conn, stats))
 
 
 if __name__ == "__main__":
