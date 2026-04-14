@@ -8,6 +8,7 @@ from typing import Awaitable, Callable, Optional
 
 import pynmea2
 import serial
+from shared.hardware_probe import edge_hardware_lock
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ class NMEAReader:
 
         while not stop_event.is_set():
             try:
-                with serial.Serial(self.port, self.baudrate, timeout=2, exclusive=True) as conn:
+                with serial.Serial(self.port, self.baudrate, timeout=0.5, exclusive=True) as conn:
                     logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
 
                     try:
@@ -113,19 +114,17 @@ class NMEAReader:
                     data_received = False
                     while not stop_event.is_set():
                         try:
-                            line = conn.readline()
+                            if conn.in_waiting <= 0:
+                                time.sleep(0.05)
+                                continue
+                            with edge_hardware_lock(timeout_sec=0.5):
+                                line = conn.readline()
                         except serial.SerialException as exc:
                             if "returned no data" in str(exc).lower():
-                                empty_read_streak += 1
-                                logger.warning(
-                                    "GPS transient empty read on %s (%s/3): %s",
-                                    self.port,
-                                    empty_read_streak,
-                                    exc,
-                                )
-                                if empty_read_streak < 3:
-                                    time.sleep(0.25)
-                                    continue
+                                empty_read_streak = min(empty_read_streak + 1, 3)
+                                logger.warning("GPS transient empty read on %s (%s/3): %s", self.port, empty_read_streak, exc)
+                                time.sleep(0.2)
+                                continue
                             raise
 
                         if not line:

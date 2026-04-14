@@ -3,10 +3,39 @@ from __future__ import annotations
 import json
 import os
 import time
+import contextlib
+import fcntl
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from smbus2 import SMBus
+
+
+@contextlib.contextmanager
+def edge_hardware_lock(timeout_sec: float = 1.0) -> Any:
+    """Best-effort cross-container lock for shared hardware bus access."""
+    lock_path = Path("/data/bus_collision.lock")
+    lock_path.touch(exist_ok=True)
+    acquired = False
+
+    with lock_path.open("r+", encoding="utf-8") as lock_file:
+        start_time = time.monotonic()
+        while True:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() - start_time >= timeout_sec:
+                    break
+                time.sleep(0.02)
+
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True)

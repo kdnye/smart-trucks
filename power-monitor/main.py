@@ -17,6 +17,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from shared.hardware_probe import (
     build_hardware_inventory,
+    edge_hardware_lock,
     parse_bool_env,
     parse_hex_list_env,
     parse_int_env,
@@ -283,7 +284,8 @@ class UpsMonitor:
             return _finalize({"status": "offline"})
 
         try:
-            metrics = self._ina.read()
+            with edge_hardware_lock(timeout_sec=1.0):
+                metrics = self._ina.read()
             current_ma = float(metrics["current_ma"])
             state_of_charge_pct_estimate = self._estimate_soc(float(metrics["bus_voltage_v"]))
             return _finalize({
