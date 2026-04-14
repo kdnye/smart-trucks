@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import threading
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
@@ -95,64 +94,37 @@ class NMEAReader:
         self._reader_thread = None
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Blocking serial reader that forwards decoded lines into the asyncio queue."""
-        reconnect_backoff_seconds = 1.0
+        """Blocking serial reader that self-heals on transient UART failures."""
+        reconnect_backoff_seconds = 3.0
         max_backoff_seconds = 30.0
 
         while not stop_event.is_set():
             try:
-                with serial.Serial(self.port, self.baudrate, timeout=0.5, exclusive=True) as conn:
-                    logger.info("Connected to GPS on %s at %s baud", self.port, self.baudrate)
+                with serial.Serial(self.port, baudrate=self.baudrate, timeout=1.0, exclusive=True) as conn:
+                    logger.info("Successfully locked %s", self.port)
+                    conn.reset_input_buffer()
+                    reconnect_backoff_seconds = 3.0
 
-                    try:
-                        conn.reset_input_buffer()
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.debug("Could not flush GPS serial input buffer: %s", exc)
-
-                    empty_read_streak = 0
-                    data_received = False
                     while not stop_event.is_set():
                         try:
-                            line = conn.readline()
+                            decoded_line = conn.readline().decode("ascii", errors="ignore").strip()
+                            if decoded_line:
+                                loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
                         except serial.SerialException as exc:
-                            if "returned no data" in str(exc).lower():
-                                empty_read_streak = min(empty_read_streak + 1, 3)
-                                logger.warning("GPS transient empty read on %s (%s/3): %s", self.port, empty_read_streak, exc)
-                                time.sleep(0.2)
-                                continue
-                            raise
-
-                        if not line:
-                            continue
-
-                        # Only reset the reconnect backoff once we have confirmed the
-                        # port is delivering real data, not merely that it opened.
-                        if not data_received:
-                            data_received = True
-                            reconnect_backoff_seconds = 1.0
-
-                        empty_read_streak = 0
-                        decoded_line = line.decode("ascii", errors="ignore").strip()
-                        if not decoded_line:
-                            continue
-
-                        loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
+                            logger.warning("Transient serial read error on %s: %s", self.port, exc)
+                            break
             except serial.SerialException as exc:
-                logger.warning(
-                    "Serial read failed on %s: %s. Reconnecting in %.1f seconds.",
+                logger.error(
+                    "Hardware port locked or unavailable on %s. Retrying in %.1fs (%s)",
                     self.port,
-                    exc,
                     reconnect_backoff_seconds,
+                    exc,
                 )
                 if stop_event.wait(reconnect_backoff_seconds):
                     break
                 reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.error(
-                    "Unexpected GPS reader error: %s. Reconnecting in %.1f seconds.",
-                    exc,
-                    reconnect_backoff_seconds,
-                )
+                logger.error("Fatal GPS reader error on %s. Retrying in %.1fs (%s)", self.port, reconnect_backoff_seconds, exc)
                 if stop_event.wait(reconnect_backoff_seconds):
                     break
                 reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)

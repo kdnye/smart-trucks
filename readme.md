@@ -118,6 +118,13 @@ The following patterns are expected during supervised updates and should not be 
    * Signature: `Serial read failed: device reports readiness to read but returned no data` in `telematics-edge`.
    * First checks:
      * Ensure only one process owns `/dev/serial0`.
+     * Ensure `telematics-edge` has direct `/dev/serial0` mapping (no user-space serial fan-out).
+     * In BalenaCloud Fleet Configuration, add a custom udev rule to hide Pi UART from ModemManager:
+       ```json
+       {
+         "99-ignore-serial": "SUBSYSTEM==\"tty\", KERNEL==\"serial0|ttyAMA0|ttyS0\", ENV{ID_MM_DEVICE_IGNORE}=\"1\""
+       }
+       ```
      * Verify GPS wiring and power stability.
      * Confirm `GPS_SERIAL_DEVICE` and `GPS_SERIAL_CANDIDATES` are set consistently.
 

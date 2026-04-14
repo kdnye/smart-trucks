@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from smbus2 import SMBus
+from smbus2 import SMBus, i2c_msg
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class IMUReader:
     def connect(self) -> bool:
         try:
             self.bus = SMBus(self.bus_num)
-            whoami = self.bus.read_byte_data(LSM6DSL_ADDRESS, WHO_AM_I)
+            whoami = self._read_register_byte(WHO_AM_I)
             if whoami != 0x6A:
                 logger.warning("Unexpected LSM6DSL WHO_AM_I value: 0x%02X", whoami)
 
@@ -76,10 +76,22 @@ class IMUReader:
     def _read_word_2c(self, register: int) -> int:
         if not self.bus:
             return 0
-        low = self.bus.read_byte_data(LSM6DSL_ADDRESS, register)
-        high = self.bus.read_byte_data(LSM6DSL_ADDRESS, register + 1)
+        write_msg = i2c_msg.write(LSM6DSL_ADDRESS, [register])
+        read_msg = i2c_msg.read(LSM6DSL_ADDRESS, 2)
+        self.bus.i2c_rdwr(write_msg, read_msg)
+        raw = list(read_msg)
+        low = raw[0]
+        high = raw[1]
         value = (high << 8) | low
         return value - 65536 if value >= 32768 else value
+
+    def _read_register_byte(self, register: int) -> int:
+        if not self.bus:
+            return 0
+        write_msg = i2c_msg.write(LSM6DSL_ADDRESS, [register])
+        read_msg = i2c_msg.read(LSM6DSL_ADDRESS, 1)
+        self.bus.i2c_rdwr(write_msg, read_msg)
+        return list(read_msg)[0]
 
     def get_acceleration(self) -> tuple[float, float, float]:
         x = self._read_word_2c(OUTX_L_XL) * self.accel_sensitivity_g
