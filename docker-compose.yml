@@ -2,7 +2,6 @@ version: '2.1'
 services:
   ble-sensor:
     build: ./ble-sensor
-    image: smart-truck/ble-sensor:latest
     privileged: true
     network_mode: "host"
     restart: always
@@ -23,7 +22,6 @@ services:
     build:
       context: .
       dockerfile: telematics-edge/Dockerfile
-    image: smart-truck/telematics-edge:latest
     privileged: true
     restart: always
     devices:
@@ -42,7 +40,6 @@ services:
     build:
       context: .
       dockerfile: power-monitor/Dockerfile
-    image: smart-truck/power-monitor:latest
     privileged: true
     restart: always
     devices:
