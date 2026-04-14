@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -31,12 +32,28 @@ class IMUSnapshot:
 ImuSnapshot = IMUSnapshot
 
 
+def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
+    """Executes a hardware-locked combined I2C transaction."""
+    retries = 3
+    for attempt in range(retries):
+        try:
+            with SMBus(bus_num) as bus:
+                write_msg = i2c_msg.write(address, [register])
+                read_msg = i2c_msg.read(address, length)
+                bus.i2c_rdwr(write_msg, read_msg)
+                return list(read_msg)
+        except OSError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.05)
+    raise RuntimeError("I2C read exhausted retries")
+
+
 class IMUReader:
     """LSM6DSL reader with 10Hz sampling and 1Hz snapshot emission."""
 
     def __init__(self, bus_num: int = 1) -> None:
         self.bus_num = bus_num
-        self.bus: SMBus | None = None
 
         self.harsh_threshold_g = float(os.getenv("HARSH_EVENT_G_THRESHOLD", "0.4"))
         self.gravity_baseline_g = float(os.getenv("GRAVITY_BASELINE_G", "1.0"))
@@ -45,13 +62,13 @@ class IMUReader:
 
     def connect(self) -> bool:
         try:
-            self.bus = SMBus(self.bus_num)
             whoami = self._read_register_byte(WHO_AM_I)
             if whoami != 0x6A:
                 logger.warning("Unexpected LSM6DSL WHO_AM_I value: 0x%02X", whoami)
 
             # 208Hz ODR, +/-2g scale, anti-aliasing 100Hz.
-            self.bus.write_byte_data(LSM6DSL_ADDRESS, CTRL1_XL, 0x50)
+            with SMBus(self.bus_num) as bus:
+                bus.write_byte_data(LSM6DSL_ADDRESS, CTRL1_XL, 0x50)
             logger.info(
                 "IMU initialized on I2C 0x%02X (WHO_AM_I=0x%02X). Threshold=%0.2fg, Gravity baseline=%0.2fg",
                 LSM6DSL_ADDRESS,
@@ -62,36 +79,17 @@ class IMUReader:
             return True
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("Could not initialize IMU on bus %s: %s", self.bus_num, exc)
-            self._close_bus()
             return False
 
-    def _close_bus(self) -> None:
-        if self.bus:
-            try:
-                self.bus.close()
-            except Exception:  # pylint: disable=broad-except
-                pass
-        self.bus = None
-
     def _read_word_2c(self, register: int) -> int:
-        if not self.bus:
-            return 0
-        write_msg = i2c_msg.write(LSM6DSL_ADDRESS, [register])
-        read_msg = i2c_msg.read(LSM6DSL_ADDRESS, 2)
-        self.bus.i2c_rdwr(write_msg, read_msg)
-        raw = list(read_msg)
+        raw = read_i2c_atomic(self.bus_num, LSM6DSL_ADDRESS, register, 2)
         low = raw[0]
         high = raw[1]
         value = (high << 8) | low
         return value - 65536 if value >= 32768 else value
 
     def _read_register_byte(self, register: int) -> int:
-        if not self.bus:
-            return 0
-        write_msg = i2c_msg.write(LSM6DSL_ADDRESS, [register])
-        read_msg = i2c_msg.read(LSM6DSL_ADDRESS, 1)
-        self.bus.i2c_rdwr(write_msg, read_msg)
-        return list(read_msg)[0]
+        return read_i2c_atomic(self.bus_num, LSM6DSL_ADDRESS, register, 1)[0]
 
     def get_acceleration(self) -> tuple[float, float, float]:
         x = self._read_word_2c(OUTX_L_XL) * self.accel_sensitivity_g
@@ -110,7 +108,7 @@ class IMUReader:
         last_snapshot_time = 0.0
 
         while True:
-            if not self.bus and not self.connect():
+            if not self.connect():
                 await asyncio.sleep(5)
                 continue
 
@@ -148,7 +146,6 @@ class IMUReader:
                     last_snapshot_time = current_time
             except OSError as exc:
                 logger.error("IMU I2C read error: %s. Resetting bus.", exc)
-                self._close_bus()
                 await asyncio.sleep(1)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error("IMU read error: %s", exc)

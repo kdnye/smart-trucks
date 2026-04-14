@@ -1,13 +1,11 @@
 import asyncio
 import logging
-import socket as _socket
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
 
 import pynmea2
-import serial
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +33,8 @@ class NMEAReader:
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600) -> None:
         self.port = port
         self.baudrate = baudrate
+        self.device = port
+        self.baud = baudrate
         self.current_reading = GpsReading()
         self._line_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
         self._reader_stop_event: Optional[threading.Event] = None
@@ -95,108 +95,46 @@ class NMEAReader:
         self._reader_thread = None
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Dispatch to the TCP or serial reader depending on the configured port scheme."""
-        if self.port.startswith("tcp://"):
-            self._tcp_reader_loop(loop, stop_event)
-        else:
-            self._serial_reader_loop(loop, stop_event)
+        """Blocking serial reader that forwards decoded lines into the asyncio queue."""
+        self._event_loop = loop
+        self._reader_stop_event = stop_event
+        self._blocking_read_worker()
+
+    def _blocking_read_worker(self) -> None:
+        import time
+        import serial
+
+        while self._reader_stop_event and not self._reader_stop_event.is_set():
+            try:
+                with serial.Serial(self.device, baudrate=self.baud, timeout=1.0, exclusive=True) as handle:
+                    logger.info(f"Successfully locked {self.device}")
+                    if hasattr(handle, "reset_input_buffer"):
+                        handle.reset_input_buffer()
+
+                    while self._reader_stop_event and not self._reader_stop_event.is_set():
+                        try:
+                            line = handle.readline().decode("ascii", errors="ignore").strip()
+                            if line and hasattr(self, "_event_loop"):
+                                self._event_loop.call_soon_threadsafe(self._enqueue_line, line)
+                        except serial.SerialException as e:
+                            logger.warning(f"Transient serial read error: {e}")
+                            break  # Break inner loop to force handle closure and reconnect
+            except serial.SerialException as e:
+                logger.error(f"Hardware port locked or unavailable. Retrying in 3s... ({e})")
+                time.sleep(3.0)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f"Fatal GPS reader error: {e}")
+                time.sleep(3.0)
 
     def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Blocking serial reader that forwards decoded lines into the asyncio queue."""
-        reconnect_backoff_seconds = 1.0
-        max_backoff_seconds = 30.0
-
-        while not stop_event.is_set():
-            try:
-                with serial.Serial(self.port, baudrate=self.baudrate, timeout=1.0, exclusive=True) as conn:
-                    logger.info("Successfully locked %s", self.port)
-                    conn.reset_input_buffer()
-                    reconnect_backoff_seconds = 3.0
-
-                    while not stop_event.is_set():
-                        try:
-                            decoded_line = conn.readline().decode("ascii", errors="ignore").strip()
-                            if decoded_line:
-                                loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
-                        except serial.SerialException as exc:
-                            logger.warning("Transient serial read error on %s: %s", self.port, exc)
-                            break
-            except serial.SerialException as exc:
-                logger.error(
-                    "Hardware port locked or unavailable on %s. Retrying in %.1fs (%s)",
-                    self.port,
-                    reconnect_backoff_seconds,
-                    exc,
-                )
-                if stop_event.wait(reconnect_backoff_seconds):
-                    break
-                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error("Fatal GPS reader error on %s. Retrying in %.1fs (%s)", self.port, reconnect_backoff_seconds, exc)
-                if stop_event.wait(reconnect_backoff_seconds):
-                    break
-                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
+        """Backward-compatible wrapper around the hardened blocking worker."""
+        self._serial_reader_thread(loop, stop_event)
 
     def _tcp_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """TCP client reader: connects to gps-multiplexer and forwards NMEA lines to the queue.
-
-        Port format: tcp://host:port  (e.g. tcp://gps-multiplexer:2947)
-        """
-        addr = self.port[len("tcp://"):]
-        host, port_str = addr.rsplit(":", 1)
-        port = int(port_str)
-
-        reconnect_backoff_seconds = 1.0
-        max_backoff_seconds = 30.0
-
-        while not stop_event.is_set():
-            try:
-                with _socket.create_connection((host, port), timeout=10) as sock:
-                    logger.info("GPS TCP connected to %s:%d", host, port)
-                    sock.settimeout(5.0)
-
-                    data_received = False
-                    buf = b""
-                    while not stop_event.is_set():
-                        try:
-                            chunk = sock.recv(4096)
-                        except _socket.timeout:
-                            continue
-                        if not chunk:
-                            logger.warning("GPS TCP connection closed by multiplexer.")
-                            break
-
-                        if not data_received:
-                            data_received = True
-                            reconnect_backoff_seconds = 1.0
-
-                        buf += chunk
-                        while b"\n" in buf:
-                            raw_line, buf = buf.split(b"\n", 1)
-                            decoded_line = raw_line.decode("ascii", errors="ignore").strip()
-                            if decoded_line:
-                                loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
-
-            except (_socket.error, OSError) as exc:
-                logger.warning(
-                    "GPS TCP connection to %s:%d failed: %s. Reconnecting in %.1f seconds.",
-                    host,
-                    port,
-                    exc,
-                    reconnect_backoff_seconds,
-                )
-                if stop_event.wait(reconnect_backoff_seconds):
-                    break
-                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error(
-                    "GPS TCP unexpected error: %s. Reconnecting in %.1f seconds.",
-                    exc,
-                    reconnect_backoff_seconds,
-                )
-                if stop_event.wait(reconnect_backoff_seconds):
-                    break
-                reconnect_backoff_seconds = min(max_backoff_seconds, reconnect_backoff_seconds * 2)
+        """Legacy TCP mode removed; GPS now uses direct serial hardware access."""
+        _ = loop
+        _ = stop_event
+        logger.error("TCP GPS mode is no longer supported; configure a serial device path.")
 
     def _enqueue_line(self, line: str) -> None:
         """Enqueue latest NMEA line without blocking event loop."""

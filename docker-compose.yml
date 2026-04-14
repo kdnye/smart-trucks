@@ -8,7 +8,7 @@ services:
     labels:
       io.balena.features.dbus: '1'
     volumes:
-      - telematics-data:/data
+      - telematics_data:/data
     environment:
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true
@@ -28,7 +28,7 @@ services:
       - "/dev/i2c-1:/dev/i2c-1"
       - "/dev/serial0:/dev/serial0"
     volumes:
-      - telematics-data:/data
+      - telematics_data:/data
     cpuset: "1,2"
     environment:
       - UDEV=1
@@ -47,7 +47,7 @@ services:
     devices:
       - "/dev/i2c-1:/dev/i2c-1"
     volumes:
-      - telematics-data:/data
+      - telematics_data:/data
     cpuset: "3"
     environment:
       - UDEV=1
@@ -56,4 +56,4 @@ services:
       - API_KEY=${API_KEY}
 
 volumes:
-  telematics-data:
+  telematics_data:
