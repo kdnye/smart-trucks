@@ -189,7 +189,7 @@ def build_hardware_inventory(
     ups_expected_addresses: tuple[int, ...],
     imu_expected_addresses: tuple[int, ...],
     *,
-    probe_serial: bool = True,
+    probe_serial: bool = False,
 ) -> HardwareInventory:
     nmea_probe: tuple[NmeaProbeResult, ...] = tuple()
     if probe_serial:
