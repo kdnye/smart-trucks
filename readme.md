@@ -108,6 +108,26 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 **Status**: Development / Testing Phase (Pi 3B)  
 **Maintainer**: Dave Alexander
 
+
+### Check device access across all containers
+When you hit errors like `No such file or directory: '/dev/i2c-1'`, verify both compose mappings and runtime visibility for every service:
+
+```bash
+./scripts/check-container-hw-access.sh
+```
+
+If containers are not running yet, audit configuration only:
+
+```bash
+./scripts/check-container-hw-access.sh --config-only
+```
+
+Expected minimum mappings:
+* `telematics-edge`: `/dev/i2c-1` and `/dev/serial0`
+* `power-monitor`: `/dev/i2c-1`
+
+If runtime checks return `no`, redeploy with the updated `docker-compose.yml` and confirm host-level I2C/UART are enabled in Balena Device Configuration.
+
 ## Balena Runtime Troubleshooting (Observed April 14, 2026)
 
 The following patterns are expected during supervised updates and should not be treated as hard failures on their own:
