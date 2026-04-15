@@ -2,8 +2,8 @@ version: '2.1'
 services:
   telematics-edge:
     build:
-      context: ./telematics-edge
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: telematics-edge/Dockerfile
     privileged: true
     restart: always
     labels:
@@ -23,8 +23,8 @@ services:
 
   power-monitor:
     build:
-      context: ./power-monitor
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: power-monitor/Dockerfile
     privileged: true
     restart: always
     devices:
@@ -41,8 +41,8 @@ services:
 
   ble-sensor:
     build:
-      context: ./ble-sensor
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ble-sensor/Dockerfile
     network_mode: host
     privileged: true
     restart: always
