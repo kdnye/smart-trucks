@@ -31,6 +31,7 @@ class NMEAReader:
     """Async NMEA reader with reconnect support and merged GPS state updates."""
 
     _SENTENCE_TYPES_USING_TYPED_FIELDS = {"RMC", "GGA", "GSA", "GLL", "VTG"}
+    _SENTENCE_TYPES_EMITTING_UPDATES = {"RMC", "GGA", "GLL"}
 
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600) -> None:
         self.port = port
@@ -67,7 +68,11 @@ class NMEAReader:
 
                 self._update_reading(msg)
 
-                if msg.sentence_type == "RMC":
+                # Emit merged GPS updates for sentence types that can carry
+                # position/fix information. Some modules intermittently omit
+                # RMC, so relying only on RMC can leave the dashboard stuck in
+                # "searching" even while valid GGA/GLL fixes are arriving.
+                if msg.sentence_type in self._SENTENCE_TYPES_EMITTING_UPDATES:
                     await callback(self.current_reading)
         except asyncio.CancelledError:
             logger.info("NMEA reader loop cancelled")
