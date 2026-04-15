@@ -13,6 +13,7 @@ WORKDIR /usr/src/app
 COPY telematics-edge/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY shared/ /usr/src/shared/
 COPY telematics-edge/ .
 
 CMD ["python", "main.py"]
