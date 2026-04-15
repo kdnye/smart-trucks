@@ -106,8 +106,6 @@ class Config:
     upload_backoff_max_seconds: int
     queue_max_events: int
     maintenance_interval_seconds: int
-    gps_serial_candidates: tuple[str, ...]
-    gps_baud_rate: int
     imu_i2c_bus: int
     imu_expected_addresses: tuple[int, ...]
     imu_required: bool
@@ -207,11 +205,6 @@ def load_config() -> Config:
     configured_candidates = _read_hex_address_list_env("UPS_I2C_ADDRESS_CANDIDATES")
     fallback_candidates = (0x43, 0x40, 0x41, 0x44, 0x45)
     ina219_addresses = _dedupe_preserve_order([primary_address, *configured_candidates, *fallback_candidates])
-    gps_serial_candidates = tuple(
-        candidate.strip()
-        for candidate in (_sanitize_env_value(os.getenv("GPS_SERIAL_CANDIDATES")) or "").split(",")
-        if candidate.strip()
-    )
     i2c_bus = _read_int_env("I2C_BUS", 1, minimum=0)
 
     return Config(
@@ -228,8 +221,6 @@ def load_config() -> Config:
         upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
         queue_max_events=_read_int_env("POWER_QUEUE_MAX_EVENTS", 2000, minimum=100),
         maintenance_interval_seconds=_read_int_env("POWER_MAINTENANCE_INTERVAL_SECONDS", 30, minimum=10),
-        gps_serial_candidates=gps_serial_candidates,
-        gps_baud_rate=parse_int_env("GPS_BAUD_RATE", 9600, minimum=1200),
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=parse_bool_env("IMU_REQUIRED", True),
@@ -813,10 +804,11 @@ async def run() -> None:
     config = load_config()
     inventory = build_hardware_inventory(
         gps_candidates=(),  # power-monitor does not own the GPS serial port
-        gps_baud_rate=config.gps_baud_rate,
+        gps_baud_rate=9600,
         i2c_bus=config.i2c_bus,
         ups_expected_addresses=config.ina219_addresses,
         imu_expected_addresses=config.imu_expected_addresses,
+        probe_serial=False,
     )
     print(f"Hardware inventory: {inventory.to_json()}")
     os.makedirs("/data", exist_ok=True)

@@ -188,10 +188,16 @@ def build_hardware_inventory(
     i2c_bus: int,
     ups_expected_addresses: tuple[int, ...],
     imu_expected_addresses: tuple[int, ...],
+    *,
+    probe_serial: bool = True,
 ) -> HardwareInventory:
+    nmea_probe: tuple[NmeaProbeResult, ...] = tuple()
+    if probe_serial:
+        nmea_probe = probe_nmea_candidates(gps_candidates, gps_baud_rate)
+
     return HardwareInventory(
         gps_candidates=gps_candidates,
-        nmea_probe=probe_nmea_candidates(gps_candidates, gps_baud_rate),
+        nmea_probe=nmea_probe,
         i2c_probe=probe_i2c(i2c_bus, ups_expected_addresses, imu_expected_addresses),
     )
 
