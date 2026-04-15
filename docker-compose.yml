@@ -1,5 +1,16 @@
 version: '2.1'
 services:
+  gps-multiplexer:
+    build:
+      context: .
+      dockerfile: gps-multiplexer/Dockerfile
+    privileged: true
+    restart: always
+    devices:
+      - "/dev/serial0:/dev/serial0" # Sole owner of the GPS serial port
+    environment:
+      - GPS_SERIAL_DEVICE=/dev/serial0
+
   telematics-edge:
     build:
       context: .
@@ -10,7 +21,6 @@ services:
       io.balena.features.dbus: '1'
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the IMU
-      - "/dev/serial0:/dev/serial0" # Grants access to the GPS
     volumes:
       - telematics_data:/data
     cpuset: "1,2"
@@ -19,7 +29,7 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
-      - GPS_SERIAL_DEVICE=/dev/serial0
+      - GPS_SERIAL_DEVICE=tcp://gps-multiplexer:2947
 
   power-monitor:
     build:
@@ -29,7 +39,6 @@ services:
     restart: always
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the UPS HAT
-      - "/dev/serial0:/dev/serial0" # Grants access to the GPS serial
     volumes:
       - telematics_data:/data
     cpuset: "3"
@@ -51,7 +60,6 @@ services:
       io.balena.features.dbus: '1'
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to shared I2C bus
-      - "/dev/serial0:/dev/serial0" # Grants access to the GPS serial
     volumes:
       - telematics_data:/data
     environment:
@@ -62,18 +70,6 @@ services:
       - API_KEY=${API_KEY}
       - SCAN_DURATION_SECONDS=30
       - POLL_INTERVAL=35
-
-  gps-multiplexer:
-    build:
-      context: .
-      dockerfile: gps-multiplexer/Dockerfile
-    privileged: true
-    restart: always
-    devices:
-      - "/dev/serial0:/dev/serial0" # GPS serial port upstream
-    environment:
-      - GPS_UPSTREAM_DEVICE=/dev/serial0
-      - GPS_VIRTUAL_DEVICE=/dev/virtual/gps_stream
 
 volumes:
   telematics_data:
