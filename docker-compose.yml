@@ -7,10 +7,12 @@ services:
     privileged: true
     restart: always
     devices:
-      - "/dev/serial0:/dev/serial0" # Sole owner of the GPS serial port
+      - "/dev/ttyAMA0:/dev/ttyAMA0" # Primary Pi UART node
+      - "/dev/ttyS0:/dev/ttyS0"     # Secondary Pi UART node
     environment:
       - UDEV=1
-      - GPS_SERIAL_DEVICE=/dev/serial0
+      - GPS_SERIAL_DEVICE=/dev/ttyAMA0
+      - GPS_SERIAL_CANDIDATES=/dev/ttyAMA0,/dev/ttyS0,/dev/serial0
 
   telematics-edge:
     build:
