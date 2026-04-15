@@ -167,8 +167,13 @@ class NMEAReader:
         import socket
 
         url = self.port[len("tcp://"):]
-        host, _, port_str = url.rpartition(":")
-        port = int(port_str) if port_str else 2947
+        host, sep, port_str = url.rpartition(":")
+        if not sep:
+            # No colon in URL — entire string is the hostname; use default port.
+            host = url
+            port = 2947
+        else:
+            port = int(port_str) if port_str else 2947
 
         reconnect_backoff_seconds = 1.0
         max_backoff_seconds = 30.0
