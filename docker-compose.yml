@@ -56,6 +56,7 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
       - API_KEY=${API_KEY}
+      - UPS_BATTERY_CAPACITY_MAH=${UPS_BATTERY_CAPACITY_MAH:-4400}
 
 volumes:
   telematics_data:
