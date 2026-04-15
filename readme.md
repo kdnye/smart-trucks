@@ -40,6 +40,8 @@ telematics-fleet/
 
 ## Quick Start: Deployment
 
+For a full, field-tested setup workflow for brand-new devices (Balena host config, identity variables, GPS cold start, and dashboard verification), see the **[Device Provisioning & Dashboard Sync Guide](docs/device-provisioning-guide.md)**.
+
 ### 1. Prerequisites
 * Install the [Balena CLI](https://github.com/balena-io/balena-cli).
 * Create a Fleet in your BalenaCloud dashboard.
@@ -56,8 +58,10 @@ balena push <fleet-name>
 
 ### 3. Device Configuration
 Set the following variables in the **Balena Dashboard > Device Configuration** to enable hardware interfaces:
-* `BALENA_HOST_CONFIG_dtparam`: `"i2c_arm=on","spi=on"`
-* `BALENA_HOST_CONFIG_enable_uart`: `1`
+* `RESIN_HOST_CONFIG_dtparam`: `i2c_arm=on,spi=on` (**no quotes**)
+* `RESIN_HOST_CONFIG_enable_uart`: `1`
+
+> ⚠️ Set `RESIN_HOST_CONFIG_dtparam` exactly as `i2c_arm=on,spi=on` **without quotation marks** to avoid I2C bus failures in the `power-monitor` container.
 
 ## Fleet Variables
 Use **Environment Variables** in Balena to manage unique truck settings without code changes:
@@ -80,6 +84,8 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `IMU_REQUIRED` | Fail fast when no IMU is detected at startup (`true`/`false`). | `true` |
 
 > ⚠️ `UPS_SHUNT_OHMS` must match your UPS HAT hardware. A `0.1` vs `0.01` mismatch causes approximately **10x error** in INA219 current/power telemetry.
+
+> ⚠️ `VEHICLE_ID` is required for truck identity. Do **not** rely on `MOTIVE_TRUCK_NUMBER`; if `VEHICLE_ID` is missing, payloads default to `UNKNOWN_TRUCK`.
 
 > ⚠️ If you run two 18650 cells in parallel, set `UPS_BATTERY_CAPACITY_MAH` to the combined pack capacity (for example `4400` for two 2200 mAh cells). Before paralleling cells, verify they are within 0.1V of each other.
 
