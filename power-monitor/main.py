@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import random
 import os
 import sys
@@ -24,6 +25,8 @@ from shared.hardware_probe import (
     parse_int_env,
     validate_inventory,
 )
+
+logger = logging.getLogger(__name__)
 
 UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health")
 
@@ -825,6 +828,12 @@ async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats:
 
 
 async def run() -> None:
+    if os.getenv("DEVICE_ROLE", "truck").lower() == "warehouse":
+        logger.info("DEVICE_ROLE is set to warehouse. Disabling UPS hardware probes.")
+        logger.info("Power Monitor container going into idle sleep mode.")
+        while True:
+            await asyncio.sleep(86400)
+
     config = load_config()
     inventory = build_hardware_inventory(
         gps_candidates=(),  # power-monitor does not own the GPS serial port
@@ -866,5 +875,6 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     uvloop.install()
     asyncio.run(run())

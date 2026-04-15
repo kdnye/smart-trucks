@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import shutil
 import socket
@@ -39,6 +40,8 @@ from shared.hardware_probe import (
     parse_int_env,
     validate_inventory,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -510,6 +513,12 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
 
 
 async def run() -> None:
+    if os.getenv("DEVICE_ROLE", "truck").lower() == "warehouse":
+        logger.info("DEVICE_ROLE is set to warehouse. Disabling GPS and IMU hardware probes.")
+        logger.info("Telematics Edge container going into idle sleep mode.")
+        while True:
+            await asyncio.sleep(86400)
+
     config = load_config()
     # TCP addresses (e.g. tcp://gps-multiplexer:2947) are served by the
     # gps-multiplexer container and must not be probed as serial ports.
@@ -552,5 +561,6 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     uvloop.install()
     asyncio.run(run())
