@@ -9,6 +9,7 @@ services:
     devices:
       - "/dev/serial0:/dev/serial0" # Sole owner of the GPS serial port
     environment:
+      - UDEV=1
       - GPS_SERIAL_DEVICE=/dev/serial0
 
   telematics-edge:

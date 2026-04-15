@@ -216,7 +216,7 @@ async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
             if os.path.exists(candidate):
                 selected_device = candidate
                 break
-    elif not os.path.exists(selected_device):
+    elif not selected_device.startswith("tcp://") and not os.path.exists(selected_device):
         print(
             "Primary GPS serial path unavailable. "
             f"device={selected_device} errno=2 exception_type=FileNotFoundError"
