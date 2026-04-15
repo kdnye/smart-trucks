@@ -5,9 +5,9 @@ GPS serial multiplexer.
 Reads raw NMEA sentences from the hardware UART and broadcasts each line to
 every connected TCP client on GPS_TCP_PORT (default 2947).
 
-This is the *sole* owner of /dev/serial0.  All other containers receive GPS
-data by connecting to this service over the Docker network — they never touch
-the physical serial port directly.
+This is the *sole* owner of the Pi UART character device(s). All other
+containers receive GPS data by connecting to this service over the Docker
+network — they never touch the physical serial port directly.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import pathlib
 import threading
 
 import serial
@@ -26,10 +27,42 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-GPS_PORT = os.getenv("GPS_SERIAL_DEVICE", "/dev/serial0")
 GPS_BAUD = int(os.getenv("GPS_BAUD_RATE", "9600"))
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(os.getenv("GPS_TCP_PORT", "2947"))
+DEFAULT_GPS_PORT = "/dev/serial0"
+DEFAULT_GPS_CANDIDATES = (
+    "/dev/serial0",
+    "/dev/ttyAMA0",
+    "/dev/ttyS0",
+)
+
+
+def _parse_candidates() -> tuple[str, ...]:
+    configured_port = os.getenv("GPS_SERIAL_DEVICE", DEFAULT_GPS_PORT).strip()
+    configured_candidates = os.getenv("GPS_SERIAL_CANDIDATES", "").strip()
+
+    candidates: list[str] = []
+
+    def add_candidate(candidate: str) -> None:
+        value = candidate.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    if configured_port and not configured_port.lower().startswith("tcp://"):
+        add_candidate(configured_port)
+
+    if configured_candidates:
+        for candidate in configured_candidates.split(","):
+            add_candidate(candidate)
+
+    for candidate in DEFAULT_GPS_CANDIDATES:
+        add_candidate(candidate)
+
+    return tuple(candidates)
+
+
+GPS_PORT_CANDIDATES = _parse_candidates()
 
 
 class GPSBroadcaster:
@@ -81,31 +114,48 @@ class GPSBroadcaster:
         backoff = 1.0
         max_backoff = 30.0
 
+        logger.info("GPS serial candidates: %s", ", ".join(GPS_PORT_CANDIDATES))
+
         while not stop_event.is_set():
-            try:
-                # exclusive=True (TIOCEXCL) prevents any other process from opening
-                # the port while we hold it.
-                with serial.Serial(GPS_PORT, GPS_BAUD, timeout=2, exclusive=True) as conn:
-                    logger.info("GPS serial connected: port=%s baud=%d", GPS_PORT, GPS_BAUD)
-                    backoff = 1.0
+            serial_connected = False
 
-                    while not stop_event.is_set():
-                        line = conn.readline()
-                        if line:
-                            self.broadcast_from_thread(line)
+            for port in GPS_PORT_CANDIDATES:
+                port_path = pathlib.Path(port)
+                if not port_path.exists():
+                    continue
+                if not port_path.is_char_device():
+                    logger.warning("Skipping non-character GPS device candidate: %s", port)
+                    continue
 
-            except serial.SerialException as exc:
+                try:
+                    # exclusive=True (TIOCEXCL) prevents any other process from opening
+                    # the port while we hold it.
+                    with serial.Serial(port, GPS_BAUD, timeout=2, exclusive=True) as conn:
+                        logger.info("GPS serial connected: port=%s baud=%d", port, GPS_BAUD)
+                        backoff = 1.0
+                        serial_connected = True
+
+                        while not stop_event.is_set():
+                            line = conn.readline()
+                            if line:
+                                self.broadcast_from_thread(line)
+                        break
+                except serial.SerialException as exc:
+                    logger.warning("GPS serial error on %s: %s", port, exc)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error("GPS serial unexpected error on %s: %s", port, exc)
+
+            if stop_event.is_set():
+                break
+            if not serial_connected:
                 logger.warning(
-                    "GPS serial error: %s. Reconnecting in %.1fs.", exc, backoff
+                    "No usable GPS serial device found among candidates: %s",
+                    ", ".join(GPS_PORT_CANDIDATES),
                 )
-                stop_event.wait(backoff)
-                backoff = min(max_backoff, backoff * 2)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error(
-                    "GPS serial unexpected error: %s. Reconnecting in %.1fs.", exc, backoff
-                )
-                stop_event.wait(backoff)
-                backoff = min(max_backoff, backoff * 2)
+
+            logger.warning("Reconnecting in %.1fs.", backoff)
+            stop_event.wait(backoff)
+            backoff = min(max_backoff, backoff * 2)
 
 
 async def run() -> None:
