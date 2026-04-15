@@ -101,6 +101,8 @@ class Config:
     ina219_addresses: tuple[int, ...]
     i2c_bus: int
     ina219_shunt_ohms: float
+    battery_capacity_mah: int
+    min_discharge_current_ma_for_runtime: int
     upload_batch_size: int
     upload_backoff_initial_seconds: int
     upload_backoff_max_seconds: int
@@ -216,6 +218,12 @@ def load_config() -> Config:
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
+        battery_capacity_mah=_read_int_env("UPS_BATTERY_CAPACITY_MAH", 2200, minimum=1),
+        min_discharge_current_ma_for_runtime=_read_int_env(
+            "UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE",
+            20,
+            minimum=1,
+        ),
         upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 50, minimum=1),
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
         upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
@@ -230,10 +238,19 @@ def load_config() -> Config:
 class UpsMonitor:
     SOC_ESTIMATE_METHOD = "voltage_curve_loaded"
 
-    def __init__(self, i2c_addresses: tuple[int, ...], shunt_ohms: float, i2c_bus: int) -> None:
+    def __init__(
+        self,
+        i2c_addresses: tuple[int, ...],
+        shunt_ohms: float,
+        i2c_bus: int,
+        battery_capacity_mah: int,
+        min_discharge_current_ma_for_runtime: int,
+    ) -> None:
         self._i2c_addresses = i2c_addresses
         self._shunt_ohms = shunt_ohms
         self._i2c_bus = i2c_bus
+        self._battery_capacity_mah = battery_capacity_mah
+        self._min_discharge_current_ma_for_runtime = min_discharge_current_ma_for_runtime
         self._ina: Ina219Adapter | None = None
         self.reinitialize()
 
@@ -303,10 +320,17 @@ class UpsMonitor:
             metrics = self._ina.read()
             current_ma = float(metrics["current_ma"])
             state_of_charge_pct_estimate = self._estimate_soc(float(metrics["bus_voltage_v"]))
+            estimated_runtime_hours: float | None = None
+            discharge_current_ma = abs(current_ma)
+            if current_ma < -self._min_discharge_current_ma_for_runtime:
+                remaining_capacity_mah = (state_of_charge_pct_estimate / 100.0) * float(self._battery_capacity_mah)
+                estimated_runtime_hours = round(remaining_capacity_mah / discharge_current_ma, 2)
             return _finalize({
                 "status": "ok",
                 **metrics,
                 "state_of_charge_pct_estimate": state_of_charge_pct_estimate,
+                "battery_capacity_mah": self._battery_capacity_mah,
+                "estimated_runtime_hours": estimated_runtime_hours,
                 "estimate_method": self.SOC_ESTIMATE_METHOD,
                 "is_charging": current_ma > 0,
             })
@@ -818,7 +842,13 @@ async def run() -> None:
     if inventory_errors:
         raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
 
-    monitor = UpsMonitor(config.ina219_addresses, config.ina219_shunt_ohms, config.i2c_bus)
+    monitor = UpsMonitor(
+        config.ina219_addresses,
+        config.ina219_shunt_ohms,
+        config.i2c_bus,
+        config.battery_capacity_mah,
+        config.min_discharge_current_ma_for_runtime,
+    )
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 

@@ -73,11 +73,15 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `POWER_SAMPLE_INTERVAL_SECONDS` | Power monitor sample/upload cadence in seconds. | `2` |
 | `POWER_UPLOAD_BATCH_SIZE` | Number of power samples uploaded per batch. | `50` |
 | `UPS_SHUNT_OHMS` | INA219 shunt resistor value in ohms for UPS current/power calibration. | `0.01` |
+| `UPS_BATTERY_CAPACITY_MAH` | Battery-pack capacity used for runtime estimation in `power-monitor` payloads. | `4400` |
+| `UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE` | Ignore tiny discharge current noise below this threshold when estimating remaining runtime. | `20` |
 | `IMU_I2C_BUS` | I2C bus used for IMU probing and telematics IMU reads. | `1` |
 | `IMU_EXPECTED_ADDRESSES` | Comma-separated IMU address candidates (hex) expected on `IMU_I2C_BUS`. | `0x6A` |
 | `IMU_REQUIRED` | Fail fast when no IMU is detected at startup (`true`/`false`). | `true` |
 
 > ⚠️ `UPS_SHUNT_OHMS` must match your UPS HAT hardware. A `0.1` vs `0.01` mismatch causes approximately **10x error** in INA219 current/power telemetry.
+
+> ⚠️ If you run two 18650 cells in parallel, set `UPS_BATTERY_CAPACITY_MAH` to the combined pack capacity (for example `4400` for two 2200 mAh cells). Before paralleling cells, verify they are within 0.1V of each other.
 
 
 ### BLE Sensor Service Configuration
