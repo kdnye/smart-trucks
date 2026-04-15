@@ -1,9 +1,7 @@
 version: '2.1'
 services:
   telematics-edge:
-    build:
-      context: ./telematics-edge
-      dockerfile: Dockerfile
+    build: ./telematics-edge
     privileged: true
     restart: always
     labels:
@@ -22,9 +20,7 @@ services:
       - GPS_SERIAL_DEVICE=/dev/serial0
 
   power-monitor:
-    build:
-      context: ./power-monitor
-      dockerfile: Dockerfile
+    build: ./power-monitor
     privileged: true
     restart: always
     devices:
@@ -40,9 +36,7 @@ services:
       - UPS_BATTERY_CAPACITY_MAH=${UPS_BATTERY_CAPACITY_MAH:-4400}
 
   ble-sensor:
-    build:
-      context: ./ble-sensor
-      dockerfile: Dockerfile
+    build: ./ble-sensor
     network_mode: host
     privileged: true
     restart: always
