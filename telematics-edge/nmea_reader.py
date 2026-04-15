@@ -193,6 +193,13 @@ class NMEAReader:
         elif msg.sentence_type == "GGA":
             self.current_reading.fix_quality = int(getattr(msg, "gps_qual", 0) or 0)
             self.current_reading.satellites = int(getattr(msg, "num_sats", 0) or 0)
+            # Keep position fresh from GGA as well. This provides a resilient
+            # fallback when some RMC lines are malformed or intermittently
+            # missing on noisy serial links.
+            if getattr(msg, "latitude", None) is not None:
+                self.current_reading.latitude = msg.latitude
+            if getattr(msg, "longitude", None) is not None:
+                self.current_reading.longitude = msg.longitude
             self.current_reading.altitude = float(msg.altitude) if getattr(msg, "altitude", None) else None
             self.current_reading.hdop = float(msg.horizontal_dil) if getattr(msg, "horizontal_dil", None) else None
 
@@ -200,7 +207,21 @@ class NMEAReader:
             self.current_reading.fix_type = int(getattr(msg, "mode_fix_type", 1) or 1)
             self.current_reading.pdop = float(msg.pdop) if getattr(msg, "pdop", None) else None
 
+        elif msg.sentence_type == "GLL":
+            # GLL carries latitude/longitude + validity status and can arrive
+            # even when RMC is absent.
+            if getattr(msg, "status", "") == "A":
+                if getattr(msg, "latitude", None) is not None:
+                    self.current_reading.latitude = msg.latitude
+                if getattr(msg, "longitude", None) is not None:
+                    self.current_reading.longitude = msg.longitude
+                if self.current_reading.fix_type < 2:
+                    self.current_reading.fix_type = 2
+
         elif msg.sentence_type == "VTG":
-            self.current_reading.speed_kmh = (
-                float(msg.spd_over_grnd_kmph) if getattr(msg, "spd_over_grnd_kmph", None) else None
-            )
+            try:
+                self.current_reading.speed_kmh = (
+                    float(msg.spd_over_grnd_kmph) if getattr(msg, "spd_over_grnd_kmph", None) else None
+                )
+            except (ValueError, TypeError):
+                self.current_reading.speed_kmh = None
