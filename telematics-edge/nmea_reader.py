@@ -111,6 +111,7 @@ class NMEAReader:
                     self.port,
                     baudrate=self.baudrate,
                     timeout=1.0,
+                    exclusive=True,
                     bytesize=serial.EIGHTBITS,
                     parity=serial.PARITY_NONE,
                     stopbits=serial.STOPBITS_ONE,
