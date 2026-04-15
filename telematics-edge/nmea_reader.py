@@ -110,8 +110,11 @@ class NMEAReader:
         self._reader_thread = None
 
     def _serial_reader_thread(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Blocking serial reader that forwards decoded lines into the asyncio queue."""
-        self._serial_reader_loop(loop, stop_event)
+        """Dispatch to TCP or serial reader based on the port scheme."""
+        if self.port.startswith("tcp://"):
+            self._tcp_reader_loop(loop, stop_event)
+        else:
+            self._serial_reader_loop(loop, stop_event)
 
     def _serial_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
         """Blocking serial reader that forwards decoded lines into the asyncio queue."""
@@ -160,10 +163,50 @@ class NMEAReader:
             reconnect_backoff_seconds = min(reconnect_backoff_seconds * 2.0, max_backoff_seconds)
 
     def _tcp_reader_loop(self, loop: asyncio.AbstractEventLoop, stop_event: threading.Event) -> None:
-        """Legacy TCP mode removed; GPS now uses direct serial hardware access."""
-        _ = loop
-        _ = stop_event
-        logger.error("TCP GPS mode is no longer supported; configure a serial device path.")
+        """Connect to a TCP GPS source (e.g. gps-multiplexer) and forward NMEA lines."""
+        import socket
+
+        url = self.port[len("tcp://"):]
+        host, _, port_str = url.rpartition(":")
+        port = int(port_str) if port_str else 2947
+
+        reconnect_backoff_seconds = 1.0
+        max_backoff_seconds = 30.0
+
+        while not stop_event.is_set():
+            try:
+                with socket.create_connection((host, port), timeout=5.0) as sock:
+                    logger.info("Successfully connected to TCP GPS source %s:%d", host, port)
+                    sock.settimeout(2.0)
+                    reconnect_backoff_seconds = 3.0
+                    buf = b""
+                    while not stop_event.is_set():
+                        try:
+                            chunk = sock.recv(1024)
+                            if not chunk:
+                                logger.warning("TCP GPS source closed connection")
+                                break
+                            buf += chunk
+                            while b"\n" in buf:
+                                raw_line, buf = buf.split(b"\n", 1)
+                                decoded_line = raw_line.decode("ascii", errors="ignore").strip()
+                                if decoded_line:
+                                    loop.call_soon_threadsafe(self._enqueue_line, decoded_line)
+                        except socket.timeout:
+                            continue
+            except (OSError, ConnectionRefusedError) as exc:
+                logger.error(
+                    "TCP GPS connection to %s:%d failed: %s. Retrying in %.1fs",
+                    host, port, exc, reconnect_backoff_seconds,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error(
+                    "Unexpected TCP GPS error: %s. Retrying in %.1fs", exc, reconnect_backoff_seconds
+                )
+
+            if stop_event.wait(reconnect_backoff_seconds):
+                break
+            reconnect_backoff_seconds = min(reconnect_backoff_seconds * 2.0, max_backoff_seconds)
 
     def _enqueue_line(self, line: str) -> None:
         """Enqueue latest NMEA line without blocking event loop."""

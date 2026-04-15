@@ -234,7 +234,7 @@ def load_config() -> Config:
         maintenance_interval_seconds=_read_int_env("POWER_MAINTENANCE_INTERVAL_SECONDS", 30, minimum=10),
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
-        imu_required=parse_bool_env("IMU_REQUIRED", True),
+        imu_required=False,  # power-monitor does not use the IMU; telematics-edge owns it
     )
 
 
@@ -840,14 +840,14 @@ async def run() -> None:
         gps_baud_rate=9600,
         i2c_bus=config.i2c_bus,
         ups_expected_addresses=config.ina219_addresses,
-        imu_expected_addresses=config.imu_expected_addresses,
+        imu_expected_addresses=(),  # power-monitor does not own the IMU
         probe_serial=False,
     )
     print(f"Hardware inventory: {inventory.to_json()}")
     os.makedirs("/data", exist_ok=True)
     with open("/data/power_hardware_inventory.json", "w", encoding="utf-8") as handle:
         json.dump(inventory.to_dict(), handle, sort_keys=True)
-    inventory_errors = validate_inventory(inventory, imu_required=config.imu_required, ups_required=True)
+    inventory_errors = validate_inventory(inventory, imu_required=False, ups_required=True)
     if inventory_errors:
         raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
 
