@@ -1,9 +1,44 @@
 version: '2.1'
 services:
+  telematics-edge:
+    build: ./telematics-edge
+    privileged: true
+    restart: always
+    labels:
+      io.balena.features.dbus: '1'
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the IMU
+      - "/dev/serial0:/dev/serial0" # Grants access to the GPS
+    volumes:
+      - telematics_data:/data
+    cpuset: "1,2"
+    environment:
+      - UDEV=1
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - VEHICLE_ID=${VEHICLE_ID}
+      - API_KEY=${API_KEY}
+      - GPS_SERIAL_DEVICE=/dev/serial0
+
+  power-monitor:
+    build: ./power-monitor
+    privileged: true
+    restart: always
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the UPS HAT
+    volumes:
+      - telematics_data:/data
+    cpuset: "3"
+    environment:
+      - UDEV=1
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - VEHICLE_ID=${VEHICLE_ID}
+      - API_KEY=${API_KEY}
+      - UPS_BATTERY_CAPACITY_MAH=${UPS_BATTERY_CAPACITY_MAH:-4400}
+
   ble-sensor:
     build: ./ble-sensor
+    network_mode: host
     privileged: true
-    network_mode: "host"
     restart: always
     labels:
       io.balena.features.dbus: '1'
@@ -17,42 +52,6 @@ services:
       - API_KEY=${API_KEY}
       - SCAN_DURATION_SECONDS=30
       - POLL_INTERVAL=35
-
-  telematics-edge:
-    build: ./telematics-edge
-    privileged: true
-    restart: always
-    labels:
-      io.balena.features.dbus: '1'
-    devices:
-      - "/dev/i2c-1:/dev/i2c-1"
-      - "/dev/serial0:/dev/serial0"
-    volumes:
-      - telematics_data:/data
-    cpuset: "1,2"
-    environment:
-      - UDEV=1
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - VEHICLE_ID=${VEHICLE_ID}
-      - API_KEY=${API_KEY}
-      - GPS_SERIAL_DEVICE=/dev/serial0
-
-
-  power-monitor:
-    build: ./power-monitor
-    privileged: true
-    restart: always
-    devices:
-      - "/dev/i2c-1:/dev/i2c-1"
-    volumes:
-      - telematics_data:/data
-    cpuset: "3"
-    environment:
-      - UDEV=1
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - VEHICLE_ID=${VEHICLE_ID}
-      - API_KEY=${API_KEY}
-      - UPS_BATTERY_CAPACITY_MAH=${UPS_BATTERY_CAPACITY_MAH:-4400}
 
 volumes:
   telematics_data:
