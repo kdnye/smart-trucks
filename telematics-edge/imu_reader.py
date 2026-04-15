@@ -107,11 +107,14 @@ class IMUReader:
         debounce_seconds = 2.0
         last_snapshot_time = 0.0
 
-        while True:
-            if not self.connect():
-                await asyncio.sleep(5)
-                continue
+        # Connect once at startup; only reconnect after an I2C error.
+        # Previously connect() was called on every loop iteration (every 0.1 s),
+        # which spammed "IMU initialized" at ~10 Hz. Now it is called once here
+        # and again only in the OSError recovery path.
+        while not self.connect():
+            await asyncio.sleep(5)
 
+        while True:
             try:
                 accel_x, accel_y, accel_z = await asyncio.to_thread(self.get_acceleration)
                 magnitude_2d = math.sqrt(accel_x**2 + accel_y**2)
@@ -147,6 +150,9 @@ class IMUReader:
             except OSError as exc:
                 logger.error("IMU I2C read error: %s. Resetting bus.", exc)
                 await asyncio.sleep(1)
+                while not self.connect():
+                    await asyncio.sleep(5)
+                continue
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error("IMU read error: %s", exc)
                 await asyncio.sleep(1)
