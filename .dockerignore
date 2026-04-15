@@ -1,4 +1,3 @@
-# Keep build context lean and avoid copying local/runtime artifacts
 __pycache__/
 *.py[cod]
 *.pyo
