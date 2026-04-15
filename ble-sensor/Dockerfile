@@ -10,11 +10,11 @@ ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/host/run/dbus/system_bus_socket
 WORKDIR /usr/src/app
 
 # Copy dependency list and install
-COPY ble-sensor/requirements.txt ./requirements.txt
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
-COPY ble-sensor/ ./
+COPY . .
 
 # Execute the script
 CMD ["python", "main.py"]
