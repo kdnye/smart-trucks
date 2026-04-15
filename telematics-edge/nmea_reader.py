@@ -170,6 +170,25 @@ class NMEAReader:
                 self.current_reading.latitude = msg.latitude
                 self.current_reading.longitude = msg.longitude
                 self.current_reading.heading = getattr(msg, "true_course", None)
+                # RMC status "A" means the fix is valid. Promote fix_type to at
+                # least 2 (2D) so _is_valid_fix passes even when the GPS module
+                # hasn't sent a GSA sentence yet (or doesn't send one at all).
+                if self.current_reading.fix_type < 2:
+                    self.current_reading.fix_type = 2
+                # Capture speed from RMC as a fallback when VTG is absent.
+                if self.current_reading.speed_kmh is None:
+                    spd_knots = getattr(msg, "spd_over_grnd", None)
+                    if spd_knots is not None:
+                        try:
+                            self.current_reading.speed_kmh = float(spd_knots) * 1.852
+                        except (ValueError, TypeError):
+                            pass
+            else:
+                # RMC status "V" (void) means the fix was lost; clear stale
+                # position data so _is_valid_fix rejects this reading.
+                self.current_reading.latitude = None
+                self.current_reading.longitude = None
+                self.current_reading.fix_type = 1
 
         elif msg.sentence_type == "GGA":
             self.current_reading.fix_quality = int(getattr(msg, "gps_qual", 0) or 0)
