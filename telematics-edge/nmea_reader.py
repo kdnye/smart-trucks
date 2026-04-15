@@ -30,6 +30,8 @@ class GpsReading:
 class NMEAReader:
     """Async NMEA reader with reconnect support and merged GPS state updates."""
 
+    _SENTENCE_TYPES_USING_TYPED_FIELDS = {"RMC", "GGA", "GSA", "GLL", "VTG"}
+
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -50,20 +52,12 @@ class NMEAReader:
                 if not decoded_line.startswith("$"):
                     continue
 
-                # Normalize $GN prefix to $GP so pynmea2 resolves typed sentence
-                # classes. The u-blox M8 chip uses the GN talker ID for combined
-                # multi-constellation output (GPS + GLONASS + Galileo). pynmea2
-                # only has typed attribute classes registered under the GP talker,
-                # so sentences like $GNRMC or $GNGGA would parse as untyped and
-                # lose named fields (latitude, longitude, etc.). Rewriting the
-                # talker before parsing restores full attribute access; we skip
-                # checksum verification because the checksum was computed over the
-                # original GN bytes.
-                line_to_parse = decoded_line
-                skip_check = False
-                if decoded_line.startswith("$GN"):
-                    line_to_parse = "$GP" + decoded_line[3:]
-                    skip_check = True
+                # Normalize any 2-letter talker prefix (GN, GL, GA, etc.) to GP
+                # for known sentence types so pynmea2 returns typed classes with
+                # named attributes (latitude, longitude, status, ...).
+                # Checksum verification must be skipped when rewriting because the
+                # original checksum was computed with the original talker bytes.
+                line_to_parse, skip_check = self._normalize_for_parsing(decoded_line)
 
                 try:
                     msg = pynmea2.parse(line_to_parse, check=not skip_check)
@@ -83,6 +77,24 @@ class NMEAReader:
             await asyncio.sleep(1)
         finally:
             self._stop_reader_thread()
+
+    def _normalize_for_parsing(self, decoded_line: str) -> tuple[str, bool]:
+        """Return (line_to_parse, skip_checksum_check) for pynmea2."""
+        # Core NMEA layout begins with: "$" + talker(2) + sentence(3)
+        if len(decoded_line) < 6:
+            return decoded_line, False
+
+        sentence_type = decoded_line[3:6]
+        if sentence_type not in self._SENTENCE_TYPES_USING_TYPED_FIELDS:
+            return decoded_line, False
+
+        # For standard two-letter talkers, force GP so pynmea2 maps to typed
+        # sentence classes regardless of talker (e.g. GN/GL/GA -> GP).
+        talker = decoded_line[1:3]
+        if talker != "GP":
+            return "$GP" + decoded_line[3:], True
+
+        return decoded_line, False
 
     def _start_reader_thread(self, loop: asyncio.AbstractEventLoop) -> None:
         """Start a fresh reader thread for the current serial connection."""
