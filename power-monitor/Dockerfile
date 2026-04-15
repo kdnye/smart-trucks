@@ -12,7 +12,7 @@ RUN apt-get update \
 COPY power-monitor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY shared/ /usr/src/shared/
+COPY shared/ /usr/src/app/shared/
 COPY power-monitor/ .
 
 CMD ["python", "main.py"]

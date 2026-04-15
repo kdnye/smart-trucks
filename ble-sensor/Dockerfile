@@ -13,6 +13,9 @@ WORKDIR /usr/src/app
 COPY ble-sensor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy shared hardware library
+COPY shared/ /usr/src/app/shared/
+
 # Copy the rest of the application code
 COPY ble-sensor/ .
 

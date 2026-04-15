@@ -50,8 +50,23 @@ class NMEAReader:
                 if not decoded_line.startswith("$"):
                     continue
 
+                # Normalize $GN prefix to $GP so pynmea2 resolves typed sentence
+                # classes. The u-blox M8 chip uses the GN talker ID for combined
+                # multi-constellation output (GPS + GLONASS + Galileo). pynmea2
+                # only has typed attribute classes registered under the GP talker,
+                # so sentences like $GNRMC or $GNGGA would parse as untyped and
+                # lose named fields (latitude, longitude, etc.). Rewriting the
+                # talker before parsing restores full attribute access; we skip
+                # checksum verification because the checksum was computed over the
+                # original GN bytes.
+                line_to_parse = decoded_line
+                skip_check = False
+                if decoded_line.startswith("$GN"):
+                    line_to_parse = "$GP" + decoded_line[3:]
+                    skip_check = True
+
                 try:
-                    msg = pynmea2.parse(decoded_line)
+                    msg = pynmea2.parse(line_to_parse, check=not skip_check)
                 except pynmea2.ParseError as exc:
                     logger.debug("Malformed NMEA sentence ignored: %s", exc)
                     continue
