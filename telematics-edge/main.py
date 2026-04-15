@@ -522,6 +522,7 @@ async def run() -> None:
         i2c_bus=config.imu_i2c_bus,
         ups_expected_addresses=tuple(),
         imu_expected_addresses=config.imu_expected_addresses,
+        probe_serial=True,
     )
     print(f"Hardware inventory: {inventory.to_json()}")
     os.makedirs("/data", exist_ok=True)
