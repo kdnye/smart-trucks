@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,11 +32,21 @@ def _to_bool(raw: str | None, default: bool = False) -> bool:
 
 
 def load_config() -> Config:
+    poll_interval_seconds = max(5, int(os.getenv("POLL_INTERVAL", "60")))
+    scan_duration_seconds = max(1.0, float(os.getenv("SCAN_DURATION_SECONDS", "15")))
+    recommended_poll_minimum = scan_duration_seconds + 15
+    if poll_interval_seconds < recommended_poll_minimum:
+        print(
+            "Warning: POLL_INTERVAL is shorter than the recommended minimum for long "
+            f"scans. Current={poll_interval_seconds}s, Recommended>="
+            f"{recommended_poll_minimum:.0f}s (SCAN_DURATION_SECONDS + 15)."
+        )
+
     return Config(
         webhook_url=os.getenv("WEBHOOK_URL"),
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
-        post_interval_seconds=max(5, int(os.getenv("POLL_INTERVAL", "60"))),
-        scan_duration_seconds=max(1.0, float(os.getenv("SCAN_DURATION_SECONDS", "15"))),
+        post_interval_seconds=poll_interval_seconds,
+        scan_duration_seconds=scan_duration_seconds,
         api_key=os.getenv("API_KEY", ""),
         request_timeout_seconds=max(2.0, float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))),
         anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "true"), default=True),
@@ -505,6 +516,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
 async def run() -> None:
     config = load_config()
+    scan_retry_attempt = 0
 
     if config.anonymize_mac and not config.mac_hash_salt:
         print(
@@ -514,8 +526,35 @@ async def run() -> None:
 
     async with aiohttp.ClientSession() as session:
         while True:
+            apply_poll_sleep = True
             try:
-                payload = await collect_payload(config)
+                try:
+                    payload = await collect_payload(config)
+                    scan_retry_attempt = 0
+                except Exception as exc:
+                    err_text = f"{exc}".lower()
+                    cause_text = f"{exc.__cause__}".lower() if exc.__cause__ else ""
+                    class_text = f"{exc.__class__.__name__} {type(exc).__name__}".lower()
+                    is_op_in_progress = "operation already in progress" in (
+                        f"{err_text} {cause_text} {class_text}"
+                    )
+
+                    if is_op_in_progress:
+                        apply_poll_sleep = False
+                        backoff_seconds = min(8.0, 0.75 * (2**scan_retry_attempt))
+                        jitter_seconds = random.uniform(0, 0.5)
+                        sleep_seconds = backoff_seconds + jitter_seconds
+                        scan_retry_attempt += 1
+                        print(
+                            "BlueZ scan-start contention detected "
+                            f"(attempt {scan_retry_attempt}): {exc}. "
+                            f"Retrying in {sleep_seconds:.2f}s."
+                        )
+                        await asyncio.sleep(sleep_seconds)
+                        continue
+
+                    raise
+
                 if payload["sensor_count"] > 0:
                     print(
                         f"Detected {payload['sensor_count']} devices in "
@@ -527,7 +566,8 @@ async def run() -> None:
             except Exception as exc:
                 print(f"Scan loop error: {exc}")
 
-            await asyncio.sleep(config.post_interval_seconds)
+            if apply_poll_sleep:
+                await asyncio.sleep(config.post_interval_seconds)
 
 
 if __name__ == "__main__":
