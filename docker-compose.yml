@@ -12,7 +12,7 @@ services:
     environment:
       - UDEV=1
       - GPS_SERIAL_DEVICE=/dev/serial0
-      - GPS_SERIAL_CANDIDATES=/dev/serial0
+      - GPS_SERIAL_CANDIDATES=/dev/serial0,/dev/ttyAMA0,/dev/ttyS0
 
   telematics-edge:
     build:
