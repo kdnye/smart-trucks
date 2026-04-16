@@ -9,6 +9,8 @@ services:
     entrypoint: ["/usr/local/bin/start.sh"]
     devices:
       - "/dev/serial0:/dev/serial0"
+      - "/dev/ttyAMA0:/dev/ttyAMA0"
+      - "/dev/ttyS0:/dev/ttyS0"
     environment:
       - UDEV=1
       - GPS_SERIAL_DEVICE=/dev/serial0
