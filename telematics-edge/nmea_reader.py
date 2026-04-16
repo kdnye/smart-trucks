@@ -183,14 +183,7 @@ class NMEAReader:
         """Connect to a TCP GPS source (e.g. gps-multiplexer) and forward NMEA lines."""
         import socket
 
-        url = self.port[len("tcp://"):]
-        host, sep, port_str = url.rpartition(":")
-        if not sep:
-            # No colon in URL — entire string is the hostname; use default port.
-            host = url
-            port = 2947
-        else:
-            port = int(port_str) if port_str else 2947
+        host, port = self._parse_tcp_target(self.port)
 
         reconnect_backoff_seconds = 1.0
         max_backoff_seconds = 30.0
@@ -229,6 +222,39 @@ class NMEAReader:
             if stop_event.wait(reconnect_backoff_seconds):
                 break
             reconnect_backoff_seconds = min(reconnect_backoff_seconds * 2.0, max_backoff_seconds)
+
+    def _parse_tcp_target(self, configured_url: str) -> tuple[str, int]:
+        """Parse a tcp:// URL into (host, port) with safe defaults and warnings."""
+        url = configured_url[len("tcp://"):] if configured_url.startswith("tcp://") else configured_url
+        host, sep, port_str = url.rpartition(":")
+
+        if not sep:
+            return url, 2947
+
+        if not port_str:
+            logger.warning(
+                "Invalid TCP GPS URL port in '%s'; falling back to default port 2947",
+                configured_url,
+            )
+            return host, 2947
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            logger.warning(
+                "Invalid TCP GPS URL port in '%s'; falling back to default port 2947",
+                configured_url,
+            )
+            return host, 2947
+
+        if not 1 <= port <= 65535:
+            logger.warning(
+                "Out-of-range TCP GPS URL port in '%s'; falling back to default port 2947",
+                configured_url,
+            )
+            return host, 2947
+
+        return host, port
 
     def _enqueue_line(self, line: str) -> None:
         """Enqueue latest NMEA line without blocking event loop."""
