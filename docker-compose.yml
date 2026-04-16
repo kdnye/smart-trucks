@@ -6,14 +6,13 @@ services:
       dockerfile: gps-multiplexer/Dockerfile
     privileged: true
     restart: always
-    entrypoint: ["/bin/sh", "-c"]
-    command: "stty -F /dev/serial0 9600 raw -echo && exec python main.py"
+    entrypoint: ["/usr/local/bin/start.sh"]
     devices:
       - "/dev/serial0:/dev/serial0"
     environment:
       - UDEV=1
       - GPS_SERIAL_DEVICE=/dev/serial0
-      - GPS_SERIAL_CANDIDATES=/dev/ttyAMA0,/dev/ttyS0,/dev/serial0
+      - GPS_SERIAL_CANDIDATES=/dev/serial0
 
   telematics-edge:
     build:

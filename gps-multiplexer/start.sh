@@ -2,6 +2,7 @@
 set -eu
 
 SERIAL_DEVICE="${GPS_SERIAL_DEVICE:-/dev/serial0}"
+APP_ENTRYPOINT="/usr/src/app/main.py"
 
 echo "gps-multiplexer starting: serial=${SERIAL_DEVICE}"
 
@@ -17,4 +18,10 @@ else
   stty -F "${SERIAL_DEVICE}" 9600 raw -echo
 fi
 
-exec python main.py
+if [ ! -f "${APP_ENTRYPOINT}" ]; then
+  echo "GPS multiplexer entrypoint not found: ${APP_ENTRYPOINT}"
+  exit 1
+fi
+
+echo "Launching gps-multiplexer Python process: ${APP_ENTRYPOINT}"
+exec python "${APP_ENTRYPOINT}"
