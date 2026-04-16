@@ -198,6 +198,28 @@ def get_latest_gps(state: RuntimeState) -> dict[str, Any]:
     return {"fix_status": "searching"}
 
 
+def build_location_payload(gps: dict[str, Any]) -> dict[str, Any]:
+    """Build canonical + compatibility GPS payload fields for downstream consumers."""
+    location = dict(gps)
+    fix_status = location.get("fix_status", "searching")
+
+    if fix_status != "locked":
+        return {"fix_status": "searching"}
+
+    latitude = location.get("latitude")
+    longitude = location.get("longitude")
+
+    return {
+        **location,
+        # Redundant aliases for downstream parsers that expect different keys.
+        "lat": latitude,
+        "lng": longitude,
+        "lon": longitude,
+        # Compatibility for older dashboards that still read speed_knots.
+        "speed_knots": (location.get("speed_kmh") / 1.852) if location.get("speed_kmh") is not None else None,
+    }
+
+
 def _is_valid_fix(reading: GpsReading) -> bool:
     if reading.latitude is None or reading.longitude is None:
         return False
@@ -297,7 +319,7 @@ async def post_payload(
 async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
     while True:
         captured_at = utc_now_iso()
-        gps = get_latest_gps(state)
+        gps = build_location_payload(get_latest_gps(state))
         state.local_sequence += 1
 
         if gps.get("fix_status") == "locked":
@@ -333,6 +355,7 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
 async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor) -> None:
     while True:
         captured_at = utc_now_iso()
+        gps_payload = build_location_payload(get_latest_gps(state))
         state.wifi_connected = is_network_connected()
         db_stats = await get_db_stats()
         latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
@@ -366,6 +389,10 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
             "vehicle_id": config.vehicle_id,
             "captured_at_utc": captured_at,
             "process_uptime_sec": int(time.monotonic() - state.start_monotonic),
+            # Keep GPS in multiple locations to maximize compatibility while
+            # clients migrate to location/location_status.
+            "location": gps_payload,
+            "gps": gps_payload,
             "location_status": {
                 "fix_status": "locked" if state.last_gps_fix_utc else "searching",
                 "last_fix_age_sec": age_seconds(state.last_gps_fix_utc),
