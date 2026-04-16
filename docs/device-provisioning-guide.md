@@ -43,10 +43,25 @@ Next, the Python containers need to know *where* to send their data and *who* th
    * **Name:** `POLL_INTERVAL` | **Value:** `30`
 3. Add the **CRITICAL** identity variable. Without this, the system will name the truck `UNKNOWN_TRUCK` and hide it from your dashboard:
    * **Name:** `VEHICLE_ID` | **Value:** `[Name of Truck]` *(e.g., `Truck_Test`, `TRK-104`)*
+4. Add UPS calibration variables for `power-monitor` so INA219 readings are scaled correctly for your UPS hardware profile:
+   * **Name:** `UPS_MAX_EXPECTED_AMPS` | **Value:** Use the profile table below.
+   * **Name:** `UPS_GAIN_STRATEGY` | **Value:** `auto` *(recommended; lets INA219 pick gain from expected amps).*
+   * **Name:** `UPS_BUS_VOLTAGE_RANGE_V` | **Value:** `32` *(default for 5V UPS rails with transient headroom).*
 
 > `VEHICLE_ID` is the required identity variable for this stack. Do **not** use `MOTIVE_TRUCK_NUMBER` as a substitute.
 
 *(Note: If you want all trucks to share the same Webhook URL and API keys, you can set those at the **Fleet Variables** level instead, so you only have to set the `VEHICLE_ID` for new trucks).*
+
+### Recommended `UPS_MAX_EXPECTED_AMPS` by hardware profile
+Use conservative values that cover sustained load plus short transients. If `ovf` appears in logs during normal operation, increase this value one tier.
+
+| Hardware profile | Typical sustained load | Recommended `UPS_MAX_EXPECTED_AMPS` |
+| --- | --- | --- |
+| Pi Zero 2 W + BerryGPS-IMU + standard LTE modem | 0.6A - 1.2A | `2.2` |
+| Pi 3/4 class truck gateway + USB peripherals (moderate) | 1.2A - 2.0A | `3.2` |
+| Pi 4 + camera / higher transient accessory load | 2.0A - 2.8A | `4.0` |
+
+`UPS_MAX_EXPECTED_AMPS` is passed directly to INA219 calibration (`max_expected_amps`). Setting it too low causes false overflow behavior; setting it much higher than real load reduces current resolution.
 
 ## Phase 3: The "Cold Start" (GPS Lock)
 A brand-new GPS chip has no idea where it is in the world. It must download a satellite "Almanac" from space before it can lock on.
