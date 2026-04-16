@@ -11,7 +11,20 @@ When a new Raspberry Pi is flashed and added to the Balena fleet, its hardware p
    * **Name:** `RESIN_HOST_CONFIG_enable_uart` | **Value:** `1` *(Turns on the serial pins)*
    * **Name:** `RESIN_HOST_CONFIG_dtparam` | **Value:** `i2c_arm=on,spi=on` *(Turns on the I2C bus for the battery monitor. **Do not use quotes**).*
 4. Scroll to **DT overlays** and add `miniuart-bt`. *(This maps the high-performance hardware serial port to the GPS chip instead of Bluetooth).*
+
 5. The device will automatically reboot to apply these hardware changes.
+
+> UART must be enabled at the **host OS** level (`enable_uart=1`, typically via `RESIN_HOST_CONFIG_enable_uart=1` in Balena). If UART is not enabled, GPS serial devices will not be exposed on the host.
+
+### Serial Device Mapping for GPS Auto-Discovery
+The `gps-multiplexer` container supports GPS serial auto-discovery using `GPS_SERIAL_CANDIDATES`. For this to work, Docker/Balena must map **every candidate host UART node** into the container under `devices:`.
+
+Current expected candidate set:
+- `/dev/serial0`
+- `/dev/ttyAMA0`
+- `/dev/ttyS0`
+
+If any candidate path is missing from container device mappings, auto-discovery may fail on boards/boot modes that expose GPS on a different UART alias.
 
 ## Phase 2: Software Identity (Device Variables)
 Next, the Python containers need to know *where* to send their data and *who* they are.
