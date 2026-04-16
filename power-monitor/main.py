@@ -28,7 +28,7 @@ from shared.hardware_probe import (
 
 logger = logging.getLogger(__name__)
 
-UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health")
+UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health", "power_diagnostic")
 
 
 def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
@@ -61,8 +61,37 @@ class Ina219Adapter:
         self.address = address
         self._bus_num = bus_num
 
-    def configure(self) -> None:
-        self._sensor.configure()
+    def configure(self, **kwargs: Any) -> None:
+        self._sensor.configure(**kwargs)
+
+    def calibration_snapshot(self) -> dict[str, Any]:
+        gain_index = getattr(self._sensor, "_gain", None)
+        voltage_range_index = getattr(self._sensor, "_voltage_range", None)
+        gain_lookup = {
+            INA219.GAIN_1_40MV: "gain_1_40mv",
+            INA219.GAIN_2_80MV: "gain_2_80mv",
+            INA219.GAIN_4_160MV: "gain_4_160mv",
+            INA219.GAIN_8_320MV: "gain_8_320mv",
+        }
+        bus_range_lookup = {
+            INA219.RANGE_16V: 16,
+            INA219.RANGE_32V: 32,
+        }
+        gain_max_mv_lookup = {
+            INA219.GAIN_1_40MV: 40,
+            INA219.GAIN_2_80MV: 80,
+            INA219.GAIN_4_160MV: 160,
+            INA219.GAIN_8_320MV: 320,
+        }
+        return {
+            "gain_strategy_active": "auto" if bool(getattr(self._sensor, "_auto_gain_enabled", False)) else "fixed",
+            "gain_setting": gain_lookup.get(gain_index, "unknown"),
+            "gain_max_shunt_mv": gain_max_mv_lookup.get(gain_index),
+            "bus_voltage_range_v": bus_range_lookup.get(voltage_range_index),
+            "current_lsb_a_per_bit": float(getattr(self._sensor, "_current_lsb", 0.0)),
+            "power_lsb_w_per_bit": float(getattr(self._sensor, "_power_lsb", 0.0)),
+            "max_expected_amps": getattr(self._sensor, "_max_expected_amps", None),
+        }
 
     def _read_register_atomic(self, register: int, *, signed: bool = False) -> int:
         raw_bytes = read_i2c_atomic(self._bus_num, self.address, register, 2)
@@ -104,6 +133,9 @@ class Config:
     ina219_addresses: tuple[int, ...]
     i2c_bus: int
     ina219_shunt_ohms: float
+    ina219_max_expected_amps: float
+    ina219_gain_strategy: str
+    ina219_bus_voltage_range_v: int
     battery_capacity_mah: int
     min_discharge_current_ma_for_runtime: int
     upload_batch_size: int
@@ -164,6 +196,24 @@ def _read_float_env(name: str, default: float) -> float:
         return default
 
 
+def _read_ina219_gain_strategy_env(default: str = "auto") -> str:
+    raw_value = os.getenv("UPS_GAIN_STRATEGY")
+    value = (_sanitize_env_value(raw_value) or default).strip().lower()
+    allowed = {"auto", "gain_1_40mv", "gain_2_80mv", "gain_4_160mv", "gain_8_320mv"}
+    if value not in allowed:
+        print(f"Warning: invalid UPS_GAIN_STRATEGY={raw_value!r}; using default {default}.")
+        return default
+    return value
+
+
+def _read_ina219_bus_voltage_range_env(default: int = 32) -> int:
+    parsed = _read_int_env("UPS_BUS_VOLTAGE_RANGE_V", default)
+    if parsed not in {16, 32}:
+        print(f"Warning: invalid UPS_BUS_VOLTAGE_RANGE_V={parsed!r}; using default {default}.")
+        return default
+    return parsed
+
+
 def _read_hex_address_env(name: str, default: int) -> int:
     raw_value = os.getenv(name)
     value = _sanitize_env_value(raw_value)
@@ -221,6 +271,9 @@ def load_config() -> Config:
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
+        ina219_max_expected_amps=max(0.05, _read_float_env("UPS_MAX_EXPECTED_AMPS", 2.2)),
+        ina219_gain_strategy=_read_ina219_gain_strategy_env("auto"),
+        ina219_bus_voltage_range_v=_read_ina219_bus_voltage_range_env(32),
         battery_capacity_mah=_read_int_env("UPS_BATTERY_CAPACITY_MAH", 2200, minimum=1),
         min_discharge_current_ma_for_runtime=_read_int_env(
             "UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE",
@@ -245,17 +298,50 @@ class UpsMonitor:
         self,
         i2c_addresses: tuple[int, ...],
         shunt_ohms: float,
+        max_expected_amps: float,
+        gain_strategy: str,
+        bus_voltage_range_v: int,
         i2c_bus: int,
         battery_capacity_mah: int,
         min_discharge_current_ma_for_runtime: int,
     ) -> None:
         self._i2c_addresses = i2c_addresses
         self._shunt_ohms = shunt_ohms
+        self._max_expected_amps = max_expected_amps
+        self._gain_strategy = gain_strategy
+        self._bus_voltage_range_v = bus_voltage_range_v
         self._i2c_bus = i2c_bus
         self._battery_capacity_mah = battery_capacity_mah
         self._min_discharge_current_ma_for_runtime = min_discharge_current_ma_for_runtime
         self._ina: Ina219Adapter | None = None
         self.reinitialize()
+
+    def _ina219_configure_kwargs(self) -> dict[str, Any]:
+        gain_map = {
+            "auto": INA219.GAIN_AUTO,
+            "gain_1_40mv": INA219.GAIN_1_40MV,
+            "gain_2_80mv": INA219.GAIN_2_80MV,
+            "gain_4_160mv": INA219.GAIN_4_160MV,
+            "gain_8_320mv": INA219.GAIN_8_320MV,
+        }
+        voltage_range = INA219.RANGE_16V if self._bus_voltage_range_v == 16 else INA219.RANGE_32V
+        return {
+            "voltage_range": voltage_range,
+            "gain": gain_map.get(self._gain_strategy, INA219.GAIN_AUTO),
+            "bus_adc": INA219.ADC_12BIT,
+            "shunt_adc": INA219.ADC_12BIT,
+        }
+
+    def build_overflow_diagnostic(self) -> dict[str, Any]:
+        calibration = self._ina.calibration_snapshot() if self._ina else {}
+        return {
+            "diagnostic_type": "ina219_overflow",
+            "shunt_ohms": self._shunt_ohms,
+            "expected_max_amps": self._max_expected_amps,
+            "gain_strategy_requested": self._gain_strategy,
+            "bus_voltage_range_requested_v": self._bus_voltage_range_v,
+            "calibration": calibration,
+        }
 
     def reinitialize(self) -> bool:
         self._ina = None
@@ -266,14 +352,28 @@ class UpsMonitor:
             f"bus={self._i2c_bus} "
             f"addresses=[{candidate_list}]"
         )
+        configure_kwargs = self._ina219_configure_kwargs()
+        print(
+            "UPS INA219 configuration: "
+            f"expected_max_amps={self._max_expected_amps}A "
+            f"shunt_ohms={self._shunt_ohms} "
+            f"gain_strategy={self._gain_strategy} "
+            f"bus_voltage_range={self._bus_voltage_range_v}V "
+            "bus_adc=12bit shunt_adc=12bit"
+        )
         for address in self._i2c_addresses:
             try:
                 self._ina = Ina219Adapter(
-                    INA219(shunt_ohms=self._shunt_ohms, address=address, busnum=self._i2c_bus),
+                    INA219(
+                        shunt_ohms=self._shunt_ohms,
+                        max_expected_amps=self._max_expected_amps,
+                        address=address,
+                        busnum=self._i2c_bus,
+                    ),
                     address,
                     self._i2c_bus,
                 )
-                self._ina.configure()
+                self._ina.configure(**configure_kwargs)
                 print(f"UPS monitor initialized. bus={self._i2c_bus} address=0x{address:02X}.")
                 return True
             except Exception as exc:
@@ -291,7 +391,7 @@ class UpsMonitor:
         if not self._ina:
             return False
         try:
-            self._ina.configure()
+            self._ina.configure(**self._ina219_configure_kwargs())
             return True
         except Exception:
             return False
@@ -321,6 +421,8 @@ class UpsMonitor:
 
         try:
             metrics = self._ina.read()
+            if bool(metrics.get("ovf")):
+                metrics["overflow_diagnostic"] = self.build_overflow_diagnostic()
             current_ma = float(metrics["current_ma"])
             state_of_charge_pct_estimate = self._estimate_soc(float(metrics["bus_voltage_v"]))
             estimated_runtime_hours: float | None = None
@@ -681,6 +783,27 @@ async def state_engine_loop(
 
         await write_reading(conn, config.vehicle_id, occurred_at, payload)
         await enqueue_event(conn, config.vehicle_id, "power_snapshot", occurred_at, payload, config.queue_max_events)
+        if bool(payload.get("ovf")):
+            overflow_diagnostic_payload = {
+                "state": current_state,
+                "flags": current_flags,
+                "diagnostic": payload.get("overflow_diagnostic", {}),
+                "reading": {
+                    "ina219_address": payload.get("ina219_address"),
+                    "bus_voltage_v": payload.get("bus_voltage_v"),
+                    "shunt_voltage_mv": payload.get("shunt_voltage_mv"),
+                    "current_ma": payload.get("current_ma"),
+                    "power_mw": payload.get("power_mw"),
+                },
+            }
+            await enqueue_event(
+                conn,
+                config.vehicle_id,
+                "power_diagnostic",
+                occurred_at,
+                overflow_diagnostic_payload,
+                config.queue_max_events,
+            )
 
         if previous_state is not None and current_state != previous_state:
             stats.state_transitions += 1
@@ -854,6 +977,9 @@ async def run() -> None:
     monitor = UpsMonitor(
         config.ina219_addresses,
         config.ina219_shunt_ohms,
+        config.ina219_max_expected_amps,
+        config.ina219_gain_strategy,
+        config.ina219_bus_voltage_range_v,
         config.i2c_bus,
         config.battery_capacity_mah,
         config.min_discharge_current_ma_for_runtime,
