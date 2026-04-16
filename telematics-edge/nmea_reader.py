@@ -52,24 +52,8 @@ class NMEAReader:
 
         try:
             while True:
-                decoded_line = await self._line_queue.get()
-                if not decoded_line.startswith("$"):
-                    continue
-
-                if len(decoded_line) < 6 or decoded_line[3:6] not in self._SUPPORTED_SENTENCE_TYPES:
-                    continue
-
-                # Normalize any 2-letter talker prefix (GN, GL, GA, etc.) to GP
-                # for known sentence types so pynmea2 returns typed classes with
-                # named attributes (latitude, longitude, status, ...).
-                # Checksum verification must be skipped when rewriting because the
-                # original checksum was computed with the original talker bytes.
-                line_to_parse, skip_check = self._normalize_for_parsing(decoded_line)
-
-                try:
-                    msg = pynmea2.parse(line_to_parse, check=not skip_check)
-                except pynmea2.ParseError as exc:
-                    logger.debug("Malformed NMEA sentence ignored: %s", exc)
+                msg = self._parse_nmea_bulletproof(await self._line_queue.get())
+                if msg is None:
                     continue
 
                 self._update_reading(msg)
@@ -89,6 +73,40 @@ class NMEAReader:
         finally:
             self._stop_reader_thread()
 
+    def _parse_nmea_bulletproof(self, line: str) -> Optional[pynmea2.NMEASentence]:
+        """
+        Parse a potentially corrupted NMEA line with multiple defensive layers:
+        1. Remove transport garbage before '$'.
+        2. Ignore talker ID differences by normalizing known sentence families.
+        3. Accept RMC/GGA/GLL as coordinate-bearing fallback sentence types.
+        4. Swallow parse errors to keep reader thread healthy under noisy links.
+        """
+        if not line or "$" not in line:
+            return None
+
+        sentence = ""
+        try:
+            clean_line = "$" + line.split("$", 1)[1].strip()
+            if len(clean_line) < 6:
+                return None
+
+            sentence = clean_line[3:6]
+            if sentence not in self._SUPPORTED_SENTENCE_TYPES:
+                return None
+
+            line_to_parse, skip_check = self._normalize_for_parsing(clean_line)
+            msg = pynmea2.parse(line_to_parse, check=not skip_check)
+
+            # Triple fallback families that can provide coordinate updates.
+            if msg.sentence_type not in self._SENTENCE_TYPES_EMITTING_UPDATES and msg.sentence_type not in {"GSA", "VTG"}:
+                return None
+            return msg
+        except pynmea2.ParseError as exc:
+            logger.debug("Malformed NMEA sentence ignored: %s", exc)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("NMEA extraction error on %s: %s", sentence or "unknown", exc)
+        return None
+
     def _normalize_for_parsing(self, decoded_line: str) -> tuple[str, bool]:
         """Return (line_to_parse, skip_checksum_check) for pynmea2."""
         # Core NMEA layout begins with: "$" + talker(2) + sentence(3)
@@ -103,7 +121,10 @@ class NMEAReader:
         # sentence classes regardless of talker (e.g. GN/GL/GA -> GP).
         talker = decoded_line[1:3]
         if talker != "GP":
-            return "$GP" + decoded_line[3:], True
+            rewritten = "$GP" + decoded_line[3:]
+            if "*" in rewritten:
+                rewritten = rewritten.split("*", 1)[0]
+            return rewritten, True
 
         return decoded_line, False
 
@@ -281,8 +302,9 @@ class NMEAReader:
         if msg.sentence_type == "RMC":
             if getattr(msg, "status", "") == "A":
                 self.current_reading.timestamp = getattr(msg, "datetime", None)
-                self.current_reading.latitude = msg.latitude
-                self.current_reading.longitude = msg.longitude
+                if self._has_non_zero_coordinates(msg.latitude, msg.longitude):
+                    self.current_reading.latitude = msg.latitude
+                    self.current_reading.longitude = msg.longitude
                 self.current_reading.heading = getattr(msg, "true_course", None)
                 # RMC status "A" means the fix is valid. Promote fix_type to at
                 # least 2 (2D) so _is_valid_fix passes even when the GPS module
@@ -310,9 +332,11 @@ class NMEAReader:
             # Keep position fresh from GGA as well. This provides a resilient
             # fallback when some RMC lines are malformed or intermittently
             # missing on noisy serial links.
-            if getattr(msg, "latitude", None) is not None:
+            if (
+                self.current_reading.fix_quality > 0
+                and self._has_non_zero_coordinates(getattr(msg, "latitude", None), getattr(msg, "longitude", None))
+            ):
                 self.current_reading.latitude = msg.latitude
-            if getattr(msg, "longitude", None) is not None:
                 self.current_reading.longitude = msg.longitude
             self.current_reading.altitude = float(msg.altitude) if getattr(msg, "altitude", None) else None
             self.current_reading.hdop = float(msg.horizontal_dil) if getattr(msg, "horizontal_dil", None) else None
@@ -325,9 +349,8 @@ class NMEAReader:
             # GLL carries latitude/longitude + validity status and can arrive
             # even when RMC is absent.
             if getattr(msg, "status", "") == "A":
-                if getattr(msg, "latitude", None) is not None:
+                if self._has_non_zero_coordinates(getattr(msg, "latitude", None), getattr(msg, "longitude", None)):
                     self.current_reading.latitude = msg.latitude
-                if getattr(msg, "longitude", None) is not None:
                     self.current_reading.longitude = msg.longitude
                 if self.current_reading.fix_type < 2:
                     self.current_reading.fix_type = 2
@@ -339,3 +362,9 @@ class NMEAReader:
                 )
             except (ValueError, TypeError):
                 self.current_reading.speed_kmh = None
+
+    def _has_non_zero_coordinates(self, latitude: Optional[float], longitude: Optional[float]) -> bool:
+        """Return True when coordinates are present and not the null-island sentinel."""
+        if latitude is None or longitude is None:
+            return False
+        return latitude != 0.0 and longitude != 0.0
