@@ -30,12 +30,15 @@ class GpsReading:
 class NMEAReader:
     """Async NMEA reader with reconnect support and merged GPS state updates."""
 
+    _SUPPORTED_SENTENCE_PREFIXES = ("$GPRMC", "$GNRMC", "$GPGGA", "$GNGGA")
     _SENTENCE_TYPES_USING_TYPED_FIELDS = {"RMC", "GGA", "GSA", "GLL", "VTG"}
     _SENTENCE_TYPES_EMITTING_UPDATES = {"RMC", "GGA", "GLL"}
 
     def __init__(self, port: str = "/dev/serial0", baudrate: int = 9600) -> None:
         self.port = port
-        self.baudrate = baudrate
+        if baudrate != 9600:
+            logger.warning("Overriding requested GPS baudrate %s to required 9600", baudrate)
+        self.baudrate = 9600
         self.device = port
         self.baud = baudrate
         self.current_reading = GpsReading()
@@ -51,6 +54,12 @@ class NMEAReader:
             while True:
                 decoded_line = await self._line_queue.get()
                 if not decoded_line.startswith("$"):
+                    continue
+
+                # Accept both $GP (GPS) and $GN (combined GNSS) talker IDs.
+                # BerryGPS HAT devices with u-blox modules frequently emit
+                # $GN... sentences even when GPS data is valid.
+                if not decoded_line.startswith(self._SUPPORTED_SENTENCE_PREFIXES):
                     continue
 
                 # Normalize any 2-letter talker prefix (GN, GL, GA, etc.) to GP
@@ -169,7 +178,8 @@ class NMEAReader:
                             break
             except serial.SerialException as exc:
                 logger.error(
-                    "Hardware port unavailable on %s. Retrying in %.1fs (%s)",
+                    "Hardware port unavailable on %s. Retrying in %.1fs (%s). "
+                    "If gpsd is enabled on the host, disable it so it does not lock the serial device.",
                     self.port, reconnect_backoff_seconds, exc
                 )
             except Exception as exc:  # pylint: disable=broad-except
