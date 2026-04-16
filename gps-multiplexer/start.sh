@@ -2,35 +2,26 @@
 set -eu
 
 SERIAL_DEVICE="${GPS_SERIAL_DEVICE:-/dev/serial0}"
-SERIAL_CANDIDATES="${GPS_SERIAL_CANDIDATES:-/dev/serial0,/dev/ttyAMA0,/dev/ttyS0}"
+APP_ENTRYPOINT="/usr/src/app/main.py"
 
-echo "gps-multiplexer starting: serial=${SERIAL_DEVICE} candidates=${SERIAL_CANDIDATES}"
+echo "gps-multiplexer starting: serial=${SERIAL_DEVICE}"
 
-# Pre-configure the first available GPS serial port: 9600 baud, raw mode, no echo.
-# Non-fatal because container hardware mappings vary by Pi model.
 if printf "%s" "${SERIAL_DEVICE}" | grep -Eq '^[Tt][Cc][Pp]://'; then
-  echo "GPS_SERIAL_DEVICE is TCP — skipping stty"
+  echo "GPS_SERIAL_DEVICE is TCP - skipping stty"
 else
-  STTY_TARGET=""
-  IFS=','
-  for candidate in ${SERIAL_CANDIDATES}; do
-    candidate_trimmed="$(echo "${candidate}" | xargs)"
-    if [ -c "${candidate_trimmed}" ]; then
-      STTY_TARGET="${candidate_trimmed}"
-      break
-    fi
-  done
-  unset IFS
-
-  if [ -z "${STTY_TARGET}" ] && [ -c "${SERIAL_DEVICE}" ]; then
-    STTY_TARGET="${SERIAL_DEVICE}"
+  if [ ! -c "${SERIAL_DEVICE}" ]; then
+    echo "GPS serial device ${SERIAL_DEVICE} is missing or not a character device"
+    exit 1
   fi
 
-  if [ -n "${STTY_TARGET}" ]; then
-    stty -F "${STTY_TARGET}" 9600 raw -echo || echo "Warning: stty failed for ${STTY_TARGET} — continuing"
-  else
-    echo "Warning: no character-device GPS serial candidates found for stty — continuing"
-  fi
+  # Force the UART to the expected module configuration before Python opens it.
+  stty -F "${SERIAL_DEVICE}" 9600 raw -echo
 fi
 
-exec python main.py
+if [ ! -f "${APP_ENTRYPOINT}" ]; then
+  echo "GPS multiplexer entrypoint not found: ${APP_ENTRYPOINT}"
+  exit 1
+fi
+
+echo "Launching gps-multiplexer Python process: ${APP_ENTRYPOINT}"
+exec python "${APP_ENTRYPOINT}"

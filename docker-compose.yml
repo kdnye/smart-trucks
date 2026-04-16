@@ -6,13 +6,13 @@ services:
       dockerfile: gps-multiplexer/Dockerfile
     privileged: true
     restart: always
+    entrypoint: ["/usr/local/bin/start.sh"]
     devices:
-      - "/dev/ttyAMA0:/dev/ttyAMA0" # Primary Pi UART node
-      - "/dev/ttyS0:/dev/ttyS0"     # Secondary Pi UART node
+      - "/dev/serial0:/dev/serial0"
     environment:
       - UDEV=1
-      - GPS_SERIAL_DEVICE=/dev/ttyAMA0
-      - GPS_SERIAL_CANDIDATES=/dev/ttyAMA0,/dev/ttyS0,/dev/serial0
+      - GPS_SERIAL_DEVICE=/dev/serial0
+      - GPS_SERIAL_CANDIDATES=/dev/serial0
 
   telematics-edge:
     build:
@@ -66,6 +66,7 @@ services:
     volumes:
       - telematics_data:/data
     environment:
+      - UDEV=1
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true
       - WEBHOOK_URL=${WEBHOOK_URL}
