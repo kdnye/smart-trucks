@@ -330,7 +330,8 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
 
         payload = {
             "event_type": "gps_point",
-            "vehicle_id": config.vehicle_id,
+            "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
+            "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
             "captured_at_utc": captured_at,
             "local_sequence": state.local_sequence,
             "location": gps,
