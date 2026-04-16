@@ -271,9 +271,9 @@ def load_config() -> Config:
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
-        ina219_max_expected_amps=max(0.05, _read_float_env("UPS_MAX_EXPECTED_AMPS", 2.2)),
-        ina219_gain_strategy=_read_ina219_gain_strategy_env("auto"),
-        ina219_bus_voltage_range_v=_read_ina219_bus_voltage_range_env(32),
+        ina219_max_expected_amps=max(0.05, _read_float_env("UPS_MAX_EXPECTED_AMPS", 3.2)),
+        ina219_gain_strategy=_read_ina219_gain_strategy_env("gain_8_320mv"),
+        ina219_bus_voltage_range_v=_read_ina219_bus_voltage_range_env(16),
         battery_capacity_mah=_read_int_env("UPS_BATTERY_CAPACITY_MAH", 2200, minimum=1),
         min_discharge_current_ma_for_runtime=_read_int_env(
             "UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE",
