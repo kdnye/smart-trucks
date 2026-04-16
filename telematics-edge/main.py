@@ -211,17 +211,23 @@ async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
         return
 
     selected_device = candidates[0]
-    if config.gps_probe_all_candidates:
+    tcp_mode = selected_device.startswith("tcp://")
+    if config.gps_probe_all_candidates and not tcp_mode:
         for candidate in candidates:
             if os.path.exists(candidate):
                 selected_device = candidate
                 break
-    elif not selected_device.startswith("tcp://") and not os.path.exists(selected_device):
+    elif not tcp_mode and not os.path.exists(selected_device):
         print(
             "Primary GPS serial path unavailable. "
             f"device={selected_device} errno=2 exception_type=FileNotFoundError"
         )
 
+    print(
+        "Preparing GPS reader. "
+        f"device={selected_device} tcp_mode={selected_device.startswith('tcp://')} "
+        f"probe_all_candidates={config.gps_probe_all_candidates}"
+    )
     reader = NMEAReader(port=selected_device, baudrate=config.gps_baud_rate)
     print(
         "Starting GPS reader task. "
