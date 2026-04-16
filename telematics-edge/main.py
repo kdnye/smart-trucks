@@ -320,35 +320,35 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
     while True:
         captured_at = utc_now_iso()
         gps = build_location_payload(get_latest_gps(state))
-        state.local_sequence += 1
 
         if gps.get("fix_status") == "locked":
             state.last_locked_gps_point_utc = captured_at
+            state.local_sequence += 1
+
+            payload = {
+                "event_type": "gps_point",
+                "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
+                "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
+                "captured_at_utc": captured_at,
+                "local_sequence": state.local_sequence,
+                "location": gps,
+            }
+
+            await insert_gps_point(
+                vehicle_id=config.vehicle_id,
+                captured_at_utc=captured_at,
+                lat=gps.get("latitude"),
+                lon=gps.get("longitude"),
+                speed_kmh=gps.get("speed_kmh"),
+                fix_status=gps.get("fix_status", "searching"),
+                source_device=gps.get("device"),
+                trip_id=None,
+                local_sequence=state.local_sequence,
+                payload=payload,
+            )
         else:
             stale_for = age_seconds(state.last_gps_fix_utc)
             state.gps_reader_ok = stale_for is None or stale_for <= 300
-
-        payload = {
-            "event_type": "gps_point",
-            "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
-            "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
-            "captured_at_utc": captured_at,
-            "local_sequence": state.local_sequence,
-            "location": gps,
-        }
-
-        await insert_gps_point(
-            vehicle_id=config.vehicle_id,
-            captured_at_utc=captured_at,
-            lat=gps.get("latitude"),
-            lon=gps.get("longitude"),
-            speed_kmh=gps.get("speed_kmh"),
-            fix_status=gps.get("fix_status", "searching"),
-            source_device=gps.get("device"),
-            trip_id=None,
-            local_sequence=state.local_sequence,
-            payload=payload,
-        )
 
         await asyncio.sleep(config.gps_sample_interval_seconds)
 
