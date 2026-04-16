@@ -30,8 +30,7 @@ class GpsReading:
 class NMEAReader:
     """Async NMEA reader with reconnect support and merged GPS state updates."""
 
-    _SUPPORTED_TALKER_PREFIXES = ("$GP", "$GN")
-    _SUPPORTED_SENTENCE_TYPES = {"RMC", "GGA"}
+    _SUPPORTED_SENTENCE_TYPES = {"RMC", "GGA", "GSA", "GLL", "VTG"}
     _SENTENCE_TYPES_USING_TYPED_FIELDS = {"RMC", "GGA", "GSA", "GLL", "VTG"}
     _SENTENCE_TYPES_EMITTING_UPDATES = {"RMC", "GGA", "GLL"}
 
@@ -57,11 +56,6 @@ class NMEAReader:
                 if not decoded_line.startswith("$"):
                     continue
 
-                # Accept both $GP (GPS) and $GN (combined GNSS) talker IDs.
-                # Process both RMC and GGA from either talker:
-                # $GPRMC, $GNRMC, $GPGGA, $GNGGA.
-                if not decoded_line.startswith(self._SUPPORTED_TALKER_PREFIXES):
-                    continue
                 if len(decoded_line) < 6 or decoded_line[3:6] not in self._SUPPORTED_SENTENCE_TYPES:
                     continue
 
