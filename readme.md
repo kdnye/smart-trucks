@@ -157,6 +157,10 @@ The following patterns are expected during supervised updates and should not be 
        ```
      * Verify GPS wiring and power stability.
      * Confirm `GPS_SERIAL_DEVICE` and `GPS_SERIAL_CANDIDATES` are set consistently.
+   * `gps-multiplexer/start.sh` behavior:
+     * Missing serial device (for example `/dev/serial0`) logs a warning and continues.
+     * Missing Python app entrypoint (`/usr/src/app/main.py`) exits immediately.
+   * Serial candidate discovery is implemented in `gps-multiplexer/main.py` via `GPS_SERIAL_CANDIDATES`.
 
 2. **Missing optional pyserial dependency in power-monitor probe path**
    * Signature: `pyserial unavailable: No module named 'serial'` inside `power-monitor` hardware inventory output.

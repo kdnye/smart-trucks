@@ -26,6 +26,13 @@ Current expected candidate set:
 
 If any candidate path is missing from container device mappings, auto-discovery may fail on boards/boot modes that expose GPS on a different UART alias.
 
+### gps-multiplexer startup behavior (important)
+`gps-multiplexer/start.sh` does **not** hard-exit when `GPS_SERIAL_DEVICE` (default `/dev/serial0`) is missing. It logs a warning and continues launching Python so runtime auto-discovery can still find another mapped UART candidate.
+
+`gps-multiplexer/start.sh` **does** hard-exit when the app entrypoint is missing (`/usr/src/app/main.py`), because the service cannot start without executable application code.
+
+Troubleshooting note: serial discovery and reconnect logic run in `gps-multiplexer/main.py`, where candidates are built from `GPS_SERIAL_CANDIDATES` (plus defaults such as `/dev/serial0`, `/dev/ttyAMA0`, and `/dev/ttyS0`).
+
 ## Phase 2: Software Identity (Device Variables)
 Next, the Python containers need to know *where* to send their data and *who* they are.
 
