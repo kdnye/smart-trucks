@@ -10,9 +10,22 @@ import aiosqlite
 logger = logging.getLogger(__name__)
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
+SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
 
 _db_connection: aiosqlite.Connection | None = None
 _db_lock = asyncio.Lock()
+
+async def _configure_sqlite_connection(conn: aiosqlite.Connection) -> None:
+    """Configure SQLite for cross-process writer contention on shared edge storage."""
+    await conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+    journal_mode_cursor = await conn.execute("PRAGMA journal_mode=WAL;")
+    journal_mode_row = await journal_mode_cursor.fetchone()
+    await conn.execute("PRAGMA synchronous=NORMAL;")
+    await conn.execute("PRAGMA temp_store=MEMORY;")
+
+    if journal_mode_row and str(journal_mode_row[0]).lower() != "wal":
+        logger.warning("SQLite journal mode is %s (expected WAL)", journal_mode_row[0])
 
 
 async def _get_db_connection() -> aiosqlite.Connection:
@@ -24,11 +37,8 @@ async def _get_db_connection() -> aiosqlite.Connection:
 
     async with _db_lock:
         if _db_connection is None:
-            _db_connection = await aiosqlite.connect(DB_PATH, timeout=20.0)
-            await _db_connection.execute("PRAGMA busy_timeout=20000;")
-            await _db_connection.execute("PRAGMA journal_mode=WAL;")
-            await _db_connection.execute("PRAGMA synchronous=NORMAL;")
-            await _db_connection.execute("PRAGMA temp_store=MEMORY;")
+            _db_connection = await aiosqlite.connect(DB_PATH, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
+            await _configure_sqlite_connection(_db_connection)
         return _db_connection
 
 
