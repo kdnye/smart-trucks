@@ -42,6 +42,28 @@ DEFAULT_UPS_MAX_EXPECTED_AMPS = 4.0
 CURRENT_FLOW_DEADBAND_MA = 20.0
 EXTERNAL_INPUT_PRESENT_MIN_BUS_V = 4.5
 
+
+class INA219SensorTimeoutError(TimeoutError):
+    def __init__(
+        self,
+        *,
+        address: int,
+        retries: int,
+        conversion_delay_s: float,
+        retry_sleep_s: float,
+        last_bus_register: int,
+    ) -> None:
+        self.details = {
+            "error": "ina219_conversion_timeout",
+            "ina219_address": f"0x{address:02X}",
+            "retries": retries,
+            "conversion_delay_ms": round(conversion_delay_s * 1000.0, 2),
+            "retry_sleep_ms": round(retry_sleep_s * 1000.0, 2),
+            "last_bus_register": f"0x{last_bus_register:04X}",
+        }
+        super().__init__(json.dumps(self.details, sort_keys=True))
+
+
 class AsyncINA219:
     _CONFIG_REGISTER = 0x00
     _SHUNT_VOLTAGE_REGISTER = 0x01
@@ -53,6 +75,27 @@ class AsyncINA219:
     _MODE_TRIGGERED_SHUNT_BUS = 0b011
     _VOLTAGE_SOC_MAX_V = 4.20
     _VOLTAGE_SOC_MIN_V = 3.20
+    _ADC_CONVERSION_SECONDS = {
+        0b0000: 84e-6,    # 9-bit
+        0b0001: 148e-6,   # 10-bit
+        0b0010: 276e-6,   # 11-bit
+        0b0011: 532e-6,   # 12-bit
+        0b0100: 532e-6,   # 12-bit (reserved encoding in some docs)
+        0b0101: 532e-6,   # 12-bit (reserved encoding in some docs)
+        0b0110: 532e-6,   # 12-bit (reserved encoding in some docs)
+        0b0111: 532e-6,   # 12-bit (reserved encoding in some docs)
+        0b1000: 532e-6,   # 12-bit (reserved encoding in some docs)
+        0b1001: 1.06e-3,  # 2 samples
+        0b1010: 2.13e-3,  # 4 samples
+        0b1011: 4.26e-3,  # 8 samples
+        0b1100: 8.51e-3,  # 16 samples
+        0b1101: 17.02e-3, # 32 samples
+        0b1110: 34.05e-3, # 64 samples
+        0b1111: 68.10e-3, # 128 samples
+    }
+    _CONVERSION_MARGIN_SECONDS = 5e-3
+    _CNVR_RETRY_SLEEP_SECONDS = 3e-3
+    _MAX_CNVR_RETRIES = 2
 
     def __init__(
         self,
@@ -177,14 +220,44 @@ class AsyncINA219:
             | self._MODE_TRIGGERED_SHUNT_BUS
         )
 
+    @classmethod
+    def _adc_conversion_seconds(cls, adc_setting: int) -> float:
+        return cls._ADC_CONVERSION_SECONDS.get(adc_setting & 0x0F, 532e-6)
+
+    @classmethod
+    def _trigger_conversion_delay_seconds(cls, config_register: int) -> float:
+        bus_adc_setting = (config_register >> 7) & 0x0F
+        shunt_adc_setting = (config_register >> 3) & 0x0F
+        return (
+            cls._adc_conversion_seconds(bus_adc_setting)
+            + cls._adc_conversion_seconds(shunt_adc_setting)
+            + cls._CONVERSION_MARGIN_SECONDS
+        )
+
     async def trigger_and_fetch(self) -> tuple[int, int, int]:
-        await self._write_register(self._CONFIG_REGISTER, self._build_trigger_config())
-        while True:
-            bus_voltage_register = await self._read_register(self._BUS_VOLTAGE_REGISTER)
-            if bus_voltage_register & self._CNVR_MASK:
-                shunt_voltage_register = await self._read_register(self._SHUNT_VOLTAGE_REGISTER, signed=True)
-                return shunt_voltage_register, bus_voltage_register, bus_voltage_register
-            await asyncio.sleep(0.01)
+        config_register = self._build_trigger_config()
+        await self._write_register(self._CONFIG_REGISTER, config_register)
+        conversion_delay_s = self._trigger_conversion_delay_seconds(config_register)
+        await asyncio.sleep(conversion_delay_s)
+
+        bus_voltage_register = await self._read_register(self._BUS_VOLTAGE_REGISTER)
+        if not (bus_voltage_register & self._CNVR_MASK):
+            for _ in range(self._MAX_CNVR_RETRIES):
+                await asyncio.sleep(self._CNVR_RETRY_SLEEP_SECONDS)
+                bus_voltage_register = await self._read_register(self._BUS_VOLTAGE_REGISTER)
+                if bus_voltage_register & self._CNVR_MASK:
+                    break
+            else:
+                raise INA219SensorTimeoutError(
+                    address=self.address,
+                    retries=self._MAX_CNVR_RETRIES,
+                    conversion_delay_s=conversion_delay_s,
+                    retry_sleep_s=self._CNVR_RETRY_SLEEP_SECONDS,
+                    last_bus_register=bus_voltage_register,
+                )
+
+        shunt_voltage_register = await self._read_register(self._SHUNT_VOLTAGE_REGISTER, signed=True)
+        return shunt_voltage_register, bus_voltage_register, bus_voltage_register
 
     def _kalman_filter(self, measurement_a: float) -> float:
         self.P = self.P + self.Q
