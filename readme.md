@@ -42,6 +42,8 @@ telematics-fleet/
 
 For a full, field-tested setup workflow for brand-new devices (Balena host config, identity variables, GPS cold start, and dashboard verification), see the **[Device Provisioning & Dashboard Sync Guide](docs/device-provisioning-guide.md)**.
 
+For UPS shutdown tuning, use the **[Hold-Up Characterization Test Procedure](docs/hold-up-characterization-test-procedure.md)** to capture per-hardware-profile recommended low-battery thresholds with 20–60s hold-up headroom.
+
 ### 1. Prerequisites
 * Install the [Balena CLI](https://github.com/balena-io/balena-cli).
 * Create a Fleet in your BalenaCloud dashboard.
