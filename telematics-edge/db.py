@@ -46,6 +46,18 @@ async def _get_db_connection() -> aiosqlite.Connection:
         return _db_connection
 
 
+async def _execute_write(sql: str, params: list[Any] | tuple[Any, ...]) -> None:
+    """Execute writes through a fresh IMMEDIATE transaction to honor busy timeout under contention."""
+    async with aiosqlite.connect(
+        DB_PATH,
+        timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        isolation_level="IMMEDIATE",
+    ) as db:
+        await _configure_sqlite_connection(db)
+        await db.execute(sql, params)
+        await db.commit()
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -274,12 +286,10 @@ async def mark_gps_points_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write(
             f"UPDATE gps_points SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
             params,
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to mark GPS rows sent: %s", exc)
 
@@ -293,12 +303,10 @@ async def mark_heartbeats_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write(
             f"UPDATE heartbeats SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
             params,
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to mark heartbeat rows sent: %s", exc)
 
@@ -309,12 +317,10 @@ async def increment_gps_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write(
             f"UPDATE gps_points SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
             row_ids,
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to increment GPS attempts: %s", exc)
 
@@ -325,12 +331,10 @@ async def increment_heartbeat_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write(
             f"UPDATE heartbeats SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
             row_ids,
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to increment heartbeat attempts: %s", exc)
 
