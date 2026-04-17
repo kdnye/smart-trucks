@@ -37,7 +37,11 @@ async def _get_db_connection() -> aiosqlite.Connection:
 
     async with _db_lock:
         if _db_connection is None:
-            _db_connection = await aiosqlite.connect(DB_PATH, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS)
+            _db_connection = await aiosqlite.connect(
+                DB_PATH,
+                timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                isolation_level="IMMEDIATE",
+            )
             await _configure_sqlite_connection(_db_connection)
         return _db_connection
 

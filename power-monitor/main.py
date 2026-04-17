@@ -993,7 +993,11 @@ async def run() -> None:
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
-    async with aiosqlite.connect(config.db_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS) as conn:
+    async with aiosqlite.connect(
+        config.db_path,
+        timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+        isolation_level="IMMEDIATE",
+    ) as conn:
         await configure_sqlite(conn)
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
