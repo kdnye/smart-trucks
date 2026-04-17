@@ -51,6 +51,8 @@ class AsyncINA219:
     _BADC_128_SAMPLES = 0b1111
     _SADC_128_SAMPLES = 0b1111
     _MODE_TRIGGERED_SHUNT_BUS = 0b011
+    _VOLTAGE_SOC_MAX_V = 4.20
+    _VOLTAGE_SOC_MIN_V = 3.20
 
     def __init__(
         self,
@@ -198,11 +200,28 @@ class AsyncINA219:
         self.total_mAh += filtered_current_a * 1000.0 * (float(delta_us) / 3_600_000_000.0)
         return delta_us
 
+    @staticmethod
+    def _raw_bus_to_voltage(bus_raw: int) -> float:
+        return float((bus_raw >> 3) * 4) / 1000.0
+
+    def estimate_starting_mah(self, current_voltage_v: float, max_capacity_mah: float = 1500.0) -> float:
+        """
+        Estimate initial battery mAh from cell voltage for one-time startup initialization.
+        """
+        if current_voltage_v >= self._VOLTAGE_SOC_MAX_V:
+            return max_capacity_mah
+        if current_voltage_v <= self._VOLTAGE_SOC_MIN_V:
+            return 0.0
+        soc_percentage = (current_voltage_v - self._VOLTAGE_SOC_MIN_V) / (
+            self._VOLTAGE_SOC_MAX_V - self._VOLTAGE_SOC_MIN_V
+        )
+        return max_capacity_mah * soc_percentage
+
     async def read(self) -> dict[str, Any]:
         shunt_raw, bus_raw, status_raw = await self.trigger_and_fetch()
         shunt_voltage_v = float(shunt_raw) * 0.00001
         shunt_voltage_mv = shunt_voltage_v * 1000.0
-        bus_voltage_v = float((bus_raw >> 3) * 4) / 1000.0
+        bus_voltage_v = self._raw_bus_to_voltage(bus_raw)
         current_a = (shunt_voltage_v * self._m) + self._c
         filtered_current_a = self._kalman_filter(current_a)
         delta_us = self._update_coulomb_counter(filtered_current_a)
@@ -503,6 +522,12 @@ class UpsMonitor:
                     scl_gpio_pin=self._i2c_scl_gpio_pin,
                 )
                 self._ina.set_calibration_profile(1.0 / max(self._shunt_ohms, 1e-6), 0.0)
+                _, bus_raw, _ = await self._ina.trigger_and_fetch()
+                bus_voltage_v = self._ina._raw_bus_to_voltage(bus_raw)
+                self._ina.total_mAh = self._ina.estimate_starting_mah(
+                    bus_voltage_v,
+                    max_capacity_mah=float(self._battery_capacity_mah),
+                )
                 print(f"UPS monitor initialized. bus={self._i2c_bus} address=0x{address:02X}.")
                 return True
             except Exception as exc:
