@@ -107,6 +107,15 @@ async def init_db() -> None:
         )
 
         await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wake_signals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_type  TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            );
+            """
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_gps_points_pending ON gps_points(sent_at_utc, captured_at_utc);"
         )
         await db.execute(
@@ -391,6 +400,36 @@ async def get_latest_power_snapshot(vehicle_id: str) -> dict[str, Any] | None:
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to fetch latest power snapshot: %s", exc)
         return None
+
+
+async def insert_wake_signal(signal_type: str) -> None:
+    try:
+        db = await _get_db_connection()
+        await db.execute(
+            "INSERT INTO wake_signals (signal_type, created_at) VALUES (?, ?)",
+            (signal_type, _utc_now_iso()),
+        )
+        await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to insert wake signal: %s", exc)
+
+
+async def pop_beacon_wake_signal() -> bool:
+    """Return True and delete all ble_key_beacon signals if any exist."""
+    try:
+        db = await _get_db_connection()
+        async with db.execute(
+            "SELECT id FROM wake_signals WHERE signal_type = 'ble_key_beacon' LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return False
+        await db.execute("DELETE FROM wake_signals WHERE signal_type = 'ble_key_beacon'")
+        await db.commit()
+        return True
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to pop beacon wake signal: %s", exc)
+        return False
 
 
 async def purge_old_sent_rows(days: int = 7) -> int:

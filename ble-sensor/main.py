@@ -4,7 +4,9 @@ import hmac
 import json
 import os
 import random
+import sqlite3 as _sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -23,6 +25,8 @@ class Config:
     mac_hash_salt: str
     include_name: bool
     max_devices_per_scan: int
+    key_beacon_uuids: frozenset[str]
+    key_beacon_manufacturer_ids: frozenset[int]
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -42,6 +46,15 @@ def load_config() -> Config:
             f"{recommended_poll_minimum:.0f}s (SCAN_DURATION_SECONDS + 15)."
         )
 
+    raw_uuids = os.getenv("KEY_BEACON_UUIDS", "")
+    key_beacon_uuids: frozenset[str] = frozenset(
+        u.strip().upper() for u in raw_uuids.split(",") if u.strip()
+    )
+    raw_mfr = os.getenv("KEY_BEACON_MANUFACTURER_IDS", "")
+    key_beacon_manufacturer_ids: frozenset[int] = frozenset(
+        int(x.strip()) for x in raw_mfr.split(",") if x.strip().isdigit()
+    )
+
     return Config(
         webhook_url=os.getenv("WEBHOOK_URL"),
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
@@ -53,6 +66,8 @@ def load_config() -> Config:
         mac_hash_salt=os.getenv("MAC_HASH_SALT", ""),
         include_name=_to_bool(os.getenv("INCLUDE_DEVICE_NAME", "false"), default=False),
         max_devices_per_scan=max(0, int(os.getenv("MAX_DEVICES_PER_SCAN", "0"))),
+        key_beacon_uuids=key_beacon_uuids,
+        key_beacon_manufacturer_ids=key_beacon_manufacturer_ids,
     )
 
 
@@ -477,11 +492,32 @@ async def push_to_cloud(
         print(f"Transmission failed: {exc}")
 
 
+def _write_ble_wake_signal() -> None:
+    try:
+        with _sqlite3.connect("/data/telematics.db", timeout=5.0) as conn:
+            conn.execute(
+                "INSERT INTO wake_signals (signal_type, created_at) VALUES (?, ?)",
+                ("ble_key_beacon", datetime.now(timezone.utc).isoformat()),
+            )
+        print("Key beacon detected: wake signal written to shared DB.")
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"Failed to write BLE wake signal: {exc}")
+
+
 async def collect_payload(config: Config) -> dict[str, Any]:
     devices = await BleakScanner.discover(
         timeout=config.scan_duration_seconds,
         return_adv=True,
     )
+
+    if config.key_beacon_uuids or config.key_beacon_manufacturer_ids:
+        for _, (device, adv_data) in devices.items():
+            uuids = {str(u).upper() for u in (adv_data.service_uuids or [])}
+            mfr_keys = set((adv_data.manufacturer_data or {}).keys())
+            if uuids & config.key_beacon_uuids or mfr_keys & config.key_beacon_manufacturer_ids:
+                print(f"Key beacon matched: address={device.address}")
+                _write_ble_wake_signal()
+                break
 
     sensors: list[dict[str, Any]] = []
     for _, (device, adv_data) in devices.items():

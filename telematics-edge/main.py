@@ -7,10 +7,10 @@ import socket
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 import uvloop
@@ -29,6 +29,7 @@ from db import (
     insert_heartbeat,
     mark_gps_points_sent,
     mark_heartbeats_sent,
+    pop_beacon_wake_signal,
     purge_old_sent_rows,
     record_edge_health,
 )
@@ -155,6 +156,8 @@ class RuntimeState:
     power_monitor_ok: bool = True
     wifi_connected: bool = False
     latest_valid_gps: dict[str, Any] | None = None
+    parked_mode: bool = False
+    park_wake_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class ImuMonitor:
@@ -162,6 +165,10 @@ class ImuMonitor:
         self._reader = IMUReader(bus_num=bus_num)
         self._latest_snapshot: dict[str, Any] = {"status": "initializing"}
         self._latest_harsh_event: dict[str, Any] | None = None
+        self._motion_wake_callback: Callable[[], Awaitable[None]] | None = None
+
+    def set_motion_wake_callback(self, cb: Callable[[], Awaitable[None]]) -> None:
+        self._motion_wake_callback = cb
 
     async def start(self) -> None:
         async def on_snapshot(snapshot: ImuSnapshot) -> None:
@@ -169,6 +176,8 @@ class ImuMonitor:
 
         async def on_harsh_event(snapshot: ImuSnapshot) -> None:
             self._latest_harsh_event = snapshot_as_dict(snapshot)
+            if self._motion_wake_callback:
+                await self._motion_wake_callback()
 
         await self._reader.read_loop(on_snapshot, on_harsh_event)
 
@@ -242,6 +251,10 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
         if is_network_connected():
             if consecutive_failures > 0:
                 logger.info("Network watchdog: connectivity restored after %s failed checks.", consecutive_failures)
+            if state.parked_mode:
+                logger.info("Network watchdog: WiFi restored — exiting parked mode.")
+                state.parked_mode = False
+                state.park_wake_event.set()
             consecutive_failures = 0
             state.wifi_connected = True
             await asyncio.sleep(config.network_watchdog_check_interval_seconds)
@@ -258,6 +271,13 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
             await asyncio.sleep(config.network_watchdog_check_interval_seconds)
             continue
 
+        # Already in parked mode — skip the radio-cycle recovery and let parked_scan_worker
+        # handle periodic WiFi re-checks.
+        if state.parked_mode:
+            consecutive_failures = 0
+            await asyncio.sleep(config.network_watchdog_check_interval_seconds)
+            continue
+
         logger.error("Network watchdog triggering Wi-Fi recovery sequence via NetworkManager.")
         _run_network_recovery_command(["nmcli", "device", "wifi", "rescan"])
         await asyncio.sleep(5)
@@ -268,6 +288,9 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
             _run_network_recovery_command(["nmcli", "connection", "up", config.network_watchdog_connection_name])
 
         consecutive_failures = 0
+        if not is_network_connected() and not state.parked_mode:
+            logger.warning("Network watchdog: WiFi recovery failed — entering parked mode.")
+            state.parked_mode = True
         await asyncio.sleep(config.network_watchdog_recovery_pause_seconds)
 
 
@@ -395,8 +418,79 @@ async def post_payload(
         return False
 
 
+PARKED_SLEEP_SECONDS = 50.0
+
+
+async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
+    """Lean GPS stash + WiFi re-check executed on every parked sleep tick."""
+    captured_at = utc_now_iso()
+    gps = build_location_payload(get_latest_gps(state))
+    if gps.get("fix_status") == "locked":
+        state.local_sequence += 1
+        payload = {
+            "event_type": "gps_point",
+            "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
+            "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
+            "captured_at_utc": captured_at,
+            "local_sequence": state.local_sequence,
+            "location": gps,
+            "parked": True,
+        }
+        await insert_gps_point(
+            vehicle_id=config.vehicle_id,
+            captured_at_utc=captured_at,
+            lat=gps.get("latitude"),
+            lon=gps.get("longitude"),
+            speed_kmh=gps.get("speed_kmh"),
+            fix_status=gps.get("fix_status", "searching"),
+            source_device=gps.get("device"),
+            trip_id=None,
+            local_sequence=state.local_sequence,
+            payload=payload,
+        )
+
+    if await pop_beacon_wake_signal():
+        logger.info("Parked scan: BLE key beacon signal found — waking.")
+        state.parked_mode = False
+        state.park_wake_event.set()
+        return
+
+    if is_network_connected():
+        logger.info("Parked scan: WiFi detected — exiting parked mode.")
+        state.parked_mode = False
+        state.wifi_connected = True
+        state.park_wake_event.set()
+
+
+async def parked_scan_worker(config: Config, state: RuntimeState) -> None:
+    while True:
+        if not state.parked_mode:
+            state.park_wake_event.clear()
+            await asyncio.sleep(2)
+            continue
+
+        logger.info("Parked mode: sleeping %.0fs before next scan cycle.", PARKED_SLEEP_SECONDS)
+        try:
+            await asyncio.wait_for(state.park_wake_event.wait(), timeout=PARKED_SLEEP_SECONDS)
+            state.park_wake_event.clear()
+            if not state.parked_mode:
+                logger.info("Parked mode: exiting (WiFi restored or external wake).")
+            else:
+                logger.info("Parked mode: motion wake — exiting parked mode.")
+                state.parked_mode = False
+            continue
+        except asyncio.TimeoutError:
+            pass
+
+        await _parked_scan_cycle(config, state)
+
+
 async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
     while True:
+        if state.parked_mode:
+            await asyncio.sleep(5)
+            continue
+
         captured_at = utc_now_iso()
         gps = build_location_payload(get_latest_gps(state))
 
@@ -434,6 +528,10 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
 
 async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor) -> None:
     while True:
+        if state.parked_mode:
+            await asyncio.sleep(10)
+            continue
+
         captured_at = utc_now_iso()
         gps_payload = build_location_payload(get_latest_gps(state))
         state.wifi_connected = is_network_connected()
@@ -553,6 +651,9 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
     while True:
         await asyncio.sleep(60)
 
+        if state.parked_mode:
+            continue
+
         db_stats = await get_db_stats()
         disk = shutil.disk_usage("/")
         disk_free_mb = round(disk.free / (1024 * 1024), 2)
@@ -657,6 +758,14 @@ async def run() -> None:
     imu = ImuMonitor(bus_num=config.imu_i2c_bus)
     state = RuntimeState(start_monotonic=time.monotonic())
 
+    async def _on_motion_wake() -> None:
+        if state.parked_mode:
+            logger.info("Motion wake: IMU harsh event detected in parked mode.")
+            state.parked_mode = False
+            state.park_wake_event.set()
+
+    imu.set_motion_wake_callback(_on_motion_wake)
+
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
 
@@ -670,6 +779,7 @@ async def run() -> None:
             asyncio.create_task(sync_worker(config, state, session)),
             asyncio.create_task(maintenance_worker(config, state)),
             asyncio.create_task(network_watchdog_worker(config, state)),
+            asyncio.create_task(parked_scan_worker(config, state)),
         ]
         await asyncio.gather(*tasks)
 
