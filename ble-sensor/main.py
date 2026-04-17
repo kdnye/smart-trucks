@@ -27,6 +27,8 @@ class Config:
     max_devices_per_scan: int
     key_beacon_uuids: frozenset[str]
     key_beacon_manufacturer_ids: frozenset[int]
+    scan_contention_backoff_cap_seconds: float
+    scan_contention_cooldown_threshold: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -37,7 +39,7 @@ def _to_bool(raw: str | None, default: bool = False) -> bool:
 
 def load_config() -> Config:
     poll_interval_seconds = max(5, int(os.getenv("POLL_INTERVAL", "60")))
-    scan_duration_seconds = max(1.0, float(os.getenv("SCAN_DURATION_SECONDS", "15")))
+    scan_duration_seconds = max(1.0, float(os.getenv("SCAN_DURATION_SECONDS", "20")))
     recommended_poll_minimum = scan_duration_seconds + 15
     if poll_interval_seconds < recommended_poll_minimum:
         print(
@@ -68,6 +70,14 @@ def load_config() -> Config:
         max_devices_per_scan=max(0, int(os.getenv("MAX_DEVICES_PER_SCAN", "0"))),
         key_beacon_uuids=key_beacon_uuids,
         key_beacon_manufacturer_ids=key_beacon_manufacturer_ids,
+        scan_contention_backoff_cap_seconds=max(
+            2.0,
+            float(os.getenv("SCAN_CONTENTION_BACKOFF_CAP_SECONDS", "12")),
+        ),
+        scan_contention_cooldown_threshold=max(
+            1,
+            int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
+        ),
     )
 
 
@@ -577,7 +587,10 @@ async def run() -> None:
 
                     if is_op_in_progress:
                         apply_poll_sleep = False
-                        backoff_seconds = min(8.0, 0.75 * (2**scan_retry_attempt))
+                        backoff_seconds = min(
+                            config.scan_contention_backoff_cap_seconds,
+                            0.75 * (2**scan_retry_attempt),
+                        )
                         jitter_seconds = random.uniform(0, 0.5)
                         sleep_seconds = backoff_seconds + jitter_seconds
                         scan_retry_attempt += 1
@@ -587,6 +600,12 @@ async def run() -> None:
                             f"Retrying in {sleep_seconds:.2f}s."
                         )
                         await asyncio.sleep(sleep_seconds)
+                        if scan_retry_attempt % config.scan_contention_cooldown_threshold == 0:
+                            print(
+                                "Repeated scan contention detected. Applying extended "
+                                f"cooldown of {config.post_interval_seconds}s before retry."
+                            )
+                            await asyncio.sleep(config.post_interval_seconds)
                         continue
 
                     raise
