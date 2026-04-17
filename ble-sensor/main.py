@@ -504,7 +504,11 @@ async def push_to_cloud(
 
 def _write_ble_wake_signal() -> None:
     try:
-        with _sqlite3.connect("/data/telematics.db", timeout=5.0) as conn:
+        with _sqlite3.connect(
+            "/data/telematics.db",
+            timeout=30.0,
+            isolation_level="IMMEDIATE",
+        ) as conn:
             conn.execute(
                 "INSERT INTO wake_signals (signal_type, created_at) VALUES (?, ?)",
                 ("ble_key_beacon", datetime.now(timezone.utc).isoformat()),
