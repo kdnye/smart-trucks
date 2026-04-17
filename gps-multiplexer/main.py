@@ -175,6 +175,7 @@ async def run() -> None:
         writer: asyncio.StreamWriter,
     ) -> None:
         broadcaster.add_client(writer)
+        addr = writer.get_extra_info("peername", "?")
         try:
             # Block here until the client closes the connection (EOF).
             # GPS clients are receive-only, so we never expect inbound data.
@@ -182,10 +183,13 @@ async def run() -> None:
                 chunk = await reader.read(256)
                 if not chunk:
                     break
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as exc:
+            logger.info("GPS client abruptly disconnected: %s error=%s", addr, exc)
         finally:
             broadcaster.remove_client(writer)
             with contextlib.suppress(Exception):
                 writer.close()
+                await writer.wait_closed()
 
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
     addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
