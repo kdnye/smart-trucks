@@ -158,6 +158,7 @@ class RuntimeState:
     latest_valid_gps: dict[str, Any] | None = None
     parked_mode: bool = False
     park_wake_event: asyncio.Event = field(default_factory=asyncio.Event)
+    last_motion_monotonic: float = 0.0
 
 
 class ImuMonitor:
@@ -289,8 +290,14 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
 
         consecutive_failures = 0
         if not is_network_connected() and not state.parked_mode:
-            logger.warning("Network watchdog: WiFi recovery failed — entering parked mode.")
-            state.parked_mode = True
+            if _truck_is_active(state):
+                logger.info(
+                    "Network watchdog: WiFi recovery failed but truck is active — "
+                    "staying in active mode, data will queue until WiFi returns."
+                )
+            else:
+                logger.warning("Network watchdog: WiFi recovery failed and truck inactive — entering parked mode.")
+                state.parked_mode = True
         await asyncio.sleep(config.network_watchdog_recovery_pause_seconds)
 
 
@@ -419,6 +426,21 @@ async def post_payload(
 
 
 PARKED_SLEEP_SECONDS = 50.0
+# Truck is considered active for this many seconds after the last IMU motion event.
+ACTIVE_AFTER_MOTION_SECONDS = 300.0
+# GPS speed threshold below which the truck is considered stationary.
+_MOVING_SPEED_KMH = 5.0
+
+
+def _truck_is_active(state: RuntimeState) -> bool:
+    """Return True if recent motion or GPS speed suggests the truck is in use."""
+    if state.last_motion_monotonic > 0:
+        if time.monotonic() - state.last_motion_monotonic < ACTIVE_AFTER_MOTION_SECONDS:
+            return True
+    gps = state.latest_valid_gps
+    if gps and (gps.get("speed_kmh") or 0.0) >= _MOVING_SPEED_KMH:
+        return True
+    return False
 
 
 async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
@@ -449,6 +471,12 @@ async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
             payload=payload,
         )
 
+    if _truck_is_active(state):
+        logger.info("Parked scan: truck is active — resuming full-rate collection.")
+        state.parked_mode = False
+        state.park_wake_event.set()
+        return
+
     if await pop_beacon_wake_signal():
         logger.info("Parked scan: BLE key beacon signal found — waking.")
         state.parked_mode = False
@@ -478,6 +506,10 @@ async def parked_scan_worker(config: Config, state: RuntimeState) -> None:
             else:
                 logger.info("Parked mode: motion wake — exiting parked mode.")
                 state.parked_mode = False
+            # Immediately check WiFi so the sync worker can start draining the queue.
+            if is_network_connected():
+                state.wifi_connected = True
+                logger.info("Parked wake: WiFi available — sync worker will upload queued data.")
             continue
         except asyncio.TimeoutError:
             pass
@@ -759,6 +791,7 @@ async def run() -> None:
     state = RuntimeState(start_monotonic=time.monotonic())
 
     async def _on_motion_wake() -> None:
+        state.last_motion_monotonic = time.monotonic()
         if state.parked_mode:
             logger.info("Motion wake: IMU harsh event detected in parked mode.")
             state.parked_mode = False
