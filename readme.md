@@ -68,6 +68,8 @@ Set the following variables in the **Balena Dashboard > Device Configuration** t
 ## Fleet Variables
 Use **Environment Variables** in Balena to manage unique truck settings without code changes:
 
+> Note: UPS / INA219 variables (`UPS_*`, `POWER_*`) are consumed by the `power-monitor` service. `telematics-edge` does not read INA219 directly.
+
 | Variable | Description | Example |
 | :--- | :--- | :--- |
 | `VEHICLE_ID` | Unique identifier for the truck | `TRK-905` |
