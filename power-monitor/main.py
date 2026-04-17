@@ -449,6 +449,7 @@ class UpsMonitor:
 
 async def configure_sqlite(conn: aiosqlite.Connection) -> None:
     """Apply low-overhead SQLite settings for SD-card backed storage."""
+    await conn.execute("PRAGMA busy_timeout=20000;")
     await conn.execute("PRAGMA journal_mode=WAL;")
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA temp_store=MEMORY;")
@@ -987,7 +988,7 @@ async def run() -> None:
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
-    async with aiosqlite.connect(config.db_path, timeout=15.0) as conn:
+    async with aiosqlite.connect(config.db_path, timeout=20.0) as conn:
         await configure_sqlite(conn)
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)

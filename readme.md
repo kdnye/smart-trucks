@@ -79,6 +79,11 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `UPS_SHUNT_OHMS` | INA219 shunt resistor value in ohms for UPS current/power calibration. | `0.01` |
 | `UPS_BATTERY_CAPACITY_MAH` | Battery-pack capacity used for runtime estimation in `power-monitor` payloads. | `4400` |
 | `UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE` | Ignore tiny discharge current noise below this threshold when estimating remaining runtime. | `20` |
+| `NETWORK_WATCHDOG_ENABLED` | Enables periodic Wi-Fi recovery logic (`nmcli` rescan/radio reset) in `telematics-edge`. | `true` |
+| `NETWORK_WATCHDOG_CHECK_INTERVAL_SECONDS` | Seconds between connectivity checks before recovery is attempted. | `60` |
+| `NETWORK_WATCHDOG_MAX_FAILURES` | Consecutive failed checks required before Wi-Fi recovery commands run. | `3` |
+| `NETWORK_WATCHDOG_RECOVERY_PAUSE_SECONDS` | Cooldown after recovery commands before checks resume. | `30` |
+| `NETWORK_WATCHDOG_CONNECTION_NAME` | Optional `nmcli` connection profile name to explicitly bring up after recovery. | `""` |
 | `IMU_I2C_BUS` | I2C bus used for IMU probing and telematics IMU reads. | `1` |
 | `IMU_EXPECTED_ADDRESSES` | Comma-separated IMU address candidates (hex) expected on `IMU_I2C_BUS`. | `0x6A` |
 | `IMU_REQUIRED` | Fail fast when no IMU is detected at startup (`true`/`false`). | `true` |
