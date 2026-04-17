@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import os
+import shlex
 import sys
 import time
 from dataclasses import dataclass
@@ -28,7 +29,13 @@ from shared.hardware_probe import (
 
 logger = logging.getLogger(__name__)
 
-UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health", "power_diagnostic")
+UPLOADABLE_EVENT_TYPES: tuple[str, ...] = (
+    "power_snapshot",
+    "power_state",
+    "power_health",
+    "power_diagnostic",
+    "power_event",
+)
 SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
 DEFAULT_UPS_MAX_EXPECTED_AMPS = 4.0
@@ -230,6 +237,10 @@ class Config:
     ina219_scl_gpio_pin: int
     battery_capacity_mah: int
     min_discharge_current_ma_for_runtime: int
+    shutdown_soc_pct: float
+    shutdown_voltage_v: float
+    shutdown_consecutive_samples: int
+    shutdown_command_timeout_seconds: float
     upload_batch_size: int
     upload_backoff_initial_seconds: int
     upload_backoff_max_seconds: int
@@ -375,6 +386,13 @@ def load_config() -> Config:
             "UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE",
             20,
             minimum=1,
+        ),
+        shutdown_soc_pct=_read_float_env("UPS_SHUTDOWN_SOC_PCT", 10.0),
+        shutdown_voltage_v=_read_float_env("UPS_SHUTDOWN_VOLTAGE_V", 3.45),
+        shutdown_consecutive_samples=_read_int_env("UPS_SHUTDOWN_CONSECUTIVE_SAMPLES", 3, minimum=1),
+        shutdown_command_timeout_seconds=max(
+            1.0,
+            _read_float_env("UPS_SHUTDOWN_COMMAND_TIMEOUT_SECONDS", 10.0),
         ),
         upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 50, minimum=1),
         upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
@@ -724,6 +742,78 @@ class RuntimeStats:
     uploader_failure_streak: int = 0
     last_upload_ok_at: str | None = None
     last_upload_attempt_at: str | None = None
+    shutdown_requested: bool = False
+
+
+def _evaluate_shutdown_breach(payload: dict[str, Any], config: Config) -> dict[str, Any] | None:
+    status = str(payload.get("read_status", payload.get("status", "unknown")))
+    if status != "ok":
+        return None
+
+    soc = float(payload.get("state_of_charge_pct_estimate", 0.0))
+    voltage = float(payload.get("bus_voltage_v", 0.0))
+    power_state = str(payload.get("power_state", "unknown"))
+    current_ma = float(payload.get("current_ma", 0.0))
+
+    soc_breach = soc <= config.shutdown_soc_pct
+    voltage_breach = voltage <= config.shutdown_voltage_v
+    discharging_direction = power_state in {"discharging", "brownout_risk", "battery_only"} or current_ma < -20.0
+    charging_direction = power_state == "charging" or current_ma > 20.0
+
+    if (soc_breach or voltage_breach) and discharging_direction and not charging_direction:
+        reasons: list[str] = []
+        if soc_breach:
+            reasons.append("soc_below_threshold")
+        if voltage_breach:
+            reasons.append("voltage_below_threshold")
+        return {
+            "reasons": reasons,
+            "soc_pct": soc,
+            "voltage_v": voltage,
+            "power_state": power_state,
+            "current_ma": current_ma,
+            "soc_threshold_pct": config.shutdown_soc_pct,
+            "voltage_threshold_v": config.shutdown_voltage_v,
+            "discharging_direction": discharging_direction,
+        }
+    return None
+
+
+async def _request_host_poweroff(
+    *,
+    timeout_seconds: float,
+    command: tuple[str, ...] = ("systemctl", "poweroff"),
+) -> tuple[bool, str]:
+    command_str = " ".join(shlex.quote(part) for part in command)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return False, f"poweroff_command_not_found:{command_str}"
+    except Exception as exc:
+        return False, f"poweroff_spawn_failed:{type(exc).__name__}:{exc}"
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return False, f"poweroff_timeout:{timeout_seconds}s command={command_str}"
+    except Exception as exc:
+        process.kill()
+        await process.wait()
+        return False, f"poweroff_exec_failed:{type(exc).__name__}:{exc}"
+
+    stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+    stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+    output = " | ".join(part for part in (stdout_text, stderr_text) if part)
+
+    if process.returncode == 0:
+        return True, output or "poweroff_command_submitted"
+    return False, f"poweroff_exit_{process.returncode}:{output or 'no_output'}"
 
 
 def _derive_power_flags(payload: dict[str, Any]) -> dict[str, bool]:
@@ -848,6 +938,7 @@ async def state_engine_loop(
 ) -> None:
     previous_state: str | None = None
     previous_flags: dict[str, bool] | None = None
+    shutdown_breach_samples = 0
     while True:
         event = await in_queue.get()
         occurred_at = str(event["occurred_at"])
@@ -914,6 +1005,57 @@ async def state_engine_loop(
                 health_payload,
                 config.queue_max_events,
             )
+
+        shutdown_breach = _evaluate_shutdown_breach(payload, config)
+        if shutdown_breach is None:
+            shutdown_breach_samples = 0
+        else:
+            shutdown_breach_samples += 1
+            if (
+                shutdown_breach_samples >= config.shutdown_consecutive_samples
+                and not stats.shutdown_requested
+            ):
+                stats.shutdown_requested = True
+                shutdown_event_payload = {
+                    "event": "shutdown_requested",
+                    "reason": shutdown_breach["reasons"],
+                    "trigger_sample_count": shutdown_breach_samples,
+                    "required_consecutive_samples": config.shutdown_consecutive_samples,
+                    "thresholds": {
+                        "soc_pct": config.shutdown_soc_pct,
+                        "bus_voltage_v": config.shutdown_voltage_v,
+                    },
+                    "measurement": {
+                        "soc_pct": shutdown_breach["soc_pct"],
+                        "bus_voltage_v": shutdown_breach["voltage_v"],
+                        "current_ma": shutdown_breach["current_ma"],
+                        "power_state": shutdown_breach["power_state"],
+                    },
+                    "debounce_started_at": occurred_at,
+                    "requested_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await enqueue_event(
+                    conn,
+                    config.vehicle_id,
+                    "power_event",
+                    occurred_at,
+                    shutdown_event_payload,
+                    config.queue_max_events,
+                )
+                print(
+                    "Power shutdown policy triggered: "
+                    f"reasons={shutdown_breach['reasons']} "
+                    f"samples={shutdown_breach_samples}/{config.shutdown_consecutive_samples} "
+                    f"soc={shutdown_breach['soc_pct']} "
+                    f"voltage={shutdown_breach['voltage_v']}"
+                )
+                shutdown_ok, shutdown_detail = await _request_host_poweroff(
+                    timeout_seconds=config.shutdown_command_timeout_seconds
+                )
+                if shutdown_ok:
+                    print(f"Host poweroff request accepted: {shutdown_detail}")
+                else:
+                    print(f"Host poweroff request failed: {shutdown_detail}")
 
         previous_flags = current_flags
         previous_state = current_state
