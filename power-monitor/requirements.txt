@@ -1,5 +1,5 @@
 aiohttp==3.9.3
 aiosqlite==0.20.0
-pi-ina219
+gpiozero==2.0.1
 smbus2==0.4.3
 uvloop==0.19.0
