@@ -29,6 +29,8 @@ from shared.hardware_probe import (
 logger = logging.getLogger(__name__)
 
 UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health", "power_diagnostic")
+SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
 
 
 def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
@@ -449,10 +451,13 @@ class UpsMonitor:
 
 async def configure_sqlite(conn: aiosqlite.Connection) -> None:
     """Apply low-overhead SQLite settings for SD-card backed storage."""
-    await conn.execute("PRAGMA busy_timeout=20000;")
-    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+    journal_mode_cursor = await conn.execute("PRAGMA journal_mode=WAL;")
+    journal_mode_row = await journal_mode_cursor.fetchone()
     await conn.execute("PRAGMA synchronous=NORMAL;")
     await conn.execute("PRAGMA temp_store=MEMORY;")
+    if journal_mode_row and str(journal_mode_row[0]).lower() != "wal":
+        logger.warning("SQLite journal mode is %s (expected WAL)", journal_mode_row[0])
 
 async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.execute(
@@ -988,7 +993,7 @@ async def run() -> None:
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
-    async with aiosqlite.connect(config.db_path, timeout=20.0) as conn:
+    async with aiosqlite.connect(config.db_path, timeout=SQLITE_CONNECT_TIMEOUT_SECONDS) as conn:
         await configure_sqlite(conn)
         await init_db(conn)
         timeout = aiohttp.ClientTimeout(total=10)
