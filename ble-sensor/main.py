@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
+import uvloop
 from bleak import BleakScanner
 
 
@@ -630,4 +631,5 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    uvloop.install()
     asyncio.run(run())
