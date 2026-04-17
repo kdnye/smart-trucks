@@ -237,8 +237,10 @@ class Config:
     ina219_scl_gpio_pin: int
     battery_capacity_mah: int
     min_discharge_current_ma_for_runtime: int
-    shutdown_soc_pct: float
-    shutdown_voltage_v: float
+    shutdown_soc_trip_pct: float
+    shutdown_soc_recover_pct: float
+    shutdown_voltage_trip_v: float
+    shutdown_voltage_recover_v: float
     shutdown_consecutive_samples: int
     shutdown_command_timeout_seconds: float
     upload_batch_size: int
@@ -297,6 +299,12 @@ def _read_float_env(name: str, default: float) -> float:
     except ValueError:
         print(f"Warning: invalid {name}={raw_value!r}; using default {default}.")
         return default
+
+
+def _read_float_env_alias(name: str, legacy_name: str, default: float) -> float:
+    if _sanitize_env_value(os.getenv(name)) is not None:
+        return _read_float_env(name, default)
+    return _read_float_env(legacy_name, default)
 
 
 def _read_ina219_gain_strategy_env(default: str = "auto") -> str:
@@ -365,6 +373,27 @@ def load_config() -> Config:
     ina219_addresses = _dedupe_preserve_order([primary_address, *configured_candidates, *fallback_candidates])
     i2c_bus = _read_int_env("I2C_BUS", 1, minimum=0)
 
+    shutdown_soc_trip_pct = _read_float_env_alias("UPS_SHUTDOWN_SOC_TRIP_PCT", "UPS_SHUTDOWN_SOC_PCT", 10.0)
+    shutdown_soc_recover_pct = _read_float_env("UPS_SHUTDOWN_SOC_RECOVER_PCT", max(shutdown_soc_trip_pct + 5.0, 15.0))
+    shutdown_voltage_trip_v = _read_float_env_alias("UPS_SHUTDOWN_VOLTAGE_TRIP_V", "UPS_SHUTDOWN_VOLTAGE_V", 3.50)
+    shutdown_voltage_recover_v = _read_float_env(
+        "UPS_SHUTDOWN_VOLTAGE_RECOVER_V",
+        max(shutdown_voltage_trip_v + 0.10, 3.60),
+    )
+
+    if shutdown_soc_recover_pct < shutdown_soc_trip_pct:
+        print(
+            "Warning: UPS_SHUTDOWN_SOC_RECOVER_PCT is below trip threshold; "
+            "clamping to trip threshold."
+        )
+        shutdown_soc_recover_pct = shutdown_soc_trip_pct
+    if shutdown_voltage_recover_v < shutdown_voltage_trip_v:
+        print(
+            "Warning: UPS_SHUTDOWN_VOLTAGE_RECOVER_V is below trip threshold; "
+            "clamping to trip threshold."
+        )
+        shutdown_voltage_recover_v = shutdown_voltage_trip_v
+
     return Config(
         vehicle_id=_sanitize_env_value(os.getenv("VEHICLE_ID")) or "UNKNOWN_TRUCK",
         db_path=_sanitize_env_value(os.getenv("TELEMATICS_DB_PATH")) or "/data/telematics.db",
@@ -387,8 +416,10 @@ def load_config() -> Config:
             20,
             minimum=1,
         ),
-        shutdown_soc_pct=_read_float_env("UPS_SHUTDOWN_SOC_PCT", 10.0),
-        shutdown_voltage_v=_read_float_env("UPS_SHUTDOWN_VOLTAGE_V", 3.45),
+        shutdown_soc_trip_pct=shutdown_soc_trip_pct,
+        shutdown_soc_recover_pct=shutdown_soc_recover_pct,
+        shutdown_voltage_trip_v=shutdown_voltage_trip_v,
+        shutdown_voltage_recover_v=shutdown_voltage_recover_v,
         shutdown_consecutive_samples=_read_int_env("UPS_SHUTDOWN_CONSECUTIVE_SAMPLES", 3, minimum=1),
         shutdown_command_timeout_seconds=max(
             1.0,
@@ -745,7 +776,7 @@ class RuntimeStats:
     shutdown_requested: bool = False
 
 
-def _evaluate_shutdown_breach(payload: dict[str, Any], config: Config) -> dict[str, Any] | None:
+def _evaluate_shutdown_trip(payload: dict[str, Any], config: Config) -> dict[str, Any] | None:
     status = str(payload.get("read_status", payload.get("status", "unknown")))
     if status != "ok":
         return None
@@ -755,8 +786,8 @@ def _evaluate_shutdown_breach(payload: dict[str, Any], config: Config) -> dict[s
     power_state = str(payload.get("power_state", "unknown"))
     current_ma = float(payload.get("current_ma", 0.0))
 
-    soc_breach = soc <= config.shutdown_soc_pct
-    voltage_breach = voltage <= config.shutdown_voltage_v
+    soc_breach = soc <= config.shutdown_soc_trip_pct
+    voltage_breach = voltage <= config.shutdown_voltage_trip_v
     discharging_direction = power_state in {"discharging", "brownout_risk", "battery_only"} or current_ma < -20.0
     charging_direction = power_state == "charging" or current_ma > 20.0
 
@@ -772,11 +803,21 @@ def _evaluate_shutdown_breach(payload: dict[str, Any], config: Config) -> dict[s
             "voltage_v": voltage,
             "power_state": power_state,
             "current_ma": current_ma,
-            "soc_threshold_pct": config.shutdown_soc_pct,
-            "voltage_threshold_v": config.shutdown_voltage_v,
+            "soc_threshold_pct": config.shutdown_soc_trip_pct,
+            "voltage_threshold_v": config.shutdown_voltage_trip_v,
             "discharging_direction": discharging_direction,
         }
     return None
+
+
+def _evaluate_shutdown_recovery(payload: dict[str, Any], config: Config) -> bool:
+    status = str(payload.get("read_status", payload.get("status", "unknown")))
+    if status != "ok":
+        return False
+
+    soc = float(payload.get("state_of_charge_pct_estimate", 0.0))
+    voltage = float(payload.get("bus_voltage_v", 0.0))
+    return soc >= config.shutdown_soc_recover_pct and voltage >= config.shutdown_voltage_recover_v
 
 
 async def _request_host_poweroff(
@@ -938,7 +979,7 @@ async def state_engine_loop(
 ) -> None:
     previous_state: str | None = None
     previous_flags: dict[str, bool] | None = None
-    shutdown_breach_samples = 0
+    low_battery_counter = 0
     while True:
         event = await in_queue.get()
         occurred_at = str(event["occurred_at"])
@@ -1006,24 +1047,24 @@ async def state_engine_loop(
                 config.queue_max_events,
             )
 
-        shutdown_breach = _evaluate_shutdown_breach(payload, config)
-        if shutdown_breach is None:
-            shutdown_breach_samples = 0
-        else:
-            shutdown_breach_samples += 1
+        shutdown_breach = _evaluate_shutdown_trip(payload, config)
+        if shutdown_breach is not None:
+            low_battery_counter += 1
             if (
-                shutdown_breach_samples >= config.shutdown_consecutive_samples
+                low_battery_counter >= config.shutdown_consecutive_samples
                 and not stats.shutdown_requested
             ):
                 stats.shutdown_requested = True
                 shutdown_event_payload = {
                     "event": "shutdown_requested",
                     "reason": shutdown_breach["reasons"],
-                    "trigger_sample_count": shutdown_breach_samples,
+                    "trigger_sample_count": low_battery_counter,
                     "required_consecutive_samples": config.shutdown_consecutive_samples,
                     "thresholds": {
-                        "soc_pct": config.shutdown_soc_pct,
-                        "bus_voltage_v": config.shutdown_voltage_v,
+                        "soc_trip_pct": config.shutdown_soc_trip_pct,
+                        "soc_recover_pct": config.shutdown_soc_recover_pct,
+                        "bus_voltage_trip_v": config.shutdown_voltage_trip_v,
+                        "bus_voltage_recover_v": config.shutdown_voltage_recover_v,
                     },
                     "measurement": {
                         "soc_pct": shutdown_breach["soc_pct"],
@@ -1045,7 +1086,7 @@ async def state_engine_loop(
                 print(
                     "Power shutdown policy triggered: "
                     f"reasons={shutdown_breach['reasons']} "
-                    f"samples={shutdown_breach_samples}/{config.shutdown_consecutive_samples} "
+                    f"samples={low_battery_counter}/{config.shutdown_consecutive_samples} "
                     f"soc={shutdown_breach['soc_pct']} "
                     f"voltage={shutdown_breach['voltage_v']}"
                 )
@@ -1056,6 +1097,15 @@ async def state_engine_loop(
                     print(f"Host poweroff request accepted: {shutdown_detail}")
                 else:
                     print(f"Host poweroff request failed: {shutdown_detail}")
+        elif _evaluate_shutdown_recovery(payload, config):
+            if low_battery_counter > 0:
+                print(
+                    "Power shutdown debounce reset after recovery: "
+                    f"counter={low_battery_counter} "
+                    f"soc={payload.get('state_of_charge_pct_estimate')} "
+                    f"voltage={payload.get('bus_voltage_v')}"
+                )
+            low_battery_counter = 0
 
         previous_flags = current_flags
         previous_state = current_state
@@ -1177,6 +1227,15 @@ async def run() -> None:
             await asyncio.sleep(86400)
 
     config = load_config()
+    print(
+        "Shutdown policy settings: "
+        f"soc_trip_pct={config.shutdown_soc_trip_pct} "
+        f"soc_recover_pct={config.shutdown_soc_recover_pct} "
+        f"voltage_trip_v={config.shutdown_voltage_trip_v} "
+        f"voltage_recover_v={config.shutdown_voltage_recover_v} "
+        f"consecutive_samples={config.shutdown_consecutive_samples} "
+        f"command_timeout_s={config.shutdown_command_timeout_seconds}"
+    )
     inventory = build_hardware_inventory(
         gps_candidates=(),  # power-monitor does not own the GPS serial port
         gps_baud_rate=9600,
