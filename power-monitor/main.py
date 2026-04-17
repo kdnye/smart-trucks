@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 UPLOADABLE_EVENT_TYPES: tuple[str, ...] = ("power_snapshot", "power_state", "power_health", "power_diagnostic")
 SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
+DEFAULT_UPS_MAX_EXPECTED_AMPS = 4.0
 
 
 def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
@@ -273,7 +274,10 @@ def load_config() -> Config:
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
-        ina219_max_expected_amps=max(0.05, _read_float_env("UPS_MAX_EXPECTED_AMPS", 3.2)),
+        ina219_max_expected_amps=max(
+            0.05,
+            _read_float_env("UPS_MAX_EXPECTED_AMPS", DEFAULT_UPS_MAX_EXPECTED_AMPS),
+        ),
         ina219_gain_strategy=_read_ina219_gain_strategy_env("gain_8_320mv"),
         ina219_bus_voltage_range_v=_read_ina219_bus_voltage_range_env(16),
         battery_capacity_mah=_read_int_env("UPS_BATTERY_CAPACITY_MAH", 2200, minimum=1),
