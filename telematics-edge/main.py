@@ -329,6 +329,47 @@ def build_location_payload(gps: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_power_metrics_payload(
+    latest_power_snapshot: dict[str, Any] | None,
+    *,
+    max_snapshot_age_seconds: int,
+) -> tuple[dict[str, Any], bool]:
+    """Build canonical + compatibility power metrics fields for downstream consumers."""
+    power_payload = latest_power_snapshot.get("payload", {}) if latest_power_snapshot else {}
+    snapshot_timestamp = latest_power_snapshot.get("occurred_at") if latest_power_snapshot else None
+    snapshot_age_sec = age_seconds(snapshot_timestamp)
+    snapshot_found = latest_power_snapshot is not None
+    snapshot_stale = (
+        snapshot_age_sec is None
+        or snapshot_age_sec > max_snapshot_age_seconds
+    )
+
+    # Canonical contract uses `voltage_v`; power-monitor currently persists `bus_voltage_v`.
+    # Keep both fields so existing dashboards continue to work during migration.
+    voltage_v = power_payload.get("voltage_v")
+    if voltage_v is None:
+        voltage_v = power_payload.get("bus_voltage_v")
+
+    power_metrics = {
+        **power_payload,
+        "voltage_v": voltage_v,
+        "source": "power_snapshot_db",
+        "snapshot_found": snapshot_found,
+        "snapshot_stale": snapshot_stale,
+        "snapshot_age_sec": snapshot_age_sec,
+        "snapshot_captured_at_utc": snapshot_timestamp,
+    }
+    if not snapshot_found:
+        power_metrics["status"] = "absent"
+
+    power_monitor_ok = (
+        snapshot_found
+        and not snapshot_stale
+        and power_payload.get("status") == "ok"
+    )
+    return power_metrics, power_monitor_ok
+
+
 def _is_valid_fix(reading: GpsReading) -> bool:
     if reading.latitude is None or reading.longitude is None:
         return False
@@ -569,29 +610,9 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
         state.wifi_connected = is_network_connected()
         db_stats = await get_db_stats()
         latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
-        power_payload = latest_power_snapshot.get("payload", {}) if latest_power_snapshot else {}
-        snapshot_timestamp = latest_power_snapshot.get("occurred_at") if latest_power_snapshot else None
-        snapshot_age_sec = age_seconds(snapshot_timestamp)
-        snapshot_found = latest_power_snapshot is not None
-        snapshot_stale = (
-            snapshot_age_sec is None
-            or snapshot_age_sec > config.power_snapshot_max_age_seconds
-        )
-        power_metrics = {
-            **power_payload,
-            "source": "power_snapshot_db",
-            "snapshot_found": snapshot_found,
-            "snapshot_stale": snapshot_stale,
-            "snapshot_age_sec": snapshot_age_sec,
-            "snapshot_captured_at_utc": snapshot_timestamp,
-        }
-        if not snapshot_found:
-            power_metrics["status"] = "absent"
-
-        state.power_monitor_ok = (
-            snapshot_found
-            and not snapshot_stale
-            and power_payload.get("status") == "ok"
+        power_metrics, state.power_monitor_ok = build_power_metrics_payload(
+            latest_power_snapshot,
+            max_snapshot_age_seconds=config.power_snapshot_max_age_seconds,
         )
 
         heartbeat_payload = {
