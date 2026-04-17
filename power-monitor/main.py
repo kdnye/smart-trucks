@@ -857,6 +857,28 @@ async def _request_host_poweroff(
     return False, f"poweroff_exit_{process.returncode}:{output or 'no_output'}"
 
 
+def _emit_shutdown_log(
+    event: str,
+    *,
+    sample_timestamp: str,
+    voltage_v: float,
+    soc_pct_estimate: float,
+    debounce_count: int,
+    command_result: dict[str, Any] | None = None,
+) -> None:
+    structured_log: dict[str, Any] = {
+        "event": event,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "sample_timestamp": sample_timestamp,
+        "voltage_v": round(float(voltage_v), 3),
+        "soc_pct_estimate": round(float(soc_pct_estimate), 2),
+        "debounce_count": int(debounce_count),
+    }
+    if command_result is not None:
+        structured_log["command_result"] = command_result
+    print(json.dumps(structured_log, separators=(",", ":"), sort_keys=True))
+
+
 def _derive_power_flags(payload: dict[str, Any]) -> dict[str, bool]:
     status = payload.get("read_status", payload.get("status"))
     sensor_fault = status != "ok"
@@ -1090,8 +1112,30 @@ async def state_engine_loop(
                     f"soc={shutdown_breach['soc_pct']} "
                     f"voltage={shutdown_breach['voltage_v']}"
                 )
+                _emit_shutdown_log(
+                    "low_battery_detected",
+                    sample_timestamp=occurred_at,
+                    voltage_v=float(shutdown_breach["voltage_v"]),
+                    soc_pct_estimate=float(shutdown_breach["soc_pct"]),
+                    debounce_count=low_battery_counter,
+                )
+                _emit_shutdown_log(
+                    "shutdown_requested",
+                    sample_timestamp=occurred_at,
+                    voltage_v=float(shutdown_breach["voltage_v"]),
+                    soc_pct_estimate=float(shutdown_breach["soc_pct"]),
+                    debounce_count=low_battery_counter,
+                )
                 shutdown_ok, shutdown_detail = await _request_host_poweroff(
                     timeout_seconds=config.shutdown_command_timeout_seconds
+                )
+                _emit_shutdown_log(
+                    "shutdown_command_result",
+                    sample_timestamp=occurred_at,
+                    voltage_v=float(shutdown_breach["voltage_v"]),
+                    soc_pct_estimate=float(shutdown_breach["soc_pct"]),
+                    debounce_count=low_battery_counter,
+                    command_result={"ok": shutdown_ok, "detail": shutdown_detail},
                 )
                 if shutdown_ok:
                     print(f"Host poweroff request accepted: {shutdown_detail}")

@@ -77,3 +77,21 @@ Once the device has its `VEHICLE_ID` and an active internet connection, it will 
 1. Open your Streamlit Dashboard.
 2. The new `VEHICLE_ID` will automatically appear in the **Select Raspberry Pi** dropdown menu dynamically based on incoming heartbeats.
 3. Select the truck to view its Live Location, BLE asset inventory, and Power State.
+
+## Phase 5: UPS Shutdown Validation Runbook
+Use this runbook to validate low-battery debounce behavior and confirm shutdown event order from logs.
+
+1. During a controlled battery drain test, tail live service logs:
+   * `journalctl -fu <service>`
+   * Confirm you see structured events in this order immediately before shutdown command execution:
+     * `low_battery_detected`
+     * `shutdown_requested`
+     * `shutdown_command_result`
+2. After the device reboots, inspect the previous boot logs to verify event ordering:
+   * `journalctl -u <service> -b -1`
+   * Validate that the same three events appear in-order and that timestamp/voltage/SOC/debounce fields are populated.
+3. Capture power throttling state before and after the test:
+   * `vcgencmd get_throttled`
+   * Interpretation guidance:
+     * `throttled=0x0`: no undervoltage or throttling flags were observed.
+     * Non-zero bitmasks indicate power quality issues (for example, undervoltage now or historically). Investigate battery, wiring, and regulator margins if these bits are set after the test.
