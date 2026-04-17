@@ -39,6 +39,8 @@ UPLOADABLE_EVENT_TYPES: tuple[str, ...] = (
 SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
 DEFAULT_UPS_MAX_EXPECTED_AMPS = 4.0
+CURRENT_FLOW_DEADBAND_MA = 20.0
+EXTERNAL_INPUT_PRESENT_MIN_BUS_V = 4.5
 
 class AsyncINA219:
     _CONFIG_REGISTER = 0x00
@@ -554,6 +556,8 @@ class UpsMonitor:
             if current_ma < -self._min_discharge_current_ma_for_runtime:
                 remaining_capacity_mah = (state_of_charge_pct_estimate / 100.0) * float(self._battery_capacity_mah)
                 estimated_runtime_hours = round(remaining_capacity_mah / discharge_current_ma, 2)
+            external_input_present = float(metrics["bus_voltage_v"]) >= EXTERNAL_INPUT_PRESENT_MIN_BUS_V
+            charging = external_input_present and current_ma > CURRENT_FLOW_DEADBAND_MA
             return _finalize({
                 "status": "ok",
                 **metrics,
@@ -561,7 +565,10 @@ class UpsMonitor:
                 "battery_capacity_mah": self._battery_capacity_mah,
                 "estimated_runtime_hours": estimated_runtime_hours,
                 "estimate_method": self.SOC_ESTIMATE_METHOD,
-                "is_charging": current_ma > 0,
+                # Compatibility field for legacy consumers.
+                # Gate on external input + current deadband to avoid false positives
+                # when the Pi is unplugged but sensor noise is slightly positive.
+                "is_charging": charging,
             })
         except Exception as exc:
             return _finalize({"status": "read_error", "message": str(exc)})
@@ -885,9 +892,9 @@ def _derive_power_flags(payload: dict[str, Any]) -> dict[str, bool]:
     overflow_fault = bool(payload.get("ovf"))
     current_ma = float(payload.get("current_ma", 0.0))
     bus_voltage_v = float(payload.get("bus_voltage_v", 0.0))
-    external_input_present = (not sensor_fault) and bus_voltage_v >= 4.5
-    charging = (not sensor_fault) and current_ma > 20
-    discharging = (not sensor_fault) and current_ma < -20
+    external_input_present = (not sensor_fault) and bus_voltage_v >= EXTERNAL_INPUT_PRESENT_MIN_BUS_V
+    charging = (not sensor_fault) and external_input_present and current_ma > CURRENT_FLOW_DEADBAND_MA
+    discharging = (not sensor_fault) and current_ma < -CURRENT_FLOW_DEADBAND_MA
     battery_only = (not sensor_fault) and (not external_input_present)
     brownout_risk = (not sensor_fault) and bus_voltage_v <= 3.45
 

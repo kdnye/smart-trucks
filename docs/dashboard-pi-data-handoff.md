@@ -44,7 +44,7 @@ Event shape:
 - `power_mw`: power in milliwatts (when available)
 - `state_of_charge_pct_estimate`: coarse battery SOC estimate derived from loaded voltage curve
 - `estimate_method`: estimation strategy identifier (`voltage_curve_loaded`)
-- `is_charging`: boolean (`current_ma > 0`)
+- `is_charging`: boolean (`bus_voltage_v >= 4.5` and `current_ma > 20`)
 - `message`: only present on read errors
 - `source`: always `power_snapshot_db`
 - `snapshot_found`: `true` when a row exists in `power_readings`
