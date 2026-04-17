@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -62,6 +63,11 @@ class Config:
     imu_i2c_bus: int
     imu_expected_addresses: tuple[int, ...]
     imu_required: bool
+    network_watchdog_enabled: bool = True
+    network_watchdog_check_interval_seconds: int = 60
+    network_watchdog_max_failures: int = 3
+    network_watchdog_recovery_pause_seconds: int = 30
+    network_watchdog_connection_name: str | None = None
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -122,6 +128,15 @@ def load_config() -> Config:
         sync_backoff_max_seconds=max(30, int(_read_str_env("SYNC_BACKOFF_MAX_SECONDS", "300") or "300")),
         queue_alert_depth=max(100, int(_read_str_env("QUEUE_ALERT_DEPTH", "1000") or "1000")),
         power_snapshot_max_age_seconds=max(5, int(_read_str_env("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30") or "30")),
+        network_watchdog_enabled=(_read_str_env("NETWORK_WATCHDOG_ENABLED", "true") or "true").lower() in {"1", "true", "yes"},
+        network_watchdog_check_interval_seconds=max(
+            15, int(_read_str_env("NETWORK_WATCHDOG_CHECK_INTERVAL_SECONDS", "60") or "60")
+        ),
+        network_watchdog_max_failures=max(1, int(_read_str_env("NETWORK_WATCHDOG_MAX_FAILURES", "3") or "3")),
+        network_watchdog_recovery_pause_seconds=max(
+            5, int(_read_str_env("NETWORK_WATCHDOG_RECOVERY_PAUSE_SECONDS", "30") or "30")
+        ),
+        network_watchdog_connection_name=_read_str_env("NETWORK_WATCHDOG_CONNECTION_NAME"),
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", 1, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=parse_bool_env("IMU_REQUIRED", True),
@@ -190,6 +205,70 @@ def is_network_connected() -> bool:
             return True
     except OSError:
         return False
+
+
+def _run_network_recovery_command(command: list[str]) -> bool:
+    try:
+        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0:
+            return True
+        logger.warning(
+            "Network watchdog command failed: cmd=%s returncode=%s stderr=%s",
+            command,
+            result.returncode,
+            (result.stderr or "").strip(),
+        )
+        return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Network watchdog command error: cmd=%s error=%s", command, exc)
+        return False
+
+
+async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
+    if not config.network_watchdog_enabled:
+        logger.info("Network watchdog disabled by configuration.")
+        return
+    if not shutil.which("nmcli"):
+        logger.warning("Network watchdog enabled but nmcli is unavailable in container; skipping recovery actions.")
+        return
+
+    consecutive_failures = 0
+    logger.info(
+        "Network watchdog enabled: check_interval=%ss max_failures=%s",
+        config.network_watchdog_check_interval_seconds,
+        config.network_watchdog_max_failures,
+    )
+    while True:
+        if is_network_connected():
+            if consecutive_failures > 0:
+                logger.info("Network watchdog: connectivity restored after %s failed checks.", consecutive_failures)
+            consecutive_failures = 0
+            state.wifi_connected = True
+            await asyncio.sleep(config.network_watchdog_check_interval_seconds)
+            continue
+
+        consecutive_failures += 1
+        state.wifi_connected = False
+        logger.warning(
+            "Network watchdog check failed (%s/%s).",
+            consecutive_failures,
+            config.network_watchdog_max_failures,
+        )
+        if consecutive_failures < config.network_watchdog_max_failures:
+            await asyncio.sleep(config.network_watchdog_check_interval_seconds)
+            continue
+
+        logger.error("Network watchdog triggering Wi-Fi recovery sequence via NetworkManager.")
+        _run_network_recovery_command(["nmcli", "device", "wifi", "rescan"])
+        await asyncio.sleep(5)
+        _run_network_recovery_command(["nmcli", "radio", "wifi", "off"])
+        await asyncio.sleep(2)
+        _run_network_recovery_command(["nmcli", "radio", "wifi", "on"])
+        if config.network_watchdog_connection_name:
+            _run_network_recovery_command(["nmcli", "connection", "up", config.network_watchdog_connection_name])
+
+        consecutive_failures = 0
+        await asyncio.sleep(config.network_watchdog_recovery_pause_seconds)
 
 
 def get_latest_gps(state: RuntimeState) -> dict[str, Any]:
@@ -590,6 +669,7 @@ async def run() -> None:
             asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
             asyncio.create_task(sync_worker(config, state, session)),
             asyncio.create_task(maintenance_worker(config, state)),
+            asyncio.create_task(network_watchdog_worker(config, state)),
         ]
         await asyncio.gather(*tasks)
 
