@@ -14,8 +14,7 @@ from typing import Any
 import aiohttp
 import aiosqlite
 import uvloop
-from gpiozero import DigitalOutputDevice
-from smbus2 import SMBus, i2c_msg
+from ina219 import INA219, DeviceRangeError
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -43,59 +42,16 @@ CURRENT_FLOW_DEADBAND_MA = 20.0
 EXTERNAL_INPUT_PRESENT_MIN_BUS_V = 4.5
 
 
-class INA219SensorTimeoutError(TimeoutError):
-    def __init__(
-        self,
-        *,
-        address: int,
-        retries: int,
-        conversion_delay_s: float,
-        retry_sleep_s: float,
-        last_bus_register: int,
-    ) -> None:
-        self.details = {
-            "error": "ina219_conversion_timeout",
-            "ina219_address": f"0x{address:02X}",
-            "retries": retries,
-            "conversion_delay_ms": round(conversion_delay_s * 1000.0, 2),
-            "retry_sleep_ms": round(retry_sleep_s * 1000.0, 2),
-            "last_bus_register": f"0x{last_bus_register:04X}",
-        }
-        super().__init__(json.dumps(self.details, sort_keys=True))
-
-
-class AsyncINA219:
-    _CONFIG_REGISTER = 0x00
-    _SHUNT_VOLTAGE_REGISTER = 0x01
-    _BUS_VOLTAGE_REGISTER = 0x02
-    _CNVR_MASK = 0x0004
-    _OVF_MASK = 0x0002
-    _BADC_128_SAMPLES = 0b1111
-    _SADC_128_SAMPLES = 0b1111
-    _MODE_TRIGGERED_SHUNT_BUS = 0b011
+class INA219Driver:
     _VOLTAGE_SOC_MAX_V = 4.20
     _VOLTAGE_SOC_MIN_V = 3.20
-    _ADC_CONVERSION_SECONDS = {
-        0b0000: 84e-6,    # 9-bit
-        0b0001: 148e-6,   # 10-bit
-        0b0010: 276e-6,   # 11-bit
-        0b0011: 532e-6,   # 12-bit
-        0b0100: 532e-6,   # 12-bit (reserved encoding in some docs)
-        0b0101: 532e-6,   # 12-bit (reserved encoding in some docs)
-        0b0110: 532e-6,   # 12-bit (reserved encoding in some docs)
-        0b0111: 532e-6,   # 12-bit (reserved encoding in some docs)
-        0b1000: 532e-6,   # 12-bit (reserved encoding in some docs)
-        0b1001: 1.06e-3,  # 2 samples
-        0b1010: 2.13e-3,  # 4 samples
-        0b1011: 4.26e-3,  # 8 samples
-        0b1100: 8.51e-3,  # 16 samples
-        0b1101: 17.02e-3, # 32 samples
-        0b1110: 34.05e-3, # 64 samples
-        0b1111: 68.10e-3, # 128 samples
+    _GAIN_MAP = {
+        "gain_1_40mv": INA219.GAIN_1_40MV,
+        "gain_2_80mv": INA219.GAIN_2_80MV,
+        "gain_4_160mv": INA219.GAIN_4_160MV,
+        "gain_8_320mv": INA219.GAIN_8_320MV,
+        "auto":         INA219.GAIN_AUTO,
     }
-    _CONVERSION_MARGIN_SECONDS = 5e-3
-    _CNVR_RETRY_SLEEP_SECONDS = 3e-3
-    _MAX_CNVR_RETRIES = 2
 
     def __init__(
         self,
@@ -103,6 +59,7 @@ class AsyncINA219:
         bus_num: int,
         *,
         shunt_ohms: float,
+        max_expected_amps: float,
         bus_voltage_range_v: int,
         gain_strategy: str,
         scl_gpio_pin: int = 3,
@@ -113,11 +70,9 @@ class AsyncINA219:
     ) -> None:
         self.address = address
         self._bus_num = bus_num
-        self._scl_gpio_pin = scl_gpio_pin
+        self._shunt_ohms = shunt_ohms
         self._bus_voltage_range_v = bus_voltage_range_v
         self._gain_strategy = gain_strategy
-        self._bus: SMBus | None = None
-        self._io_lock = asyncio.Lock()
         self._m = 1.0 / max(1e-6, shunt_ohms)
         self._c = 0.0
         self.Q = q
@@ -127,7 +82,20 @@ class AsyncINA219:
         self.X = x
         self.total_mAh = 0.0
         self._last_perf_counter = time.perf_counter()
-        self._open_bus()
+        voltage_range = INA219.RANGE_16V if bus_voltage_range_v == 16 else INA219.RANGE_32V
+        gain = self._GAIN_MAP.get(gain_strategy, INA219.GAIN_AUTO)
+        self._sensor = INA219(
+            shunt_ohms=shunt_ohms,
+            max_expected_amps=max_expected_amps,
+            address=address,
+            busnum=bus_num,
+        )
+        self._sensor.configure(
+            voltage_range=voltage_range,
+            gain=gain,
+            bus_adc=INA219.ADC_128SAMP,
+            shunt_adc=INA219.ADC_128SAMP,
+        )
 
     def set_calibration_profile(self, m: float, c: float) -> None:
         self._m = float(m)
@@ -147,117 +115,15 @@ class AsyncINA219:
             "total_mAh": self.total_mAh,
         }
 
-    def _open_bus(self) -> None:
-        if self._bus is None:
-            self._bus = SMBus(self._bus_num)
-
-    def _close_bus(self) -> None:
-        if self._bus is not None:
-            self._bus.close()
-            self._bus = None
-
-    async def _recover_i2c_bus(self) -> None:
-        logger.warning("I2C bus fault detected, running 9-pulse bus clear on GPIO%d", self._scl_gpio_pin)
-        self._close_bus()
-        scl = DigitalOutputDevice(self._scl_gpio_pin, active_high=True, initial_value=True)
-        try:
-            for _ in range(9):
-                scl.on()
-                await asyncio.sleep(0.01)
-                scl.off()
-                await asyncio.sleep(0.01)
-            scl.on()
-            await asyncio.sleep(0.01)
-        finally:
-            scl.close()
-        self._open_bus()
-
-    async def _i2c_rdwr(self, write_bytes: list[int], read_len: int = 0) -> list[int]:
-        async with self._io_lock:
-            for attempt in range(2):
-                try:
-                    self._open_bus()
-                    assert self._bus is not None
-                    write_msg = i2c_msg.write(self.address, write_bytes)
-                    if read_len <= 0:
-                        await asyncio.to_thread(self._bus.i2c_rdwr, write_msg)
-                        return []
-                    read_msg = i2c_msg.read(self.address, read_len)
-                    await asyncio.to_thread(self._bus.i2c_rdwr, write_msg, read_msg)
-                    return list(read_msg)
-                except OSError:
-                    if attempt == 0:
-                        await self._recover_i2c_bus()
-                        continue
-                    raise
-        raise RuntimeError("I2C transaction failed")
-
-    async def _write_register(self, register: int, value: int) -> None:
-        await self._i2c_rdwr([register, (value >> 8) & 0xFF, value & 0xFF], read_len=0)
-
-    async def _read_register(self, register: int, *, signed: bool = False) -> int:
-        raw_bytes = await self._i2c_rdwr([register], read_len=2)
-        raw_value = (raw_bytes[0] << 8) | raw_bytes[1]
-        if signed and raw_value >= 0x8000:
-            return raw_value - 0x10000
-        return raw_value
-
-    def _build_trigger_config(self) -> int:
-        brng = 0 if self._bus_voltage_range_v == 16 else 1
-        pga_map = {
-            "gain_1_40mv": 0b00,
-            "gain_2_80mv": 0b01,
-            "gain_4_160mv": 0b10,
-            "gain_8_320mv": 0b11,
-            "auto": 0b11,
-        }
-        pga = pga_map.get(self._gain_strategy, 0b11)
-        return (
-            (brng << 13)
-            | (pga << 11)
-            | (self._BADC_128_SAMPLES << 7)
-            | (self._SADC_128_SAMPLES << 3)
-            | self._MODE_TRIGGERED_SHUNT_BUS
+    def estimate_starting_mah(self, current_voltage_v: float, max_capacity_mah: float = 1500.0) -> float:
+        if current_voltage_v >= self._VOLTAGE_SOC_MAX_V:
+            return max_capacity_mah
+        if current_voltage_v <= self._VOLTAGE_SOC_MIN_V:
+            return 0.0
+        soc_pct = (current_voltage_v - self._VOLTAGE_SOC_MIN_V) / (
+            self._VOLTAGE_SOC_MAX_V - self._VOLTAGE_SOC_MIN_V
         )
-
-    @classmethod
-    def _adc_conversion_seconds(cls, adc_setting: int) -> float:
-        return cls._ADC_CONVERSION_SECONDS.get(adc_setting & 0x0F, 532e-6)
-
-    @classmethod
-    def _trigger_conversion_delay_seconds(cls, config_register: int) -> float:
-        bus_adc_setting = (config_register >> 7) & 0x0F
-        shunt_adc_setting = (config_register >> 3) & 0x0F
-        return (
-            cls._adc_conversion_seconds(bus_adc_setting)
-            + cls._adc_conversion_seconds(shunt_adc_setting)
-            + cls._CONVERSION_MARGIN_SECONDS
-        )
-
-    async def trigger_and_fetch(self) -> tuple[int, int, int]:
-        config_register = self._build_trigger_config()
-        await self._write_register(self._CONFIG_REGISTER, config_register)
-        conversion_delay_s = self._trigger_conversion_delay_seconds(config_register)
-        await asyncio.sleep(conversion_delay_s)
-
-        bus_voltage_register = await self._read_register(self._BUS_VOLTAGE_REGISTER)
-        if not (bus_voltage_register & self._CNVR_MASK):
-            for _ in range(self._MAX_CNVR_RETRIES):
-                await asyncio.sleep(self._CNVR_RETRY_SLEEP_SECONDS)
-                bus_voltage_register = await self._read_register(self._BUS_VOLTAGE_REGISTER)
-                if bus_voltage_register & self._CNVR_MASK:
-                    break
-            else:
-                raise INA219SensorTimeoutError(
-                    address=self.address,
-                    retries=self._MAX_CNVR_RETRIES,
-                    conversion_delay_s=conversion_delay_s,
-                    retry_sleep_s=self._CNVR_RETRY_SLEEP_SECONDS,
-                    last_bus_register=bus_voltage_register,
-                )
-
-        shunt_voltage_register = await self._read_register(self._SHUNT_VOLTAGE_REGISTER, signed=True)
-        return shunt_voltage_register, bus_voltage_register, bus_voltage_register
+        return max_capacity_mah * soc_pct
 
     def _kalman_filter(self, measurement_a: float) -> float:
         self.P = self.P + self.Q
@@ -273,45 +139,35 @@ class AsyncINA219:
         self.total_mAh += filtered_current_a * 1000.0 * (float(delta_us) / 3_600_000_000.0)
         return delta_us
 
-    @staticmethod
-    def _raw_bus_to_voltage(bus_raw: int) -> float:
-        return float((bus_raw >> 3) * 4) / 1000.0
-
-    def estimate_starting_mah(self, current_voltage_v: float, max_capacity_mah: float = 1500.0) -> float:
-        """
-        Estimate initial battery mAh from cell voltage for one-time startup initialization.
-        """
-        if current_voltage_v >= self._VOLTAGE_SOC_MAX_V:
-            return max_capacity_mah
-        if current_voltage_v <= self._VOLTAGE_SOC_MIN_V:
-            return 0.0
-        soc_percentage = (current_voltage_v - self._VOLTAGE_SOC_MIN_V) / (
-            self._VOLTAGE_SOC_MAX_V - self._VOLTAGE_SOC_MIN_V
-        )
-        return max_capacity_mah * soc_percentage
+    def _read_sync(self) -> dict[str, Any]:
+        return {
+            "bus_voltage_v":    self._sensor.voltage(),
+            "shunt_voltage_mv": self._sensor.shunt_voltage(),
+            "power_mw":         self._sensor.power(),
+        }
 
     async def read(self) -> dict[str, Any]:
-        shunt_raw, bus_raw, status_raw = await self.trigger_and_fetch()
-        shunt_voltage_v = float(shunt_raw) * 0.00001
-        shunt_voltage_mv = shunt_voltage_v * 1000.0
-        bus_voltage_v = self._raw_bus_to_voltage(bus_raw)
-        current_a = (shunt_voltage_v * self._m) + self._c
+        raw = await asyncio.to_thread(self._read_sync)
+        bus_voltage_v    = float(raw["bus_voltage_v"])
+        shunt_voltage_mv = float(raw["shunt_voltage_mv"])
+        power_mw         = float(raw["power_mw"])
+        shunt_voltage_v  = shunt_voltage_mv / 1000.0
+        current_a        = (shunt_voltage_v * self._m) + self._c
         filtered_current_a = self._kalman_filter(current_a)
         delta_us = self._update_coulomb_counter(filtered_current_a)
         current_ma = filtered_current_a * 1000.0
-        power_mw = bus_voltage_v * current_ma
         return {
-            "bus_voltage_v": round(bus_voltage_v, 3),
-            "current_ma": round(current_ma, 3),
-            "power_mw": round(power_mw, 3),
-            "shunt_voltage_mv": round(shunt_voltage_mv, 3),
-            "cnvr": bool(status_raw & self._CNVR_MASK),
-            "ovf": bool(status_raw & self._OVF_MASK),
-            "ina219_address": f"0x{self.address:02X}",
-            "total_mAh": round(self.total_mAh, 6),
+            "bus_voltage_v":        round(bus_voltage_v, 3),
+            "current_ma":           round(current_ma, 3),
+            "power_mw":             round(power_mw, 3),
+            "shunt_voltage_mv":     round(shunt_voltage_mv, 3),
+            "cnvr":                 True,
+            "ovf":                  False,
+            "ina219_address":       f"0x{self.address:02X}",
+            "total_mAh":            round(self.total_mAh, 6),
             "integration_delta_us": delta_us,
-            "raw_current_a": round(current_a, 6),
-            "kalman_current_a": round(filtered_current_a, 6),
+            "raw_current_a":        round(current_a, 6),
+            "kalman_current_a":     round(filtered_current_a, 6),
         }
 
 
@@ -554,7 +410,7 @@ class UpsMonitor:
         self._i2c_scl_gpio_pin = i2c_scl_gpio_pin
         self._battery_capacity_mah = battery_capacity_mah
         self._min_discharge_current_ma_for_runtime = min_discharge_current_ma_for_runtime
-        self._ina: AsyncINA219 | None = None
+        self._ina: INA219Driver | None = None
 
     def build_overflow_diagnostic(self) -> dict[str, Any]:
         calibration = self._ina.calibration_snapshot() if self._ina else {}
@@ -582,21 +438,21 @@ class UpsMonitor:
             f"shunt_ohms={self._shunt_ohms} "
             f"gain_strategy={self._gain_strategy} "
             f"bus_voltage_range={self._bus_voltage_range_v}V "
-            "bus_adc=128sample shunt_adc=128sample mode=triggered"
+            "bus_adc=128sample shunt_adc=128sample mode=continuous"
         )
         for address in self._i2c_addresses:
             try:
-                self._ina = AsyncINA219(
+                self._ina = INA219Driver(
                     address,
                     self._i2c_bus,
                     shunt_ohms=self._shunt_ohms,
+                    max_expected_amps=self._max_expected_amps,
                     bus_voltage_range_v=self._bus_voltage_range_v,
                     gain_strategy=self._gain_strategy,
                     scl_gpio_pin=self._i2c_scl_gpio_pin,
                 )
                 self._ina.set_calibration_profile(1.0 / max(self._shunt_ohms, 1e-6), 0.0)
-                _, bus_raw, _ = await self._ina.trigger_and_fetch()
-                bus_voltage_v = self._ina._raw_bus_to_voltage(bus_raw)
+                bus_voltage_v = await asyncio.to_thread(self._ina._sensor.voltage)
                 self._ina.total_mAh = self._ina.estimate_starting_mah(
                     bus_voltage_v,
                     max_capacity_mah=float(self._battery_capacity_mah),
@@ -668,6 +524,8 @@ class UpsMonitor:
                 # when the Pi is unplugged but sensor noise is slightly positive.
                 "is_charging": charging,
             })
+        except DeviceRangeError:
+            return _finalize({"status": "range_error"})
         except Exception as exc:
             return _finalize({"status": "read_error", "message": str(exc)})
 
