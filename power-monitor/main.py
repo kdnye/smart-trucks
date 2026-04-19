@@ -62,7 +62,6 @@ class INA219Driver:
         max_expected_amps: float,
         bus_voltage_range_v: int,
         gain_strategy: str,
-        scl_gpio_pin: int = 3,
         q: float = 0.05,
         r: float = 100.0,
         p: float = 1.0,
@@ -143,19 +142,18 @@ class INA219Driver:
         return {
             "bus_voltage_v":    self._sensor.voltage(),
             "shunt_voltage_mv": self._sensor.shunt_voltage(),
-            "power_mw":         self._sensor.power(),
         }
 
     async def read(self) -> dict[str, Any]:
         raw = await asyncio.to_thread(self._read_sync)
         bus_voltage_v    = float(raw["bus_voltage_v"])
         shunt_voltage_mv = float(raw["shunt_voltage_mv"])
-        power_mw         = float(raw["power_mw"])
         shunt_voltage_v  = shunt_voltage_mv / 1000.0
         current_a        = (shunt_voltage_v * self._m) + self._c
         filtered_current_a = self._kalman_filter(current_a)
         delta_us = self._update_coulomb_counter(filtered_current_a)
         current_ma = filtered_current_a * 1000.0
+        power_mw = bus_voltage_v * current_ma
         return {
             "bus_voltage_v":        round(bus_voltage_v, 3),
             "current_ma":           round(current_ma, 3),
@@ -449,7 +447,6 @@ class UpsMonitor:
                     max_expected_amps=self._max_expected_amps,
                     bus_voltage_range_v=self._bus_voltage_range_v,
                     gain_strategy=self._gain_strategy,
-                    scl_gpio_pin=self._i2c_scl_gpio_pin,
                 )
                 self._ina.set_calibration_profile(1.0 / max(self._shunt_ohms, 1e-6), 0.0)
                 bus_voltage_v = await asyncio.to_thread(self._ina._sensor.voltage)
@@ -525,7 +522,11 @@ class UpsMonitor:
                 "is_charging": charging,
             })
         except DeviceRangeError:
-            return _finalize({"status": "range_error"})
+            return _finalize({
+                "status": "range_error",
+                "ovf": True,
+                "overflow_diagnostic": self.build_overflow_diagnostic(),
+            })
         except Exception as exc:
             return _finalize({"status": "read_error", "message": str(exc)})
 
