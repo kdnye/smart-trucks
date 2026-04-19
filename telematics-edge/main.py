@@ -473,6 +473,18 @@ ACTIVE_AFTER_MOTION_SECONDS = 300.0
 _MOVING_SPEED_KMH = 5.0
 
 
+def _adaptive_parked_sleep_seconds(power: dict[str, Any] | None) -> float:
+    """Return parked sleep duration scaled by battery SOC to preserve charge."""
+    if not power or bool(power.get("is_charging")):
+        return PARKED_SLEEP_SECONDS
+    soc = float(power.get("state_of_charge_pct_estimate", 100.0))
+    if soc < 10.0:
+        return 300.0
+    if soc < 25.0:
+        return 120.0
+    return PARKED_SLEEP_SECONDS
+
+
 def _truck_is_active(state: RuntimeState) -> bool:
     """Return True if recent motion or GPS speed suggests the truck is in use."""
     if state.last_motion_monotonic > 0:
@@ -524,6 +536,13 @@ async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
         state.park_wake_event.set()
         return
 
+    power = await get_latest_power_snapshot(config.vehicle_id)
+    if power and bool(power.get("is_charging")):
+        logger.info("Parked scan: charging detected (solar/USB) — waking to sync queued data.")
+        state.parked_mode = False
+        state.park_wake_event.set()
+        return
+
     if is_network_connected():
         logger.info("Parked scan: WiFi detected — exiting parked mode.")
         state.parked_mode = False
@@ -538,9 +557,11 @@ async def parked_scan_worker(config: Config, state: RuntimeState) -> None:
             await asyncio.sleep(2)
             continue
 
-        logger.info("Parked mode: sleeping %.0fs before next scan cycle.", PARKED_SLEEP_SECONDS)
+        power = await get_latest_power_snapshot(config.vehicle_id)
+        sleep_seconds = _adaptive_parked_sleep_seconds(power)
+        logger.info("Parked mode: sleeping %.0fs before next scan cycle.", sleep_seconds)
         try:
-            await asyncio.wait_for(state.park_wake_event.wait(), timeout=PARKED_SLEEP_SECONDS)
+            await asyncio.wait_for(state.park_wake_event.wait(), timeout=sleep_seconds)
             state.park_wake_event.clear()
             if not state.parked_mode:
                 logger.info("Parked mode: exiting (WiFi restored or external wake).")
