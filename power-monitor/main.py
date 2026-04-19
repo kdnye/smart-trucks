@@ -44,7 +44,7 @@ EXTERNAL_INPUT_PRESENT_MIN_BUS_V = 4.5
 
 class INA219Driver:
     _VOLTAGE_SOC_MAX_V = 4.20
-    _VOLTAGE_SOC_MIN_V = 3.20
+    _VOLTAGE_SOC_MIN_V = 3.00  # LiPo protection board cuts at ~2.75V; 3.00V = usable floor
     _GAIN_MAP = {
         "gain_1_40mv": INA219.GAIN_1_40MV,
         "gain_2_80mv": INA219.GAIN_2_80MV,
@@ -475,14 +475,18 @@ class UpsMonitor:
 
     @staticmethod
     def _estimate_soc(voltage_v: float) -> int:
-        if voltage_v >= 3.87:
+        # Breakpoints derived from a standard 1S LiPo OCV discharge curve.
+        # 4.20V = 100% (fully charged); protection board cuts at ~2.75V.
+        if voltage_v >= 4.10:
             return 100
-        if voltage_v >= 3.7:
+        if voltage_v >= 3.90:
             return 75
-        if voltage_v >= 3.55:
+        if voltage_v >= 3.75:
             return 50
-        if voltage_v >= 3.4:
+        if voltage_v >= 3.60:
             return 25
+        if voltage_v >= 3.40:
+            return 10
         return 0
 
     async def read(self) -> dict[str, Any]:
