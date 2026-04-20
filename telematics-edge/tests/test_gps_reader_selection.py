@@ -33,6 +33,7 @@ class GpsReaderWorkerSelectionTests(unittest.IsolatedAsyncioTestCase):
     def _build_config(self, candidates: tuple[str, ...], probe_all: bool) -> main.Config:
         return main.Config(
             vehicle_id="TRUCK",
+            device_role="truck",
             webhook_url=None,
             api_key="",
             gps_sample_interval_seconds=5,
