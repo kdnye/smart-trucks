@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Config:
     vehicle_id: str
+    device_role: str
     webhook_url: str | None
     api_key: str
     gps_sample_interval_seconds: int
@@ -64,6 +65,8 @@ class Config:
     imu_i2c_bus: int
     imu_expected_addresses: tuple[int, ...]
     imu_required: bool
+    warehouse_latitude: float | None = None
+    warehouse_longitude: float | None = None
     network_watchdog_enabled: bool = True
     network_watchdog_check_interval_seconds: int = 60
     network_watchdog_max_failures: int = 3
@@ -97,7 +100,23 @@ def _read_str_env(name: str, default: str | None = None) -> str | None:
     return default
 
 
+def _read_float_env(name: str) -> float | None:
+    value = _read_str_env(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a numeric value; received {value!r}.") from None
+
+
 def load_config() -> Config:
+    device_role = (_read_str_env("DEVICE_ROLE", "truck") or "truck").lower()
+    warehouse_latitude = _read_float_env("WAREHOUSE_LAT")
+    warehouse_longitude = _read_float_env("WAREHOUSE_LON")
+    if device_role == "warehouse" and (warehouse_latitude is None or warehouse_longitude is None):
+        raise RuntimeError("DEVICE_ROLE=warehouse requires WAREHOUSE_LAT and WAREHOUSE_LON.")
+
     raw_candidates = _read_str_env("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0") or ""
     serial_candidates = tuple(
         candidate.strip()
@@ -117,6 +136,7 @@ def load_config() -> Config:
         serial_devices = (primary_device,)
     return Config(
         vehicle_id=_read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
+        device_role=device_role,
         webhook_url=_read_str_env("WEBHOOK_URL"),
         api_key=_read_str_env("API_KEY", "") or "",
         gps_sample_interval_seconds=max(1, int(_read_str_env("GPS_SAMPLE_INTERVAL_SECONDS", "5") or "5")),
@@ -141,6 +161,8 @@ def load_config() -> Config:
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", 1, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=parse_bool_env("IMU_REQUIRED", True),
+        warehouse_latitude=warehouse_latitude,
+        warehouse_longitude=warehouse_longitude,
     )
 
 
@@ -301,7 +323,17 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
         await asyncio.sleep(config.network_watchdog_recovery_pause_seconds)
 
 
-def get_latest_gps(state: RuntimeState) -> dict[str, Any]:
+def get_latest_gps(config: Config, state: RuntimeState) -> dict[str, Any]:
+    if config.device_role == "warehouse":
+        return {
+            "fix_status": "locked",
+            "device": "warehouse_config",
+            "latitude": config.warehouse_latitude,
+            "longitude": config.warehouse_longitude,
+            "altitude_m": None,
+            "speed_kmh": 0.0,
+            "gps_timestamp": None,
+        }
     if state.latest_valid_gps:
         return dict(state.latest_valid_gps)
     return {"fix_status": "searching"}
@@ -499,7 +531,7 @@ def _truck_is_active(state: RuntimeState) -> bool:
 async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
     """Lean GPS stash + WiFi re-check executed on every parked sleep tick."""
     captured_at = utc_now_iso()
-    gps = build_location_payload(get_latest_gps(state))
+    gps = build_location_payload(get_latest_gps(config, state))
     if gps.get("fix_status") == "locked":
         state.local_sequence += 1
         payload = {
@@ -586,7 +618,7 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
             continue
 
         captured_at = utc_now_iso()
-        gps = build_location_payload(get_latest_gps(state))
+        gps = build_location_payload(get_latest_gps(config, state))
 
         if gps.get("fix_status") == "locked":
             state.last_locked_gps_point_utc = captured_at
@@ -620,21 +652,33 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
         await asyncio.sleep(config.gps_sample_interval_seconds)
 
 
-async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor) -> None:
+async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:
     while True:
         if state.parked_mode:
             await asyncio.sleep(10)
             continue
 
         captured_at = utc_now_iso()
-        gps_payload = build_location_payload(get_latest_gps(state))
+        gps_payload = build_location_payload(get_latest_gps(config, state))
         state.wifi_connected = is_network_connected()
         db_stats = await get_db_stats()
-        latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
-        power_metrics, state.power_monitor_ok = build_power_metrics_payload(
-            latest_power_snapshot,
-            max_snapshot_age_seconds=config.power_snapshot_max_age_seconds,
-        )
+        if config.device_role == "warehouse":
+            power_metrics = {
+                "status": "skipped",
+                "reason": "device_role_warehouse",
+                "source": "disabled_for_role",
+                "snapshot_found": False,
+                "snapshot_stale": False,
+                "snapshot_age_sec": None,
+                "snapshot_captured_at_utc": None,
+            }
+            state.power_monitor_ok = True
+        else:
+            latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
+            power_metrics, state.power_monitor_ok = build_power_metrics_payload(
+                latest_power_snapshot,
+                max_snapshot_age_seconds=config.power_snapshot_max_age_seconds,
+            )
 
         heartbeat_payload = {
             "event_type": "edge_telematics_heartbeat",
@@ -646,11 +690,11 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
             "location": gps_payload,
             "gps": gps_payload,
             "location_status": {
-                "fix_status": "locked" if state.last_gps_fix_utc else "searching",
-                "last_fix_age_sec": age_seconds(state.last_gps_fix_utc),
+                "fix_status": gps_payload.get("fix_status", "searching"),
+                "last_fix_age_sec": age_seconds(state.last_gps_fix_utc) if config.device_role != "warehouse" else 0,
             },
             "power_metrics": power_metrics,
-            "imu_metrics": imu.read(),
+            "imu_metrics": imu.read() if imu is not None else {"status": "skipped", "reason": "device_role_warehouse"},
             "queue": db_stats,
             "wifi_connected": state.wifi_connected,
         }
@@ -737,7 +781,7 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
         queue_depth = db_stats["queue_depth"]
 
         alerts: list[str] = []
-        if last_gps_fix_age is not None and last_gps_fix_age > 300:
+        if config.device_role != "warehouse" and last_gps_fix_age is not None and last_gps_fix_age > 300:
             alerts.append("gps_reader_stale")
             state.gps_reader_ok = False
 
@@ -801,13 +845,13 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
 
 
 async def run() -> None:
-    if os.getenv("DEVICE_ROLE", "truck").lower() == "warehouse":
-        logger.info("DEVICE_ROLE is set to warehouse. Disabling GPS and IMU hardware probes.")
-        logger.info("Telematics Edge container going into idle sleep mode.")
-        while True:
-            await asyncio.sleep(86400)
-
     config = load_config()
+    warehouse_mode = config.device_role == "warehouse"
+    if warehouse_mode:
+        logger.info(
+            "DEVICE_ROLE=warehouse detected. GPS and power-monitor dependencies disabled; "
+            "heartbeats will use configured warehouse coordinates."
+        )
     # TCP addresses (e.g. tcp://gps-multiplexer:2947) are served by the
     # gps-multiplexer container and must not be probed as serial ports.
     serial_probe_candidates = tuple(
@@ -819,17 +863,21 @@ async def run() -> None:
         i2c_bus=config.imu_i2c_bus,
         ups_expected_addresses=tuple(),
         imu_expected_addresses=config.imu_expected_addresses,
-        probe_serial=True,
+        probe_serial=not warehouse_mode,
     )
     print(f"Hardware inventory: {inventory.to_json()}")
     os.makedirs("/data", exist_ok=True)
     with open("/data/telematics_hardware_inventory.json", "w", encoding="utf-8") as handle:
         json.dump(inventory.to_dict(), handle, sort_keys=True)
-    inventory_errors = validate_inventory(inventory, imu_required=config.imu_required, ups_required=False)
+    inventory_errors = validate_inventory(
+        inventory,
+        imu_required=(config.imu_required and not warehouse_mode),
+        ups_required=False,
+    )
     if inventory_errors:
         raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
 
-    imu = ImuMonitor(bus_num=config.imu_i2c_bus)
+    imu = ImuMonitor(bus_num=config.imu_i2c_bus) if not warehouse_mode else None
     state = RuntimeState(start_monotonic=time.monotonic())
 
     async def _on_motion_wake() -> None:
@@ -839,7 +887,8 @@ async def run() -> None:
             state.parked_mode = False
             state.park_wake_event.set()
 
-    imu.set_motion_wake_callback(_on_motion_wake)
+    if imu is not None:
+        imu.set_motion_wake_callback(_on_motion_wake)
 
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
@@ -847,15 +896,20 @@ async def run() -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [
-            asyncio.create_task(imu.start()),
-            asyncio.create_task(gps_reader_worker(config, state)),
-            asyncio.create_task(gps_collector_worker(config, state)),
             asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
             asyncio.create_task(sync_worker(config, state, session)),
             asyncio.create_task(maintenance_worker(config, state)),
             asyncio.create_task(network_watchdog_worker(config, state)),
-            asyncio.create_task(parked_scan_worker(config, state)),
         ]
+        if not warehouse_mode and imu is not None:
+            tasks.extend(
+                [
+                    asyncio.create_task(imu.start()),
+                    asyncio.create_task(gps_reader_worker(config, state)),
+                    asyncio.create_task(gps_collector_worker(config, state)),
+                    asyncio.create_task(parked_scan_worker(config, state)),
+                ]
+            )
         await asyncio.gather(*tasks)
 
 
