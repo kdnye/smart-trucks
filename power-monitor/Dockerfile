@@ -19,7 +19,7 @@ WORKDIR /usr/src/app
 COPY power-monitor/requirements.txt .
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
-    && python -c "import aiohttp, aiosqlite, ina219, uvloop"
+    && python -c "import aiohttp, aiosqlite, ina219, smbus2, uvloop"
 
 COPY shared/ /usr/src/app/shared/
 COPY power-monitor/ .

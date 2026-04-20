@@ -30,6 +30,7 @@ class Config:
     key_beacon_manufacturer_ids: frozenset[int]
     scan_contention_backoff_cap_seconds: float
     scan_contention_cooldown_threshold: int
+    scan_contention_max_attempts_before_reset: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -78,6 +79,10 @@ def load_config() -> Config:
         scan_contention_cooldown_threshold=max(
             1,
             int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
+        ),
+        scan_contention_max_attempts_before_reset=max(
+            1,
+            int(os.getenv("SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", "12")),
         ),
     )
 
@@ -586,8 +591,10 @@ async def run() -> None:
                     err_text = f"{exc}".lower()
                     cause_text = f"{exc.__cause__}".lower() if exc.__cause__ else ""
                     class_text = f"{exc.__class__.__name__} {type(exc).__name__}".lower()
-                    is_op_in_progress = "operation already in progress" in (
-                        f"{err_text} {cause_text} {class_text}"
+                    combined_error_text = f"{err_text} {cause_text} {class_text}"
+                    is_op_in_progress = (
+                        "operation already in progress" in combined_error_text
+                        or "org.bluez.error.inprogress" in combined_error_text
                     )
 
                     if is_op_in_progress:
@@ -610,6 +617,15 @@ async def run() -> None:
                                 "Repeated scan contention detected. Applying extended "
                                 f"cooldown of {config.post_interval_seconds}s before retry."
                             )
+                            await asyncio.sleep(config.post_interval_seconds)
+
+                        if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
+                            print(
+                                "Persistent BlueZ scan contention detected. Resetting retry "
+                                f"counter after {config.post_interval_seconds}s cooldown. "
+                                "Check for competing BLE scanners on the host."
+                            )
+                            scan_retry_attempt = 0
                             await asyncio.sleep(config.post_interval_seconds)
                         continue
 
