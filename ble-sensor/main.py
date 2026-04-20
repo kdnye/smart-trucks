@@ -30,6 +30,8 @@ class Config:
     key_beacon_manufacturer_ids: frozenset[int]
     scan_contention_backoff_cap_seconds: float
     scan_contention_cooldown_threshold: int
+    local_db_path: str
+    upload_batch_size: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -79,6 +81,8 @@ def load_config() -> Config:
             1,
             int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
         ),
+        local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
+        upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
     )
 
 
@@ -477,10 +481,9 @@ def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> st
 
 async def push_to_cloud(
     session: aiohttp.ClientSession, payload: dict[str, Any], config: Config
-) -> None:
+) -> bool:
     if not config.webhook_url:
-        print("Error: WEBHOOK_URL is not configured.")
-        return
+        return False
 
     headers = {}
     if config.api_key:
@@ -497,10 +500,119 @@ async def push_to_cloud(
             response_text = await response.text()
             if response.status >= 400:
                 print(f"Upload failed [{response.status}]: {response_text[:200]}")
-                return
+                return False
             print(f"Payload transmitted. Status: {response.status}")
+            return True
     except Exception as exc:
         print(f"Transmission failed: {exc}")
+        return False
+
+
+def _init_local_store(db_path: str) -> None:
+    with _sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ble_scan_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                sent_at_utc TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ble_scan_events_pending
+            ON ble_scan_events(sent_at_utc, captured_at_utc);
+            """
+        )
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _queue_scan_payload(db_path: str, payload: dict[str, Any]) -> None:
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            INSERT INTO ble_scan_events (captured_at_utc, payload_json)
+            VALUES (?, ?)
+            """,
+            (payload["captured_at_utc"], json.dumps(payload)),
+        )
+
+
+def _get_pending_scan_payloads(
+    db_path: str, limit: int
+) -> list[tuple[int, str, str]]:
+    with _sqlite3.connect(db_path, timeout=30.0) as conn:
+        cursor = conn.execute(
+            """
+            SELECT id, captured_at_utc, payload_json
+            FROM ble_scan_events
+            WHERE sent_at_utc IS NULL
+            ORDER BY captured_at_utc ASC, id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [(int(row[0]), str(row[1]), str(row[2])) for row in cursor.fetchall()]
+
+
+def _mark_scan_payload_sent(db_path: str, row_id: int) -> None:
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute(
+            """
+            UPDATE ble_scan_events
+            SET sent_at_utc = ?, last_error = NULL
+            WHERE id = ?
+            """,
+            (_utc_now_iso(), row_id),
+        )
+
+
+def _record_scan_upload_failure(db_path: str, row_id: int, error: str) -> None:
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute(
+            """
+            UPDATE ble_scan_events
+            SET attempts = attempts + 1, last_error = ?
+            WHERE id = ?
+            """,
+            (error[:500], row_id),
+        )
+
+
+async def _flush_pending_scan_payloads(
+    session: aiohttp.ClientSession, config: Config
+) -> None:
+    pending_rows = _get_pending_scan_payloads(config.local_db_path, config.upload_batch_size)
+    if not pending_rows:
+        return
+
+    for row_id, captured_at_utc, payload_json in pending_rows:
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            _record_scan_upload_failure(config.local_db_path, row_id, f"json_decode_error:{exc}")
+            continue
+
+        was_uploaded = await push_to_cloud(session, payload, config)
+        if was_uploaded:
+            _mark_scan_payload_sent(config.local_db_path, row_id)
+        else:
+            _record_scan_upload_failure(
+                config.local_db_path,
+                row_id,
+                f"upload_failed:{captured_at_utc}",
+            )
+            break
 
 
 def _write_ble_wake_signal() -> None:
@@ -558,6 +670,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
     return {
         "vehicle_id": config.vehicle_id,
+        "captured_at_utc": _utc_now_iso(),
         "event_type": "ble_sensor_scan",
         "scan_duration_seconds": config.scan_duration_seconds,
         "sensor_count": len(sensors),
@@ -568,6 +681,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
+    _init_local_store(config.local_db_path)
 
     if config.anonymize_mac and not config.mac_hash_salt:
         print(
@@ -615,14 +729,12 @@ async def run() -> None:
 
                     raise
 
-                if payload["sensor_count"] > 0:
-                    print(
-                        f"Detected {payload['sensor_count']} devices in "
-                        f"{config.scan_duration_seconds:.0f}s scan. Uploading..."
-                    )
-                    await push_to_cloud(session, payload, config)
-                else:
-                    print("No BLE broadcasts detected in this scan window.")
+                _queue_scan_payload(config.local_db_path, payload)
+                print(
+                    f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
+                    f"for captured_at_utc={payload['captured_at_utc']}."
+                )
+                await _flush_pending_scan_payloads(session, config)
             except Exception as exc:
                 print(f"Scan loop error: {exc}")
 
