@@ -9,6 +9,12 @@ ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/host/run/dbus/system_bus_socket
 # Set the working directory
 WORKDIR /usr/src/app
 
+# Install C build tools required by uvloop (compiles libuv from source)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential gcc \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy dependency list and install
 COPY ble-sensor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
