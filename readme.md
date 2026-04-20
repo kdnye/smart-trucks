@@ -111,6 +111,10 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 | `INCLUDE_DEVICE_NAME` | Includes BLE local names in payloads when enabled. | `false` |
 | `MAX_DEVICES_PER_SCAN` | Caps payload size in busy RF environments. | `500` |
 | `HTTP_TIMEOUT_SECONDS` | Upload timeout in seconds. | `10` |
+| `BLE_LOCAL_DB_PATH` | Local SQLite WAL path used to queue BLE scan events for offline backfill. | `/data/ble-sensor.db` |
+| `UPLOAD_BATCH_SIZE` | Max queued BLE scan events uploaded per cycle after connectivity returns. | `25` |
+
+`ble-sensor` now stores each scan result (including `sensor_count=0` windows) to local SQLite before upload attempts. This preserves both inventory presence and absence history so dashboards can backfill accurately after a connectivity outage.
 
 > ⚠️ Legal/Privacy note: only collect BLE broadcasts where you have explicit permission and a lawful basis to process device identifiers.
 
