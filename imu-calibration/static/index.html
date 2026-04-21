@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IMU Calibration Console</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 16px; background: #0f172a; color: #e2e8f0; }
+    h1 { margin-top: 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button { border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
+    .primary { background: #22c55e; color: #052e16; font-weight: 600; }
+    .danger { background: #f87171; color: #450a0a; font-weight: 600; }
+    .event { background: #334155; color: #f8fafc; }
+    input, textarea { background: #1e293b; color: #f1f5f9; border: 1px solid #475569; border-radius: 8px; padding: 8px; }
+    #status { margin-bottom: 10px; font-weight: 600; }
+    #chart { width: 100%; max-width: 1100px; height: 320px; background: #020617; border-radius: 8px; border: 1px solid #334155; }
+  </style>
+</head>
+<body>
+  <h1>IMU Calibration Console</h1>
+  <div id="status">Loading...</div>
+
+  <div class="row">
+    <input id="session-label" placeholder="Session label (e.g., TRK-12 downtown route)" size="50" />
+    <button id="start" class="primary">Start Recording</button>
+    <button id="stop" class="danger">Stop Recording</button>
+  </div>
+
+  <canvas id="chart" width="1100" height="320"></canvas>
+
+  <h3>Event Markers</h3>
+  <div id="event-buttons" class="row"></div>
+
+  <div class="row">
+    <input id="custom-event" placeholder="custom event label" />
+    <input id="event-notes" placeholder="optional notes" size="40" />
+    <button id="mark-custom" class="event">Mark Custom Event</button>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const chart = document.getElementById('chart');
+    const ctx = chart.getContext('2d');
+    const eventButtons = document.getElementById('event-buttons');
+
+    let lastPoints = [];
+    let state = { recording: false, event_types: [] };
+
+    async function api(path, method = 'GET', body = null) {
+      const res = await fetch(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : null,
+      });
+      return res.json();
+    }
+
+    function renderState() {
+      statusEl.textContent = state.recording
+        ? `Recording active | session ${state.session_id}`
+        : 'Recording stopped';
+
+      eventButtons.innerHTML = '';
+      state.event_types.forEach((eventType) => {
+        const btn = document.createElement('button');
+        btn.className = 'event';
+        btn.textContent = eventType;
+        btn.onclick = () => mark(eventType);
+        eventButtons.appendChild(btn);
+      });
+    }
+
+    function drawGraph(points) {
+      ctx.clearRect(0, 0, chart.width, chart.height);
+      if (points.length < 2) return;
+
+      const values = points.map(p => p.magnitude_3d);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = Math.max(max - min, 0.01);
+
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      points.forEach((p, i) => {
+        const x = (i / (points.length - 1)) * chart.width;
+        const y = chart.height - ((p.magnitude_3d - min) / span) * chart.height;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(`magnitude_3d min=${min.toFixed(3)} max=${max.toFixed(3)}`, 10, 15);
+    }
+
+    async function refreshState() {
+      state = await api('/api/state');
+      renderState();
+    }
+
+    async function refreshLive() {
+      const payload = await api('/api/live');
+      lastPoints = payload.points || [];
+      drawGraph(lastPoints);
+    }
+
+    async function mark(eventType, customLabel = '', notes = '') {
+      const resp = await api('/api/mark', 'POST', {
+        event_type: eventType,
+        custom_label: customLabel,
+        notes,
+      });
+      if (resp.error) alert(resp.error);
+    }
+
+    document.getElementById('start').onclick = async () => {
+      const label = document.getElementById('session-label').value.trim();
+      await api('/api/session/start', 'POST', { label });
+      await refreshState();
+    };
+
+    document.getElementById('stop').onclick = async () => {
+      await api('/api/session/stop', 'POST', {});
+      await refreshState();
+    };
+
+    document.getElementById('mark-custom').onclick = async () => {
+      const custom = document.getElementById('custom-event').value.trim();
+      const notes = document.getElementById('event-notes').value.trim();
+      await mark('custom', custom, notes);
+    };
+
+    refreshState();
+    refreshLive();
+    setInterval(refreshState, 4000);
+    setInterval(refreshLive, 500);
+  </script>
+</body>
+</html>
