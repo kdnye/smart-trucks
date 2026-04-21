@@ -103,5 +103,22 @@ services:
       - IMU_I2C_BUS=${IMU_I2C_BUS:-1}
       - IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS=${IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS:-0.05}
 
+  ble-calibration:
+    build:
+      context: .
+      dockerfile: ble-calibration/Dockerfile
+    network_mode: host
+    privileged: true
+    restart: "no"
+    labels:
+      io.balena.features.dbus: '1'
+    volumes:
+      - telematics_data:/data
+    environment:
+      - UDEV=1
+      - VEHICLE_ID=${VEHICLE_ID}
+      - BLE_CALIBRATION_SCAN_DURATION_SECONDS=${BLE_CALIBRATION_SCAN_DURATION_SECONDS:-4}
+      - BLE_CALIBRATION_REFRESH_SECONDS=${BLE_CALIBRATION_REFRESH_SECONDS:-6}
+
 volumes:
   telematics_data:

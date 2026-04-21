@@ -217,3 +217,31 @@ python telematics-edge/scripts/sync_imu_calibration_truth_table.py \
 ```
 
 The generated `/data/imu-truth-table.json` can be consumed by downstream threshold/model experiments without changing runtime hot-path sensor loops.
+
+## BLE Distance + Obstruction Calibration Container (On-Demand)
+
+An optional `ble-calibration` service is available for per-device BLE environment calibration (distance + obstruction effects) without modifying production scan loops.
+
+### What it provides
+- Browser UI for interactive mapping:
+  - configure space size in meters (grid uses 1m x 1m cells),
+  - set Pi location,
+  - mark obstruction cells (walls, pallets, etc.),
+  - assign currently detected beacons to clicked grid cells and capture RSSI samples.
+- BLE scanning with periodic refresh to keep a current beacon list.
+- SQLite WAL capture to `/data/ble-calibration.db`:
+  - `ble_calibration_sessions`
+  - `ble_grid_state`
+  - `ble_captures`
+- Per-beacon local path-loss fit for clear and obstructed paths (`RSSI = intercept + slope*log10(distance_m)`) with an obstruction offset estimate.
+
+### Suggested workflow
+1. Pause heavy containers in Balena (optional).
+2. Start `ble-calibration` on the target Pi.
+3. Open `http://<device-ip>:8080` (host networking).
+4. Enter grid dimensions, set Pi location, and mark obstruction cells.
+5. For each beacon, collect 4-5 captures across multiple positions.
+6. Repeat after moving Pi mounting location (cab/box placement experiments).
+7. Stop session and container when done.
+
+This creates a reusable per-Pi calibration dataset that can be used later to improve beacon distance inference under truck-specific environmental conditions.
