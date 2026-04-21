@@ -1,0 +1,4 @@
+aiohttp==3.9.3
+aiosqlite==0.19.0
+bleak==0.22.2
+uvloop==0.19.0

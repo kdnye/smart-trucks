@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BLE Distance + Obstruction Calibration</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0b1220; color: #e2e8f0; margin: 0; padding: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+    input, select, button { border-radius: 8px; border: 1px solid #475569; background: #1e293b; color: #f8fafc; padding: 8px; }
+    button { cursor: pointer; }
+    .primary { background: #0ea5e9; }
+    .warn { background: #f97316; }
+    .ok { background: #22c55e; }
+    #grid { display: grid; gap: 2px; margin: 12px 0; max-width: 100%; overflow: auto; }
+    .cell { width: 28px; height: 28px; border: 1px solid #334155; background: #0f172a; font-size: 10px; }
+    .cell.pi { background: #16a34a; }
+    .cell.blocked { background: #b45309; }
+    .cell.target { outline: 2px solid #38bdf8; }
+    #beacons { max-height: 260px; overflow: auto; border: 1px solid #334155; border-radius: 8px; padding: 8px; }
+    #models { white-space: pre-wrap; background: #020617; border-radius: 8px; border: 1px solid #334155; padding: 8px; }
+  </style>
+</head>
+<body>
+  <h2>BLE Distance & Obstruction Calibration</h2>
+  <div id="status">Loading...</div>
+
+  <div class="row">
+    <input id="session-label" placeholder="Session label" />
+    <button id="start" class="ok">Start Session</button>
+    <button id="stop" class="warn">Stop Session</button>
+  </div>
+
+  <div class="row">
+    <label>Width (m)</label><input id="grid-width" type="number" min="2" max="40" value="8" />
+    <label>Height (m)</label><input id="grid-height" type="number" min="2" max="40" value="8" />
+    <label>Pi X</label><input id="pi-x" type="number" min="0" value="0" />
+    <label>Pi Y</label><input id="pi-y" type="number" min="0" value="0" />
+    <button id="apply-layout" class="primary">Apply Grid</button>
+  </div>
+
+  <p>Click behavior: <b>Shift+Click</b> toggles obstruction, <b>Ctrl/Cmd+Click</b> moves Pi, plain click selects capture cell.</p>
+  <div id="grid"></div>
+
+  <h3>Detected beacons</h3>
+  <div id="beacons"></div>
+
+  <div class="row">
+    <label>Beacon</label>
+    <select id="beacon-select"></select>
+    <label>Capture Group</label>
+    <input id="capture-group" placeholder="e.g., run1-posA" />
+    <label>Obstruction Notes</label>
+    <input id="obstruction-notes" placeholder="wall/pallet/none" />
+    <button id="capture" class="ok">Capture Selected Cell</button>
+  </div>
+
+  <h3>Calibration model</h3>
+  <div id="models"></div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const gridEl = document.getElementById('grid');
+    const beaconsEl = document.getElementById('beacons');
+    const beaconSelect = document.getElementById('beacon-select');
+    const modelsEl = document.getElementById('models');
+
+    let state = null;
+    let selected = { x: 0, y: 0 };
+
+    async function api(path, method='GET', body=null) {
+      const res = await fetch(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : null,
+      });
+      return await res.json();
+    }
+
+    function obstructionSet() {
+      return new Set((state.grid.obstructions || []).map(o => `${o.x},${o.y}`));
+    }
+
+    function drawGrid() {
+      const { width, height, pi } = state.grid;
+      const blocked = obstructionSet();
+      gridEl.style.gridTemplateColumns = `repeat(${width}, 28px)`;
+      gridEl.innerHTML = '';
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const cell = document.createElement('button');
+          cell.className = 'cell';
+          cell.textContent = `${x},${y}`;
+          if (pi.x === x && pi.y === y) cell.classList.add('pi');
+          if (blocked.has(`${x},${y}`)) cell.classList.add('blocked');
+          if (selected.x === x && selected.y === y) cell.classList.add('target');
+
+          cell.onclick = async (event) => {
+            if (event.shiftKey) {
+              await api('/api/obstruction', 'POST', { x, y, blocked: !blocked.has(`${x},${y}`) });
+              await refresh();
+              return;
+            }
+            if (event.metaKey || event.ctrlKey) {
+              await api('/api/layout', 'POST', { width, height, pi_x: x, pi_y: y });
+              await refresh();
+              return;
+            }
+            selected = { x, y };
+            drawGrid();
+          };
+          gridEl.appendChild(cell);
+        }
+      }
+    }
+
+    function drawBeacons() {
+      beaconsEl.innerHTML = '';
+      beaconSelect.innerHTML = '';
+      if (!state.beacons.length) {
+        beaconsEl.textContent = 'No beacons seen yet. Wait for scan refresh.';
+        return;
+      }
+
+      state.beacons.forEach(b => {
+        const row = document.createElement('div');
+        row.textContent = `${b.mac} | RSSI ${b.rssi} dBm | ${b.name || 'unknown'}`;
+        beaconsEl.appendChild(row);
+
+        const opt = document.createElement('option');
+        opt.value = b.mac;
+        opt.textContent = `${b.mac} (${b.rssi} dBm)`;
+        beaconSelect.appendChild(opt);
+      });
+    }
+
+    function drawModels() {
+      modelsEl.textContent = JSON.stringify(state.models, null, 2);
+    }
+
+    function fillLayoutInputs() {
+      document.getElementById('grid-width').value = state.grid.width;
+      document.getElementById('grid-height').value = state.grid.height;
+      document.getElementById('pi-x').value = state.grid.pi.x;
+      document.getElementById('pi-y').value = state.grid.pi.y;
+    }
+
+    async function refresh() {
+      state = await api('/api/state');
+      statusEl.textContent = state.recording
+        ? `Session ${state.session_id} active (${state.session_label || 'unnamed'})`
+        : 'Session stopped';
+      fillLayoutInputs();
+      drawGrid();
+      drawBeacons();
+      drawModels();
+    }
+
+    document.getElementById('apply-layout').onclick = async () => {
+      await api('/api/layout', 'POST', {
+        width: parseInt(document.getElementById('grid-width').value, 10),
+        height: parseInt(document.getElementById('grid-height').value, 10),
+        pi_x: parseInt(document.getElementById('pi-x').value, 10),
+        pi_y: parseInt(document.getElementById('pi-y').value, 10),
+      });
+      await refresh();
+    };
+
+    document.getElementById('start').onclick = async () => {
+      await api('/api/session/start', 'POST', { label: document.getElementById('session-label').value.trim() });
+      await refresh();
+    };
+
+    document.getElementById('stop').onclick = async () => {
+      await api('/api/session/stop', 'POST', {});
+      await refresh();
+    };
+
+    document.getElementById('capture').onclick = async () => {
+      const payload = {
+        beacon_mac: beaconSelect.value,
+        x: selected.x,
+        y: selected.y,
+        capture_group: document.getElementById('capture-group').value.trim(),
+        obstruction_notes: document.getElementById('obstruction-notes').value.trim(),
+      };
+      const res = await api('/api/capture', 'POST', payload);
+      if (res.error) alert(res.error);
+      await refresh();
+    };
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
