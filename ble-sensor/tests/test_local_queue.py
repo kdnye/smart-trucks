@@ -76,6 +76,7 @@ class MacNormalizationTests(unittest.TestCase):
             scan_contention_max_attempts_before_reset=10,
             local_db_path=":memory:",
             upload_batch_size=25,
+            telematics_db_path="/data/telematics.db",
             pi_location_db_path="/data/telematics.db",
             pi_location_cache_path="/data/telematics_last_locked.json",
             pi_location_query_timeout_seconds=0.25,
@@ -144,6 +145,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
+                    telematics_db_path="/data/telematics.db",
                     pi_location_db_path="/data/telematics.db",
                     pi_location_cache_path="/data/telematics_last_locked.json",
                     pi_location_query_timeout_seconds=0.25,
@@ -208,6 +210,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
+                    telematics_db_path="/data/telematics.db",
                     pi_location_db_path="/data/telematics.db",
                     pi_location_cache_path="/data/telematics_last_locked.json",
                     pi_location_query_timeout_seconds=0.25,
@@ -278,6 +281,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
+                    telematics_db_path="/data/telematics.db",
                     pi_location_db_path="/data/telematics.db",
                     pi_location_cache_path="/data/telematics_last_locked.json",
                     pi_location_query_timeout_seconds=0.25,
@@ -357,6 +361,7 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 scan_contention_max_attempts_before_reset=10,
                 local_db_path=str(Path(tmpdir) / "ble.db"),
                 upload_batch_size=25,
+                telematics_db_path=telematics_db_path,
                 pi_location_db_path=telematics_db_path,
                 pi_location_cache_path=str(Path(tmpdir) / "missing.json"),
                 pi_location_query_timeout_seconds=0.25,
@@ -397,6 +402,7 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 scan_contention_max_attempts_before_reset=10,
                 local_db_path=str(Path(tmpdir) / "ble.db"),
                 upload_batch_size=25,
+                telematics_db_path=str(Path(tmpdir) / "missing.db"),
                 pi_location_db_path=str(Path(tmpdir) / "missing.db"),
                 pi_location_cache_path=str(Path(tmpdir) / "missing.json"),
                 pi_location_query_timeout_seconds=0.25,
@@ -452,6 +458,7 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 scan_contention_max_attempts_before_reset=10,
                 local_db_path=db_path,
                 upload_batch_size=25,
+                telematics_db_path=str(Path(tmpdir) / "telematics.db"),
                 pi_location_db_path=str(Path(tmpdir) / "telematics.db"),
                 pi_location_cache_path=str(Path(tmpdir) / "telematics_last_locked.json"),
                 pi_location_query_timeout_seconds=0.25,
@@ -542,6 +549,7 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 scan_contention_max_attempts_before_reset=10,
                 local_db_path=db_path,
                 upload_batch_size=25,
+                telematics_db_path=str(Path(tmpdir) / "telematics.db"),
                 pi_location_db_path=str(Path(tmpdir) / "telematics.db"),
                 pi_location_cache_path=str(Path(tmpdir) / "telematics_last_locked.json"),
                 pi_location_query_timeout_seconds=0.25,
@@ -606,6 +614,7 @@ class BleScanContentionTests(unittest.IsolatedAsyncioTestCase):
                 scan_contention_max_attempts_before_reset=2,
                 local_db_path=db_path,
                 upload_batch_size=25,
+                telematics_db_path="/data/telematics.db",
                 pi_location_db_path="/data/telematics.db",
                 pi_location_cache_path="/data/telematics_last_locked.json",
                 pi_location_query_timeout_seconds=0.25,
@@ -653,6 +662,119 @@ class BleScanContentionTests(unittest.IsolatedAsyncioTestCase):
                 ble_sensor_main.aiohttp.ClientSession = original_client_session
                 ble_sensor_main.asyncio.sleep = original_sleep
                 ble_sensor_main.random.uniform = original_uniform
+
+
+class PiGpsInjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_pi_gps_from_telematics_db_returns_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telematics_db_path = str(Path(tmpdir) / "telematics.db")
+            with sqlite3.connect(telematics_db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE gps_points (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lat REAL,
+                        lon REAL,
+                        fix_status TEXT,
+                        captured_at_utc TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO gps_points (lat, lon, fix_status, captured_at_utc)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (33.7490, -84.3880, "locked", "2026-04-21T00:00:00+00:00"),
+                )
+
+            pi_gps = ble_sensor_main._read_pi_gps_from_telematics_db(
+                telematics_db_path,
+                lock_timeout_seconds=0.2,
+            )
+            assert pi_gps is not None
+            self.assertEqual(
+                set(pi_gps.keys()),
+                {"latitude", "longitude", "speed_kmh", "fix_status", "captured_at_utc"},
+            )
+            self.assertEqual(pi_gps["fix_status"], "locked")
+
+    async def test_collect_payload_includes_pi_gps_when_lock_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            telematics_db_path = str(Path(tmpdir) / "telematics.db")
+            with sqlite3.connect(telematics_db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE gps_points (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        lat REAL,
+                        lon REAL,
+                        fix_status TEXT,
+                        captured_at_utc TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO gps_points (lat, lon, fix_status, captured_at_utc)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (33.9000, -84.2000, "locked", "2026-04-21T00:10:00+00:00"),
+                )
+
+            config = ble_sensor_main.Config(
+                webhook_url="https://example.test/ingest",
+                vehicle_id="truck-1",
+                post_interval_seconds=60,
+                scan_duration_seconds=1,
+                api_key="",
+                request_timeout_seconds=10,
+                anonymize_mac=False,
+                mac_hash_salt="salt",
+                include_name=False,
+                max_devices_per_scan=0,
+                key_beacon_uuids=frozenset(),
+                key_beacon_manufacturer_ids=frozenset(),
+                scan_contention_backoff_cap_seconds=12,
+                scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=2,
+                local_db_path=str(Path(tmpdir) / "ble.db"),
+                upload_batch_size=25,
+                telematics_db_path=telematics_db_path,
+                pi_location_db_path=telematics_db_path,
+                pi_location_cache_path=str(Path(tmpdir) / "missing.json"),
+                pi_location_query_timeout_seconds=0.25,
+                pi_location_stale_after_seconds=180,
+                pi_id="pi-a",
+                tracked_asset_registry_path=str(Path(tmpdir) / "tracked-assets.json"),
+                resolver_candidate_window_seconds=60,
+                resolver_tie_epsilon=0.02,
+                resolver_stationary_mode_enabled=False,
+                upload_batch_max_bytes=200000,
+                upload_backoff_initial_seconds=5,
+                upload_backoff_max_seconds=300,
+            )
+
+            original_discover = ble_sensor_main.BleakScanner.discover
+            original_collect_pi_location = ble_sensor_main._collect_pi_location
+            try:
+                async def _no_devices(**_kwargs):
+                    return {}
+
+                async def _stub_pi_location(_config):
+                    return {"latitude": None, "longitude": None, "fix_status": "stale_or_unknown"}
+
+                ble_sensor_main.BleakScanner.discover = _no_devices
+                ble_sensor_main._collect_pi_location = _stub_pi_location
+
+                payload = await ble_sensor_main.collect_payload(config)
+            finally:
+                ble_sensor_main.BleakScanner.discover = original_discover
+                ble_sensor_main._collect_pi_location = original_collect_pi_location
+
+            self.assertIn("pi_gps", payload)
+            self.assertEqual(payload["pi_gps"]["latitude"], 33.9)
+            self.assertEqual(payload["pi_gps"]["fix_status"], "locked")
 
 
 if __name__ == "__main__":

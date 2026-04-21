@@ -84,6 +84,8 @@ services:
       - SCAN_CONTENTION_COOLDOWN_THRESHOLD=3
       - SCAN_DURATION_SECONDS=20
       - POLL_INTERVAL=60
+      - TELEMATICS_DB_PATH=/data/telematics.db
+      - UPLOAD_BATCH_SIZE=${BLE_UPLOAD_BATCH_SIZE:-25}
 
   imu-calibration:
     build:

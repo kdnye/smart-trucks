@@ -5,6 +5,7 @@ import json
 import os
 import random
 import sqlite3 as _sqlite3
+from urllib.parse import quote as _urlquote
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ class Config:
     scan_contention_max_attempts_before_reset: int
     local_db_path: str
     upload_batch_size: int
+    telematics_db_path: str
     pi_location_db_path: str
     pi_location_cache_path: str
     pi_location_query_timeout_seconds: float
@@ -101,7 +103,11 @@ def load_config() -> Config:
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
-        pi_location_db_path=os.getenv("PI_LOCATION_DB_PATH", "/data/telematics.db"),
+        telematics_db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
+        pi_location_db_path=os.getenv(
+            "PI_LOCATION_DB_PATH",
+            os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
+        ),
         pi_location_cache_path=os.getenv(
             "PI_LOCATION_CACHE_PATH",
             "/data/telematics_last_locked.json",
@@ -1005,13 +1011,52 @@ def _read_last_locked_gps_from_db(db_path: str, lock_timeout_seconds: float) -> 
     return lat, lon, gps_timestamp
 
 
+def _read_pi_gps_from_telematics_db(
+    db_path: str,
+    lock_timeout_seconds: float,
+) -> dict[str, Any] | None:
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    read_only_uri = f"file:{_urlquote(db_path)}?mode=ro"
+    with _sqlite3.connect(
+        read_only_uri,
+        uri=True,
+        timeout=max(0.05, lock_timeout_seconds),
+    ) as conn:
+        row = conn.execute(
+            """
+            SELECT lat, lon, captured_at_utc
+            FROM gps_points
+            WHERE fix_status = 'locked'
+            ORDER BY captured_at_utc DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    latitude, longitude, captured_at_utc = row
+    if latitude is None or longitude is None:
+        return None
+
+    return {
+        "latitude": latitude,
+        "longitude": longitude,
+        "speed_kmh": None,
+        "fix_status": "locked",
+        "captured_at_utc": captured_at_utc,
+    }
+
+
 async def _collect_pi_location(config: Config) -> dict[str, Any]:
     def _from_cache() -> tuple[Any, Any, str | None] | None:
         return _read_pi_location_from_cache(config.pi_location_cache_path)
 
     def _from_db() -> tuple[Any, Any, str | None] | None:
         return _read_last_locked_gps_from_db(
-            db_path=config.pi_location_db_path,
+            db_path=config.telematics_db_path,
             lock_timeout_seconds=config.pi_location_query_timeout_seconds,
         )
 
@@ -1332,8 +1377,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
         sensors.append(sensor_payload)
 
     pi_location = await _collect_pi_location(config)
-
-    return {
+    payload: dict[str, Any] = {
         "vehicle_id": config.vehicle_id,
         "pi_id": config.pi_id,
         "captured_at_utc": _utc_now_iso(),
@@ -1343,6 +1387,23 @@ async def collect_payload(config: Config) -> dict[str, Any]:
         "sensors": sensors,
         "pi_location": pi_location,
     }
+
+    try:
+        pi_gps = await asyncio.wait_for(
+            asyncio.to_thread(
+                _read_pi_gps_from_telematics_db,
+                config.telematics_db_path,
+                config.pi_location_query_timeout_seconds,
+            ),
+            timeout=config.pi_location_query_timeout_seconds,
+        )
+    except Exception:
+        pi_gps = None
+
+    if pi_gps is not None:
+        payload["pi_gps"] = pi_gps
+
+    return payload
 
 
 async def run() -> None:
