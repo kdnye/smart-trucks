@@ -11,6 +11,7 @@ RUN apt-get update \
 
 COPY ble-calibration/requirements.txt .
 RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+RUN for f in /wheels/*armv8l.whl; do mv "$f" "${f%armv8l.whl}armv7l.whl" 2>/dev/null || true; done
 
 FROM balenalib/raspberrypi3-python:3.11-run
 
