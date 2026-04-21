@@ -185,6 +185,17 @@ The following patterns are expected during supervised updates and should not be 
      * Validate `UPS_SHUNT_OHMS` matches your physical INA219 shunt value.
      * Reconfirm INA219 address and wiring (default candidate list: `0x43,0x40,0x41,0x44,0x45`).
 
+4. **BLE scan start contention (`org.bluez.Error.InProgress`)**
+   * Signatures:
+     * `org.bluez.Error.InProgress`
+     * `BlueZ scan-start contention detected`
+   * Recovery order:
+     1. First, restart only the `ble-sensor` service.
+     2. If BLE scan start remains stuck, reboot the device from the Balena Dashboard to power-cycle `hci0`.
+   * Prevention:
+     * Avoid force-killing the scanner container during an active scan when possible.
+     * Prefer graceful stop/redeploy paths so BlueZ can release scan state cleanly.
+
 ### Alerting policy reminder
 
 Operational alert transport should remain account-managed and routed through **Postmark**.
