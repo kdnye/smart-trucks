@@ -85,5 +85,23 @@ services:
       - SCAN_DURATION_SECONDS=20
       - POLL_INTERVAL=60
 
+  imu-calibration:
+    build:
+      context: .
+      dockerfile: imu-calibration/Dockerfile
+    privileged: true
+    restart: "no"
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"
+    volumes:
+      - telematics_data:/data
+    ports:
+      - "8085:8080"
+    environment:
+      - UDEV=1
+      - VEHICLE_ID=${VEHICLE_ID}
+      - IMU_I2C_BUS=${IMU_I2C_BUS:-1}
+      - IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS=${IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS:-0.05}
+
 volumes:
   telematics_data:
