@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import sys
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -13,6 +14,14 @@ import aiosqlite
 from aiohttp import web
 
 from imu_reader import IMUReader
+
+ENABLE_CALIBRATION = os.getenv("ENABLE_CALIBRATION", "")
+if ENABLE_CALIBRATION.lower() != "true":
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    logging.getLogger(__name__).info(
+        "imu-calibration is dormant by default; set ENABLE_CALIBRATION=true to run this container."
+    )
+    sys.exit(0)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)

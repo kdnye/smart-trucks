@@ -202,6 +202,11 @@ An optional `imu-calibration` service can be launched independently from Balena 
 - Local SQLite WAL data capture to `/data/imu-calibration.db` (`calibration_sessions`, `imu_samples`, `calibration_marks`).
 - Session/event labels can later be converted into a truth-table style profile JSON for telematics tuning.
 
+### Operational trigger (dormant by default)
+- `imu-calibration` starts in dormant mode unless `ENABLE_CALIBRATION=true`.
+- In Balena, set `ENABLE_CALIBRATION=true` as a **service-scoped device variable** targeting only the `imu-calibration` service when you want to run a calibration session.
+- After calibration completes, reset or remove that service variable so the container returns to dormant behavior.
+
 ### Suggested field workflow
 1. Pause heavier containers in Balena (optional for resource headroom).
 2. Start only `imu-calibration`.
@@ -234,6 +239,11 @@ An optional `ble-calibration` service is available for per-device BLE environmen
   - `ble_grid_state`
   - `ble_captures`
 - Per-beacon local path-loss fit for clear and obstructed paths (`RSSI = intercept + slope*log10(distance_m)`) with an obstruction offset estimate.
+
+### Operational trigger (dormant by default)
+- `ble-calibration` starts in dormant mode unless `ENABLE_CALIBRATION=true`.
+- In Balena, set `ENABLE_CALIBRATION=true` as a **service-scoped device variable** targeting only the `ble-calibration` service when you need a BLE calibration run.
+- After the run completes, reset or remove that service variable to restore dormant-by-default operation.
 
 ### Suggested workflow
 1. Pause heavy containers in Balena (optional).
