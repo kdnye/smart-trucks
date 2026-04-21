@@ -40,7 +40,7 @@ class BleLocalQueueTests(unittest.TestCase):
             rows = ble_sensor_main._get_pending_scan_payloads(db_path, limit=10)
 
             self.assertEqual(len(rows), 1)
-            _, _, payload_json = rows[0]
+            _, _, payload_json, _ = rows[0]
             stored_payload = json.loads(payload_json)
             self.assertEqual(stored_payload["captured_at_utc"], payload["captured_at_utc"])
             self.assertEqual(stored_payload["sensor_count"], 0)
@@ -84,6 +84,9 @@ class MacNormalizationTests(unittest.TestCase):
             resolver_candidate_window_seconds=60,
             resolver_tie_epsilon=0.02,
             resolver_stationary_mode_enabled=False,
+            upload_batch_max_bytes=200000,
+            upload_backoff_initial_seconds=5,
+            upload_backoff_max_seconds=300,
         )
         self.assertEqual(
             ble_sensor_main._normalize_mac("e45f01aabbcc", config),
@@ -148,10 +151,146 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     resolver_candidate_window_seconds=60,
                     resolver_tie_epsilon=0.02,
                     resolver_stationary_mode_enabled=False,
+                    upload_batch_max_bytes=200000,
+                    upload_backoff_initial_seconds=5,
+                    upload_backoff_max_seconds=300,
                 )
                 await ble_sensor_main._flush_pending_scan_payloads(None, config)
             finally:
                 ble_sensor_main.push_to_cloud = original_push
+
+            self.assertEqual(
+                len(ble_sensor_main._get_pending_scan_payloads(db_path, limit=10)),
+                0,
+            )
+
+    async def test_flush_batch_partial_ack_marks_only_successful_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "ble-test.db")
+            ble_sensor_main._init_local_store(db_path)
+            for second in ("00", "01"):
+                ble_sensor_main._queue_scan_payload(
+                    db_path,
+                    {
+                        "vehicle_id": "truck-1",
+                        "captured_at_utc": f"2026-04-20T00:00:{second}+00:00",
+                        "event_type": "ble_sensor_scan",
+                        "sensor_count": 1,
+                        "scan_duration_seconds": 20,
+                        "sensors": [{"device_id": f"abc-{second}"}],
+                        "pi_location": {"latitude": None, "longitude": None},
+                    },
+                )
+
+            async def _batch_partial(_session, _payload, _config):
+                return True, {2}
+
+            original_batch = ble_sensor_main._post_scan_batch
+            ble_sensor_main._post_scan_batch = _batch_partial
+            try:
+                config = ble_sensor_main.Config(
+                    webhook_url="https://example.test/ingest",
+                    vehicle_id="truck-1",
+                    post_interval_seconds=60,
+                    scan_duration_seconds=20,
+                    api_key="",
+                    request_timeout_seconds=10,
+                    anonymize_mac=True,
+                    mac_hash_salt="salt",
+                    include_name=False,
+                    max_devices_per_scan=0,
+                    key_beacon_uuids=frozenset(),
+                    key_beacon_manufacturer_ids=frozenset(),
+                    scan_contention_backoff_cap_seconds=12,
+                    scan_contention_cooldown_threshold=3,
+                    local_db_path=db_path,
+                    upload_batch_size=25,
+                    pi_location_db_path="/data/telematics.db",
+                    pi_location_cache_path="/data/telematics_last_locked.json",
+                    pi_location_query_timeout_seconds=0.25,
+                    pi_location_stale_after_seconds=180,
+                    pi_id="pi-a",
+                    tracked_asset_registry_path="/tmp/tracked-assets.json",
+                    resolver_candidate_window_seconds=60,
+                    resolver_tie_epsilon=0.02,
+                    resolver_stationary_mode_enabled=False,
+                    upload_batch_max_bytes=200000,
+                    upload_backoff_initial_seconds=1,
+                    upload_backoff_max_seconds=8,
+                )
+                await ble_sensor_main._flush_pending_scan_payloads(None, config)
+            finally:
+                ble_sensor_main._post_scan_batch = original_batch
+
+            with sqlite3.connect(db_path) as conn:
+                pending = conn.execute(
+                    "SELECT id FROM ble_scan_events WHERE sent_at_utc IS NULL ORDER BY id ASC"
+                ).fetchall()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(int(pending[0][0]), 2)
+
+    async def test_flush_batch_failure_falls_back_to_single_uploads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "ble-test.db")
+            ble_sensor_main._init_local_store(db_path)
+            ble_sensor_main._queue_scan_payload(
+                db_path,
+                {
+                    "vehicle_id": "truck-1",
+                    "captured_at_utc": "2026-04-20T00:00:00+00:00",
+                    "event_type": "ble_sensor_scan",
+                    "sensor_count": 1,
+                    "scan_duration_seconds": 20,
+                    "sensors": [{"device_id": "abc"}],
+                    "pi_location": {"latitude": None, "longitude": None},
+                },
+            )
+
+            async def _batch_fail(_session, _payload, _config):
+                return False, None
+
+            async def _single_ok(_session, _payload, _config):
+                return True
+
+            original_batch = ble_sensor_main._post_scan_batch
+            original_single = ble_sensor_main.push_to_cloud
+            ble_sensor_main._post_scan_batch = _batch_fail
+            ble_sensor_main.push_to_cloud = _single_ok
+            try:
+                config = ble_sensor_main.Config(
+                    webhook_url="https://example.test/ingest",
+                    vehicle_id="truck-1",
+                    post_interval_seconds=60,
+                    scan_duration_seconds=20,
+                    api_key="",
+                    request_timeout_seconds=10,
+                    anonymize_mac=True,
+                    mac_hash_salt="salt",
+                    include_name=False,
+                    max_devices_per_scan=0,
+                    key_beacon_uuids=frozenset(),
+                    key_beacon_manufacturer_ids=frozenset(),
+                    scan_contention_backoff_cap_seconds=12,
+                    scan_contention_cooldown_threshold=3,
+                    local_db_path=db_path,
+                    upload_batch_size=25,
+                    pi_location_db_path="/data/telematics.db",
+                    pi_location_cache_path="/data/telematics_last_locked.json",
+                    pi_location_query_timeout_seconds=0.25,
+                    pi_location_stale_after_seconds=180,
+                    pi_id="pi-a",
+                    tracked_asset_registry_path="/tmp/tracked-assets.json",
+                    resolver_candidate_window_seconds=60,
+                    resolver_tie_epsilon=0.02,
+                    resolver_stationary_mode_enabled=False,
+                    upload_batch_max_bytes=200000,
+                    upload_backoff_initial_seconds=5,
+                    upload_backoff_max_seconds=300,
+                )
+                await ble_sensor_main._flush_pending_scan_payloads(None, config)
+            finally:
+                ble_sensor_main._post_scan_batch = original_batch
+                ble_sensor_main.push_to_cloud = original_single
 
             self.assertEqual(
                 len(ble_sensor_main._get_pending_scan_payloads(db_path, limit=10)),
@@ -222,6 +361,9 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 resolver_candidate_window_seconds=60,
                 resolver_tie_epsilon=0.02,
                 resolver_stationary_mode_enabled=False,
+            upload_batch_max_bytes=200000,
+            upload_backoff_initial_seconds=5,
+            upload_backoff_max_seconds=300,
             )
 
             pi_location = await ble_sensor_main._collect_pi_location(config)
@@ -258,6 +400,9 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 resolver_candidate_window_seconds=60,
                 resolver_tie_epsilon=0.02,
                 resolver_stationary_mode_enabled=False,
+            upload_batch_max_bytes=200000,
+            upload_backoff_initial_seconds=5,
+            upload_backoff_max_seconds=300,
             )
 
             pi_location = await ble_sensor_main._collect_pi_location(config)
@@ -309,6 +454,9 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 resolver_candidate_window_seconds=60,
                 resolver_tie_epsilon=0.05,
                 resolver_stationary_mode_enabled=False,
+            upload_batch_max_bytes=200000,
+            upload_backoff_initial_seconds=5,
+            upload_backoff_max_seconds=300,
             )
             ble_sensor_main._init_local_store(db_path)
             ble_sensor_main._sync_tracked_asset_registry(config)
@@ -395,6 +543,9 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 resolver_candidate_window_seconds=60,
                 resolver_tie_epsilon=0.2,
                 resolver_stationary_mode_enabled=False,
+            upload_batch_max_bytes=200000,
+            upload_backoff_initial_seconds=5,
+            upload_backoff_max_seconds=300,
             )
             ble_sensor_main._init_local_store(db_path)
             ble_sensor_main._sync_tracked_asset_registry(config)
