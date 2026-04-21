@@ -593,13 +593,13 @@ def _init_local_store(db_path: str) -> None:
             ON ble_scan_events(sent_at_utc, captured_at_utc);
             """
         )
+        _ensure_column(conn, "ble_scan_events", "next_retry_at_utc", "TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_ble_scan_events_retry
             ON ble_scan_events(sent_at_utc, next_retry_at_utc, captured_at_utc);
             """
         )
-        _ensure_column(conn, "ble_scan_events", "next_retry_at_utc", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ble_device_observations (
