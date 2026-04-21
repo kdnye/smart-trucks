@@ -31,6 +31,7 @@ class Config:
     key_beacon_manufacturer_ids: frozenset[int]
     scan_contention_backoff_cap_seconds: float
     scan_contention_cooldown_threshold: int
+    scan_contention_max_attempts_before_reset: int
     local_db_path: str
     upload_batch_size: int
     pi_location_db_path: str
@@ -93,6 +94,10 @@ def load_config() -> Config:
         scan_contention_cooldown_threshold=max(
             1,
             int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
+        ),
+        scan_contention_max_attempts_before_reset=max(
+            1,
+            int(os.getenv("SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", "10")),
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
@@ -1351,6 +1356,13 @@ async def run() -> None:
             "Warning: ANONYMIZE_MAC=true but MAC_HASH_SALT is empty. "
             "Set a unique secret salt per deployment for stronger privacy guarantees."
         )
+
+    print(
+        "BLE scan contention config: "
+        f"backoff_cap={config.scan_contention_backoff_cap_seconds}s, "
+        f"cooldown_threshold={config.scan_contention_cooldown_threshold}, "
+        f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}."
+    )
 
     async with aiohttp.ClientSession() as session:
         while True:

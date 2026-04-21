@@ -73,6 +73,7 @@ class MacNormalizationTests(unittest.TestCase):
             key_beacon_manufacturer_ids=frozenset(),
             scan_contention_backoff_cap_seconds=12,
             scan_contention_cooldown_threshold=3,
+            scan_contention_max_attempts_before_reset=10,
             local_db_path=":memory:",
             upload_batch_size=25,
             pi_location_db_path="/data/telematics.db",
@@ -140,6 +141,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     key_beacon_manufacturer_ids=frozenset(),
                     scan_contention_backoff_cap_seconds=12,
                     scan_contention_cooldown_threshold=3,
+                    scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
                     pi_location_db_path="/data/telematics.db",
@@ -203,6 +205,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     key_beacon_manufacturer_ids=frozenset(),
                     scan_contention_backoff_cap_seconds=12,
                     scan_contention_cooldown_threshold=3,
+                    scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
                     pi_location_db_path="/data/telematics.db",
@@ -272,6 +275,7 @@ class BleFlushTests(unittest.IsolatedAsyncioTestCase):
                     key_beacon_manufacturer_ids=frozenset(),
                     scan_contention_backoff_cap_seconds=12,
                     scan_contention_cooldown_threshold=3,
+                    scan_contention_max_attempts_before_reset=10,
                     local_db_path=db_path,
                     upload_batch_size=25,
                     pi_location_db_path="/data/telematics.db",
@@ -350,6 +354,7 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 key_beacon_manufacturer_ids=frozenset(),
                 scan_contention_backoff_cap_seconds=12,
                 scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=10,
                 local_db_path=str(Path(tmpdir) / "ble.db"),
                 upload_batch_size=25,
                 pi_location_db_path=telematics_db_path,
@@ -389,6 +394,7 @@ class PiLocationTests(unittest.IsolatedAsyncioTestCase):
                 key_beacon_manufacturer_ids=frozenset(),
                 scan_contention_backoff_cap_seconds=12,
                 scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=10,
                 local_db_path=str(Path(tmpdir) / "ble.db"),
                 upload_batch_size=25,
                 pi_location_db_path=str(Path(tmpdir) / "missing.db"),
@@ -443,6 +449,7 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 key_beacon_manufacturer_ids=frozenset(),
                 scan_contention_backoff_cap_seconds=12,
                 scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=10,
                 local_db_path=db_path,
                 upload_batch_size=25,
                 pi_location_db_path=str(Path(tmpdir) / "telematics.db"),
@@ -532,6 +539,7 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 key_beacon_manufacturer_ids=frozenset(),
                 scan_contention_backoff_cap_seconds=12,
                 scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=10,
                 local_db_path=db_path,
                 upload_batch_size=25,
                 pi_location_db_path=str(Path(tmpdir) / "telematics.db"),
@@ -543,9 +551,9 @@ class TrackedAssetResolverTests(unittest.TestCase):
                 resolver_candidate_window_seconds=60,
                 resolver_tie_epsilon=0.2,
                 resolver_stationary_mode_enabled=False,
-            upload_batch_max_bytes=200000,
-            upload_backoff_initial_seconds=5,
-            upload_backoff_max_seconds=300,
+                upload_batch_max_bytes=200000,
+                upload_backoff_initial_seconds=5,
+                upload_backoff_max_seconds=300,
             )
             ble_sensor_main._init_local_store(db_path)
             ble_sensor_main._sync_tracked_asset_registry(config)
@@ -574,6 +582,77 @@ class TrackedAssetResolverTests(unittest.TestCase):
             assert row is not None
             self.assertEqual(row[0], "lexicographic_pi_tiebreak")
             self.assertEqual(row[1], "pi-a")
+
+
+class BleScanContentionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_contention_path_does_not_raise_attribute_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(Path(tmpdir) / "ble-test.db")
+            config = ble_sensor_main.Config(
+                webhook_url="https://example.test/ingest",
+                vehicle_id="truck-1",
+                post_interval_seconds=60,
+                scan_duration_seconds=20,
+                api_key="",
+                request_timeout_seconds=10,
+                anonymize_mac=True,
+                mac_hash_salt="salt",
+                include_name=False,
+                max_devices_per_scan=0,
+                key_beacon_uuids=frozenset(),
+                key_beacon_manufacturer_ids=frozenset(),
+                scan_contention_backoff_cap_seconds=12,
+                scan_contention_cooldown_threshold=3,
+                scan_contention_max_attempts_before_reset=2,
+                local_db_path=db_path,
+                upload_batch_size=25,
+                pi_location_db_path="/data/telematics.db",
+                pi_location_cache_path="/data/telematics_last_locked.json",
+                pi_location_query_timeout_seconds=0.25,
+                pi_location_stale_after_seconds=180,
+                pi_id="pi-a",
+                tracked_asset_registry_path="/tmp/tracked-assets.json",
+                resolver_candidate_window_seconds=60,
+                resolver_tie_epsilon=0.02,
+                resolver_stationary_mode_enabled=False,
+                upload_batch_max_bytes=200000,
+                upload_backoff_initial_seconds=5,
+                upload_backoff_max_seconds=300,
+            )
+
+            async def _contention(*_args, **_kwargs):
+                raise RuntimeError("org.bluez.Error.InProgress")
+
+            class _FakeClientSession:
+                async def __aenter__(self):
+                    return object()
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return False
+
+            async def _interrupting_sleep(_seconds):
+                raise KeyboardInterrupt()
+
+            original_load_config = ble_sensor_main.load_config
+            original_collect_payload = ble_sensor_main.collect_payload
+            original_client_session = ble_sensor_main.aiohttp.ClientSession
+            original_sleep = ble_sensor_main.asyncio.sleep
+            original_uniform = ble_sensor_main.random.uniform
+            try:
+                ble_sensor_main.load_config = lambda: config
+                ble_sensor_main.collect_payload = _contention
+                ble_sensor_main.aiohttp.ClientSession = lambda: _FakeClientSession()
+                ble_sensor_main.asyncio.sleep = _interrupting_sleep
+                ble_sensor_main.random.uniform = lambda _a, _b: 0.0
+
+                with self.assertRaises(KeyboardInterrupt):
+                    await ble_sensor_main.run()
+            finally:
+                ble_sensor_main.load_config = original_load_config
+                ble_sensor_main.collect_payload = original_collect_payload
+                ble_sensor_main.aiohttp.ClientSession = original_client_session
+                ble_sensor_main.asyncio.sleep = original_sleep
+                ble_sensor_main.random.uniform = original_uniform
 
 
 if __name__ == "__main__":
