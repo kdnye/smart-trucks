@@ -32,6 +32,10 @@ class Config:
     scan_contention_cooldown_threshold: int
     local_db_path: str
     upload_batch_size: int
+    pi_location_db_path: str
+    pi_location_cache_path: str
+    pi_location_query_timeout_seconds: float
+    pi_location_stale_after_seconds: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -83,6 +87,19 @@ def load_config() -> Config:
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
+        pi_location_db_path=os.getenv("PI_LOCATION_DB_PATH", "/data/telematics.db"),
+        pi_location_cache_path=os.getenv(
+            "PI_LOCATION_CACHE_PATH",
+            "/data/telematics_last_locked.json",
+        ),
+        pi_location_query_timeout_seconds=max(
+            0.05,
+            float(os.getenv("PI_LOCATION_QUERY_TIMEOUT_SECONDS", "0.25")),
+        ),
+        pi_location_stale_after_seconds=max(
+            30,
+            int(os.getenv("PI_LOCATION_STALE_AFTER_SECONDS", "180")),
+        ),
     )
 
 
@@ -536,6 +553,154 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso_utc(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _empty_pi_location() -> dict[str, Any]:
+    return {
+        "latitude": None,
+        "longitude": None,
+        "fix_status": "stale_or_unknown",
+        "gps_timestamp": None,
+        "source": "telematics.db:last_locked",
+        "location_age_sec": None,
+    }
+
+
+def _pi_location_from_last_locked(
+    *,
+    latitude: Any,
+    longitude: Any,
+    gps_timestamp: str | None,
+    stale_after_seconds: int,
+) -> dict[str, Any]:
+    location = _empty_pi_location()
+    location["latitude"] = latitude
+    location["longitude"] = longitude
+    location["gps_timestamp"] = gps_timestamp
+
+    gps_dt = _parse_iso_utc(gps_timestamp)
+    if gps_dt is None:
+        return location
+
+    location_age_sec = max(0, int((datetime.now(timezone.utc) - gps_dt).total_seconds()))
+    location["location_age_sec"] = location_age_sec
+    if location_age_sec <= stale_after_seconds:
+        location["fix_status"] = "locked"
+    return location
+
+
+def _read_pi_location_from_cache(cache_path: str) -> tuple[Any, Any, str | None] | None:
+    if not os.path.exists(cache_path):
+        return None
+
+    with open(cache_path, encoding="utf-8") as cache_file:
+        payload = json.load(cache_file)
+
+    if not isinstance(payload, dict):
+        return None
+
+    latitude = payload.get("latitude")
+    if latitude is None:
+        latitude = payload.get("lat")
+
+    longitude = payload.get("longitude")
+    if longitude is None:
+        longitude = payload.get("lon")
+
+    gps_timestamp = payload.get("gps_timestamp") or payload.get("captured_at_utc")
+    return latitude, longitude, gps_timestamp
+
+
+def _read_last_locked_gps_from_db(db_path: str, lock_timeout_seconds: float) -> tuple[Any, Any, str | None] | None:
+    if not os.path.exists(db_path):
+        return None
+
+    with _sqlite3.connect(db_path, timeout=lock_timeout_seconds) as conn:
+        cursor = conn.execute(
+            """
+            SELECT lat, lon, captured_at_utc, payload_json
+            FROM gps_points
+            WHERE fix_status = 'locked'
+            ORDER BY captured_at_utc DESC, id DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        return None
+
+    lat, lon, captured_at_utc, payload_json = row
+    gps_timestamp: str | None = captured_at_utc
+    try:
+        payload = json.loads(payload_json)
+        location_payload = payload.get("location") if isinstance(payload, dict) else None
+        if isinstance(location_payload, dict):
+            gps_timestamp = location_payload.get("gps_timestamp") or gps_timestamp
+        elif isinstance(payload, dict):
+            gps_timestamp = payload.get("gps_timestamp") or gps_timestamp
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    return lat, lon, gps_timestamp
+
+
+async def _collect_pi_location(config: Config) -> dict[str, Any]:
+    def _from_cache() -> tuple[Any, Any, str | None] | None:
+        return _read_pi_location_from_cache(config.pi_location_cache_path)
+
+    def _from_db() -> tuple[Any, Any, str | None] | None:
+        return _read_last_locked_gps_from_db(
+            db_path=config.pi_location_db_path,
+            lock_timeout_seconds=config.pi_location_query_timeout_seconds,
+        )
+
+    location: tuple[Any, Any, str | None] | None = None
+    try:
+        location = await asyncio.wait_for(
+            asyncio.to_thread(_from_cache),
+            timeout=config.pi_location_query_timeout_seconds,
+        )
+    except Exception:
+        location = None
+
+    if location is None:
+        try:
+            location = await asyncio.wait_for(
+                asyncio.to_thread(_from_db),
+                timeout=config.pi_location_query_timeout_seconds,
+            )
+        except Exception:
+            location = None
+
+    if location is None:
+        return _empty_pi_location()
+
+    latitude, longitude, gps_timestamp = location
+    return _pi_location_from_last_locked(
+        latitude=latitude,
+        longitude=longitude,
+        gps_timestamp=gps_timestamp,
+        stale_after_seconds=config.pi_location_stale_after_seconds,
+    )
+
+
 def _queue_scan_payload(db_path: str, payload: dict[str, Any]) -> None:
     with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -668,6 +833,8 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
         sensors.append(sensor_payload)
 
+    pi_location = await _collect_pi_location(config)
+
     return {
         "vehicle_id": config.vehicle_id,
         "captured_at_utc": _utc_now_iso(),
@@ -675,6 +842,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
         "scan_duration_seconds": config.scan_duration_seconds,
         "sensor_count": len(sensors),
         "sensors": sensors,
+        "pi_location": pi_location,
     }
 
 
