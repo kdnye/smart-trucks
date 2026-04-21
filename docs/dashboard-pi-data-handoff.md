@@ -2,6 +2,8 @@
 
 This summary is intended for the dashboard repository so UI work can proceed without re-reading the edge collector code.
 
+For the dedicated tracked-asset data model and admin CRUD surface (dashboard-side DB/API/UI), see **[dashboard-tracked-assets-spec.md](./dashboard-tracked-assets-spec.md)**.
+
 ## 1) Data streams emitted from the Pi stack
 
 ### A) `telematics-edge` heartbeat payload (GPS + IMU + power)

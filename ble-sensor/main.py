@@ -5,6 +5,7 @@ import json
 import os
 import random
 import sqlite3 as _sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -30,12 +31,21 @@ class Config:
     key_beacon_manufacturer_ids: frozenset[int]
     scan_contention_backoff_cap_seconds: float
     scan_contention_cooldown_threshold: int
+    scan_contention_max_attempts_before_reset: int
     local_db_path: str
     upload_batch_size: int
     pi_location_db_path: str
     pi_location_cache_path: str
     pi_location_query_timeout_seconds: float
     pi_location_stale_after_seconds: int
+    pi_id: str
+    tracked_asset_registry_path: str
+    resolver_candidate_window_seconds: int
+    resolver_tie_epsilon: float
+    resolver_stationary_mode_enabled: bool
+    upload_batch_max_bytes: int
+    upload_backoff_initial_seconds: int
+    upload_backoff_max_seconds: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -85,6 +95,10 @@ def load_config() -> Config:
             1,
             int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
         ),
+        scan_contention_max_attempts_before_reset=max(
+            1,
+            int(os.getenv("SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", "10")),
+        ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
         pi_location_db_path=os.getenv("PI_LOCATION_DB_PATH", "/data/telematics.db"),
@@ -100,6 +114,26 @@ def load_config() -> Config:
             30,
             int(os.getenv("PI_LOCATION_STALE_AFTER_SECONDS", "180")),
         ),
+        pi_id=os.getenv("PI_ID") or os.getenv("HOSTNAME") or "unknown-pi",
+        tracked_asset_registry_path=os.getenv(
+            "TRACKED_ASSET_REGISTRY_PATH",
+            "/data/tracked-assets-registry.json",
+        ),
+        resolver_candidate_window_seconds=max(
+            5,
+            int(os.getenv("RESOLVER_CANDIDATE_WINDOW_SECONDS", "60")),
+        ),
+        resolver_tie_epsilon=max(
+            0.0,
+            float(os.getenv("RESOLVER_TIE_EPSILON", "0.02")),
+        ),
+        resolver_stationary_mode_enabled=_to_bool(
+            os.getenv("RESOLVER_STATIONARY_MODE_ENABLED", "false"),
+            default=False,
+        ),
+        upload_batch_max_bytes=max(1024, int(os.getenv("UPLOAD_BATCH_MAX_BYTES", "200000"))),
+        upload_backoff_initial_seconds=max(1, int(os.getenv("UPLOAD_BACKOFF_INITIAL_SECONDS", "5"))),
+        upload_backoff_max_seconds=max(5, int(os.getenv("UPLOAD_BACKOFF_MAX_SECONDS", "300"))),
     )
 
 
@@ -408,17 +442,28 @@ KNOWN_OUIS = {
 }
 
 
+def _canonicalize_mac_address(mac_address: str) -> str:
+    """Return MAC as canonical uppercase colon-delimited hex when possible."""
+    stripped = "".join(ch for ch in (mac_address or "") if ch.isalnum())
+    if len(stripped) == 12 and all(ch in "0123456789abcdefABCDEF" for ch in stripped):
+        octets = [stripped[i : i + 2].upper() for i in range(0, 12, 2)]
+        return ":".join(octets)
+
+    return (mac_address or "").upper()
+
+
 def _normalize_mac(mac_address: str, config: Config) -> str:
     """
     Return a stable, privacy-preserving identifier for each device by default.
     Set ANONYMIZE_MAC=false to send raw MAC addresses when explicitly required.
     """
+    canonical_mac = _canonicalize_mac_address(mac_address)
     if not config.anonymize_mac:
-        return mac_address
+        return canonical_mac
 
     digest = hmac.new(
         key=config.mac_hash_salt.encode("utf-8"),
-        msg=mac_address.lower().encode("utf-8"),
+        msg=canonical_mac.lower().encode("utf-8"),
         digestmod=hashlib.sha256,
     ).hexdigest()
     return digest[:20]
@@ -492,7 +537,7 @@ def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> st
     if "0201060303AAFE" in mfg_hex_dump:
         return "Eddystone Beacon"
 
-    oui = mac_address.upper()[:8]
+    oui = _canonicalize_mac_address(mac_address)[:8]
     return KNOWN_OUIS.get(oui, "Unknown")
 
 
@@ -537,7 +582,8 @@ def _init_local_store(db_path: str) -> None:
                 payload_json TEXT NOT NULL,
                 sent_at_utc TEXT,
                 attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
+                last_error TEXT,
+                next_retry_at_utc TEXT
             );
             """
         )
@@ -547,10 +593,79 @@ def _init_local_store(db_path: str) -> None:
             ON ble_scan_events(sent_at_utc, captured_at_utc);
             """
         )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ble_scan_events_retry
+            ON ble_scan_events(sent_at_utc, next_retry_at_utc, captured_at_utc);
+            """
+        )
+        _ensure_column(conn, "ble_scan_events", "next_retry_at_utc", "TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ble_device_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                pi_id TEXT NOT NULL,
+                vehicle_id TEXT NOT NULL,
+                tracked_mac_normalized TEXT NOT NULL,
+                rssi INTEGER,
+                latitude REAL,
+                longitude REAL,
+                gps_timestamp TEXT,
+                gps_age_seconds INTEGER
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ble_observations_mac_time
+            ON ble_device_observations(tracked_mac_normalized, captured_at_utc DESC);
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_asset_registry (
+                tracked_mac_normalized TEXT PRIMARY KEY,
+                label TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tracked_asset_resolutions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                tracked_mac_normalized TEXT NOT NULL,
+                vehicle_id TEXT NOT NULL,
+                resolved_pi_id TEXT,
+                resolved_latitude REAL,
+                resolved_longitude REAL,
+                resolution_method TEXT NOT NULL,
+                candidate_count INTEGER NOT NULL,
+                confidence_score REAL NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tracked_asset_resolutions_lookup
+            ON tracked_asset_resolutions(tracked_mac_normalized, captured_at_utc DESC);
+            """
+        )
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_column(conn: _sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
+    existing_columns = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table_name})")  # nosec B608
+    }
+    if column_name not in existing_columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")  # nosec B608
 
 
 def _parse_iso_utc(raw: str | None) -> datetime | None:
@@ -569,6 +684,235 @@ def _parse_iso_utc(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _load_tracked_assets_from_registry(path: str) -> list[tuple[str, str | None, int]]:
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as registry_file:
+        raw = json.load(registry_file)
+    if not isinstance(raw, list):
+        return []
+
+    rows: list[tuple[str, str | None, int]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        mac = _canonicalize_mac_address(str(item.get("ble_mac_normalized", "")))
+        if len(mac) != 17:
+            continue
+        label = item.get("label")
+        active = 1 if item.get("active", True) else 0
+        rows.append((mac, str(label) if label is not None else None, active))
+    return rows
+
+
+def _sync_tracked_asset_registry(config: Config) -> None:
+    tracked_rows = _load_tracked_assets_from_registry(config.tracked_asset_registry_path)
+    if not tracked_rows:
+        return
+
+    with _sqlite3.connect(config.local_db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executemany(
+            """
+            INSERT INTO tracked_asset_registry (tracked_mac_normalized, label, active)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tracked_mac_normalized)
+            DO UPDATE SET label = excluded.label, active = excluded.active
+            """,
+            tracked_rows,
+        )
+
+
+def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
+    captured_at_utc = str(payload.get("captured_at_utc") or _utc_now_iso())
+    pi_id = str(payload.get("pi_id") or "unknown-pi")
+    vehicle_id = str(payload.get("vehicle_id") or "UNKNOWN_TRUCK")
+    pi_location = payload.get("pi_location") if isinstance(payload.get("pi_location"), dict) else {}
+    latitude = pi_location.get("latitude") if isinstance(pi_location, dict) else None
+    longitude = pi_location.get("longitude") if isinstance(pi_location, dict) else None
+    gps_timestamp = pi_location.get("gps_timestamp") if isinstance(pi_location, dict) else None
+    gps_age_seconds = pi_location.get("location_age_sec") if isinstance(pi_location, dict) else None
+
+    rows: list[tuple[Any, ...]] = []
+    sensors = payload.get("sensors")
+    if not isinstance(sensors, list):
+        return
+    for sensor in sensors:
+        if not isinstance(sensor, dict):
+            continue
+        normalized_mac = _canonicalize_mac_address(str(sensor.get("mac_address", "")))
+        if len(normalized_mac) != 17:
+            continue
+        rows.append(
+            (
+                captured_at_utc,
+                pi_id,
+                vehicle_id,
+                normalized_mac,
+                sensor.get("rssi"),
+                latitude,
+                longitude,
+                gps_timestamp,
+                gps_age_seconds,
+            )
+        )
+    if not rows:
+        return
+
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.executemany(
+            """
+            INSERT INTO ble_device_observations (
+                captured_at_utc, pi_id, vehicle_id, tracked_mac_normalized, rssi,
+                latitude, longitude, gps_timestamp, gps_age_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+
+
+def _score_candidate(
+    *,
+    rssi: int | None,
+    scan_age_seconds: float,
+    gps_age_seconds: int | None,
+    candidate_window_seconds: int,
+    gps_stale_after_seconds: int,
+) -> float:
+    bounded_rssi = max(-100, min(-30, int(rssi if rssi is not None else -100)))
+    rssi_score = (bounded_rssi + 100) / 70
+    scan_score = max(0.0, 1.0 - (scan_age_seconds / max(1, candidate_window_seconds)))
+    if gps_age_seconds is None:
+        gps_score = 0.0
+    else:
+        gps_score = max(0.0, 1.0 - (gps_age_seconds / max(1, gps_stale_after_seconds)))
+    return (0.5 * rssi_score) + (0.3 * scan_score) + (0.2 * gps_score)
+
+
+def _resolve_tracked_asset_positions(config: Config) -> None:
+    now = datetime.now(timezone.utc)
+    with _sqlite3.connect(config.local_db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        tracked_assets = conn.execute(
+            """
+            SELECT tracked_mac_normalized
+            FROM tracked_asset_registry
+            WHERE active = 1
+            """
+        ).fetchall()
+        for (tracked_mac,) in tracked_assets:
+            candidate_rows = conn.execute(
+                """
+                SELECT id, captured_at_utc, pi_id, rssi, latitude, longitude, gps_age_seconds
+                FROM ble_device_observations
+                WHERE tracked_mac_normalized = ?
+                ORDER BY captured_at_utc DESC, id DESC
+                LIMIT 200
+                """,
+                (tracked_mac,),
+            ).fetchall()
+            if not candidate_rows:
+                continue
+
+            latest_dt = _parse_iso_utc(str(candidate_rows[0][1]))
+            if latest_dt is None:
+                continue
+            candidates: list[dict[str, Any]] = []
+            for row in candidate_rows:
+                captured_dt = _parse_iso_utc(str(row[1]))
+                if captured_dt is None:
+                    continue
+                age_from_latest = (latest_dt - captured_dt).total_seconds()
+                if age_from_latest > config.resolver_candidate_window_seconds:
+                    continue
+                score = _score_candidate(
+                    rssi=int(row[3]) if row[3] is not None else None,
+                    scan_age_seconds=max(0.0, (now - captured_dt).total_seconds()),
+                    gps_age_seconds=int(row[6]) if row[6] is not None else None,
+                    candidate_window_seconds=config.resolver_candidate_window_seconds,
+                    gps_stale_after_seconds=config.pi_location_stale_after_seconds,
+                )
+                candidates.append(
+                    {
+                        "captured_at_utc": str(row[1]),
+                        "pi_id": str(row[2]),
+                        "latitude": row[4],
+                        "longitude": row[5],
+                        "score": score,
+                    }
+                )
+            if not candidates:
+                continue
+
+            candidates.sort(key=lambda item: (-item["score"], item["pi_id"], item["captured_at_utc"]))
+            winner = candidates[0]
+            method = "highest_score"
+            resolved_lat = winner["latitude"]
+            resolved_lon = winner["longitude"]
+            resolved_pi_id = winner["pi_id"]
+
+            if len(candidates) > 1:
+                second = candidates[1]
+                score_delta = abs(winner["score"] - second["score"])
+                if score_delta <= config.resolver_tie_epsilon:
+                    pair_has_coords = all(
+                        value is not None
+                        for value in (
+                            winner["latitude"],
+                            winner["longitude"],
+                            second["latitude"],
+                            second["longitude"],
+                        )
+                    )
+                    if config.resolver_stationary_mode_enabled:
+                        prior = conn.execute(
+                            """
+                            SELECT resolved_pi_id, resolved_latitude, resolved_longitude
+                            FROM tracked_asset_resolutions
+                            WHERE tracked_mac_normalized = ?
+                            ORDER BY captured_at_utc DESC, id DESC
+                            LIMIT 1
+                            """,
+                            (tracked_mac,),
+                        ).fetchone()
+                        if prior:
+                            resolved_pi_id = str(prior[0]) if prior[0] is not None else resolved_pi_id
+                            resolved_lat = prior[1]
+                            resolved_lon = prior[2]
+                            method = "stationary_hold"
+                    elif pair_has_coords:
+                        resolved_lat = (float(winner["latitude"]) + float(second["latitude"])) / 2.0
+                        resolved_lon = (float(winner["longitude"]) + float(second["longitude"])) / 2.0
+                        method = "centroid_top2"
+
+                    if method not in {"stationary_hold", "centroid_top2"}:
+                        method = "lexicographic_pi_tiebreak"
+                        resolved_pi_id = min(winner["pi_id"], second["pi_id"])
+
+            confidence_score = max(0.0, min(1.0, float(winner["score"])))
+            conn.execute(
+                """
+                INSERT INTO tracked_asset_resolutions (
+                    captured_at_utc, tracked_mac_normalized, vehicle_id, resolved_pi_id,
+                    resolved_latitude, resolved_longitude, resolution_method, candidate_count,
+                    confidence_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _utc_now_iso(),
+                    tracked_mac,
+                    config.vehicle_id,
+                    resolved_pi_id,
+                    resolved_lat,
+                    resolved_lon,
+                    method,
+                    len(candidates),
+                    confidence_score,
+                ),
+            )
 
 
 def _empty_pi_location() -> dict[str, Any]:
@@ -711,23 +1055,29 @@ def _queue_scan_payload(db_path: str, payload: dict[str, Any]) -> None:
             """,
             (payload["captured_at_utc"], json.dumps(payload)),
         )
+    _record_scan_observations(db_path, payload)
 
 
 def _get_pending_scan_payloads(
     db_path: str, limit: int
-) -> list[tuple[int, str, str]]:
+) -> list[tuple[int, str, str, int]]:
+    now_utc = _utc_now_iso()
     with _sqlite3.connect(db_path, timeout=30.0) as conn:
         cursor = conn.execute(
             """
-            SELECT id, captured_at_utc, payload_json
+            SELECT id, captured_at_utc, payload_json, attempts
             FROM ble_scan_events
             WHERE sent_at_utc IS NULL
+              AND (next_retry_at_utc IS NULL OR next_retry_at_utc <= ?)
             ORDER BY captured_at_utc ASC, id ASC
             LIMIT ?
             """,
-            (limit,),
+            (now_utc, limit),
         )
-        return [(int(row[0]), str(row[1]), str(row[2])) for row in cursor.fetchall()]
+        return [
+            (int(row[0]), str(row[1]), str(row[2]), int(row[3] or 0))
+            for row in cursor.fetchall()
+        ]
 
 
 def _mark_scan_payload_sent(db_path: str, row_id: int) -> None:
@@ -735,23 +1085,119 @@ def _mark_scan_payload_sent(db_path: str, row_id: int) -> None:
         conn.execute(
             """
             UPDATE ble_scan_events
-            SET sent_at_utc = ?, last_error = NULL
+            SET sent_at_utc = ?, last_error = NULL, next_retry_at_utc = NULL
             WHERE id = ?
             """,
             (_utc_now_iso(), row_id),
         )
 
 
-def _record_scan_upload_failure(db_path: str, row_id: int, error: str) -> None:
+def _mark_scan_payloads_sent(db_path: str, row_ids: list[int]) -> None:
+    if not row_ids:
+        return
+    placeholders = ",".join("?" for _ in row_ids)
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute(
+            f"""
+            UPDATE ble_scan_events
+            SET sent_at_utc = ?, last_error = NULL, next_retry_at_utc = NULL
+            WHERE id IN ({placeholders})
+            """,
+            (_utc_now_iso(), *row_ids),
+        )
+
+
+def _record_scan_upload_failure(
+    db_path: str,
+    row_id: int,
+    error: str,
+    *,
+    attempts_so_far: int,
+    backoff_initial_seconds: int,
+    backoff_max_seconds: int,
+) -> None:
+    backoff_seconds = min(backoff_max_seconds, backoff_initial_seconds * (2 ** max(0, attempts_so_far)))
+    retry_at = datetime.now(timezone.utc).timestamp() + backoff_seconds
+    next_retry_at_utc = datetime.fromtimestamp(retry_at, tz=timezone.utc).isoformat()
     with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
         conn.execute(
             """
             UPDATE ble_scan_events
-            SET attempts = attempts + 1, last_error = ?
+            SET attempts = attempts + 1, last_error = ?, next_retry_at_utc = ?
             WHERE id = ?
             """,
-            (error[:500], row_id),
+            (error[:500], next_retry_at_utc, row_id),
         )
+
+
+def _build_scan_batch_payload(
+    pending_rows: list[tuple[int, str, str, int]],
+    max_event_count: int,
+    max_bytes: int,
+) -> tuple[list[tuple[int, str, str, int]], dict[str, Any]] | tuple[None, None]:
+    selected_rows: list[tuple[int, str, str, int]] = []
+    events: list[dict[str, Any]] = []
+    for row in pending_rows:
+        if len(selected_rows) >= max_event_count:
+            break
+        _, _, payload_json, _ = row
+        try:
+            event_payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            continue
+        candidate_events = [*events, event_payload]
+        batch_payload = {
+            "event_type": "ble_scan_batch",
+            "batch_id": str(uuid.uuid4()),
+            "events": candidate_events,
+        }
+        if len(json.dumps(batch_payload, separators=(",", ":")).encode("utf-8")) > max_bytes:
+            if not selected_rows:
+                selected_rows.append(row)
+                events.append(event_payload)
+            break
+        selected_rows.append(row)
+        events.append(event_payload)
+    if not selected_rows:
+        return None, None
+    return selected_rows, {
+        "event_type": "ble_scan_batch",
+        "batch_id": str(uuid.uuid4()),
+        "events": events,
+    }
+
+
+async def _post_scan_batch(
+    session: aiohttp.ClientSession,
+    payload: dict[str, Any],
+    config: Config,
+) -> tuple[bool, set[int] | None]:
+    if not config.webhook_url:
+        return False, None
+
+    headers = {}
+    if config.api_key:
+        headers["X-Api-Key"] = config.api_key
+    timeout = aiohttp.ClientTimeout(total=config.request_timeout_seconds)
+    try:
+        async with session.post(config.webhook_url, json=payload, headers=headers, timeout=timeout) as response:
+            response_text = await response.text()
+            if response.status >= 400:
+                print(f"Batch upload failed [{response.status}]: {response_text[:200]}")
+                return False, None
+            try:
+                response_json = json.loads(response_text) if response_text else {}
+            except json.JSONDecodeError:
+                response_json = {}
+            failed_row_ids: set[int] = set()
+            raw_failed = response_json.get("failed_row_ids")
+            if isinstance(raw_failed, list):
+                failed_row_ids = {int(item) for item in raw_failed if str(item).isdigit()}
+            print(f"BLE batch transmitted. Status: {response.status}, failed_ids={len(failed_row_ids)}")
+            return True, failed_row_ids
+    except Exception as exc:
+        print(f"Batch transmission failed: {exc}")
+        return False, None
 
 
 async def _flush_pending_scan_payloads(
@@ -761,23 +1207,74 @@ async def _flush_pending_scan_payloads(
     if not pending_rows:
         return
 
-    for row_id, captured_at_utc, payload_json in pending_rows:
+    for row_id, _, payload_json, attempts in pending_rows:
         try:
-            payload = json.loads(payload_json)
+            json.loads(payload_json)
         except json.JSONDecodeError as exc:
-            _record_scan_upload_failure(config.local_db_path, row_id, f"json_decode_error:{exc}")
-            continue
-
-        was_uploaded = await push_to_cloud(session, payload, config)
-        if was_uploaded:
-            _mark_scan_payload_sent(config.local_db_path, row_id)
-        else:
             _record_scan_upload_failure(
                 config.local_db_path,
                 row_id,
-                f"upload_failed:{captured_at_utc}",
+                f"json_decode_error:{exc}",
+                attempts_so_far=attempts,
+                backoff_initial_seconds=config.upload_backoff_initial_seconds,
+                backoff_max_seconds=config.upload_backoff_max_seconds,
             )
-            break
+
+    eligible_rows = _get_pending_scan_payloads(config.local_db_path, config.upload_batch_size)
+    selected_rows, batch_payload = _build_scan_batch_payload(
+        eligible_rows,
+        max_event_count=config.upload_batch_size,
+        max_bytes=config.upload_batch_max_bytes,
+    )
+    if not selected_rows or not batch_payload:
+        return
+
+    sent_ok, failed_row_ids = await _post_scan_batch(session, batch_payload, config)
+    selected_row_ids = [row[0] for row in selected_rows]
+    selected_attempts = {row_id: attempts for row_id, _, _, attempts in selected_rows}
+
+    if sent_ok:
+        if failed_row_ids is None:
+            failed_row_ids = set()
+        success_ids = [row_id for row_id in selected_row_ids if row_id not in failed_row_ids]
+        _mark_scan_payloads_sent(config.local_db_path, success_ids)
+        for failed_id in failed_row_ids:
+            _record_scan_upload_failure(
+                config.local_db_path,
+                failed_id,
+                "batch_partial_failure",
+                attempts_so_far=selected_attempts.get(failed_id, 0),
+                backoff_initial_seconds=config.upload_backoff_initial_seconds,
+                backoff_max_seconds=config.upload_backoff_max_seconds,
+            )
+        return
+
+    # Backward compatibility fallback for consumers that do not support ble_scan_batch.
+    for row_id, captured_at_utc, payload_json, attempts in selected_rows:
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            _record_scan_upload_failure(
+                config.local_db_path,
+                row_id,
+                f"json_decode_error:{exc}",
+                attempts_so_far=attempts,
+                backoff_initial_seconds=config.upload_backoff_initial_seconds,
+                backoff_max_seconds=config.upload_backoff_max_seconds,
+            )
+            continue
+        was_uploaded = await push_to_cloud(session, payload, config)
+        if was_uploaded:
+            _mark_scan_payload_sent(config.local_db_path, row_id)
+            continue
+        _record_scan_upload_failure(
+            config.local_db_path,
+            row_id,
+            f"single_upload_failed:{captured_at_utc}",
+            attempts_so_far=selected_attempts.get(row_id, attempts),
+            backoff_initial_seconds=config.upload_backoff_initial_seconds,
+            backoff_max_seconds=config.upload_backoff_max_seconds,
+        )
 
 
 def _write_ble_wake_signal() -> None:
@@ -818,12 +1315,13 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
         metadata = _serialize_metadata(adv_data)
 
+        canonical_mac_address = _canonicalize_mac_address(device.address)
         sensor_payload = {
-            "device_id": _normalize_mac(device.address, config),
-            "mac_address": device.address,
+            "device_id": _normalize_mac(canonical_mac_address, config),
+            "mac_address": canonical_mac_address,
             "rssi": adv_data.rssi,
             "metadata": metadata,
-            "device_type": _device_type_from_metadata(device.address, metadata),
+            "device_type": _device_type_from_metadata(canonical_mac_address, metadata),
         }
 
         if config.include_name:
@@ -837,6 +1335,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
     return {
         "vehicle_id": config.vehicle_id,
+        "pi_id": config.pi_id,
         "captured_at_utc": _utc_now_iso(),
         "event_type": "ble_sensor_scan",
         "scan_duration_seconds": config.scan_duration_seconds,
@@ -850,12 +1349,20 @@ async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
     _init_local_store(config.local_db_path)
+    _sync_tracked_asset_registry(config)
 
     if config.anonymize_mac and not config.mac_hash_salt:
         print(
             "Warning: ANONYMIZE_MAC=true but MAC_HASH_SALT is empty. "
             "Set a unique secret salt per deployment for stronger privacy guarantees."
         )
+
+    print(
+        "BLE scan contention config: "
+        f"backoff_cap={config.scan_contention_backoff_cap_seconds}s, "
+        f"cooldown_threshold={config.scan_contention_cooldown_threshold}, "
+        f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}."
+    )
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -909,6 +1416,8 @@ async def run() -> None:
                     raise
 
                 _queue_scan_payload(config.local_db_path, payload)
+                _sync_tracked_asset_registry(config)
+                _resolve_tracked_asset_positions(config)
                 print(
                     f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
                     f"for captured_at_utc={payload['captured_at_utc']}."
