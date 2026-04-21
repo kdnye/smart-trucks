@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
+SQLITE_LOCKED_RETRY_COUNT = int(os.getenv("SQLITE_LOCKED_RETRY_COUNT", "3"))
+SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS = float(os.getenv("SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS", "0.05"))
 
 _db_connection: aiosqlite.Connection | None = None
 _db_lock = asyncio.Lock()
@@ -62,6 +64,41 @@ async def _execute_write(sql: str, params: list[Any] | tuple[Any, ...]) -> None:
             if db.in_transaction:
                 await db.execute("ROLLBACK")
             raise
+
+
+def _is_locked_error(exc: Exception) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+async def _execute_write_with_retry(
+    sql: str,
+    params: list[Any] | tuple[Any, ...],
+    *,
+    operation_name: str,
+) -> None:
+    attempts = max(1, SQLITE_LOCKED_RETRY_COUNT + 1)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await _execute_write(sql, params)
+            return
+        except aiosqlite.OperationalError as exc:
+            last_exc = exc
+            if not _is_locked_error(exc) or attempt == attempts:
+                raise
+            delay_seconds = SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS * attempt
+            logger.warning(
+                "%s hit SQLite lock contention (attempt %d/%d); retrying in %.3fs",
+                operation_name,
+                attempt,
+                attempts,
+                delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+
+    if last_exc is not None:
+        raise last_exc
 
 
 def _utc_now_iso() -> str:
@@ -162,8 +199,7 @@ async def insert_gps_point(
     payload_json = json.dumps(payload)
 
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write_with_retry(
             """
             INSERT INTO gps_points (
                 vehicle_id, captured_at_utc, lat, lon, speed_kmh,
@@ -182,8 +218,8 @@ async def insert_gps_point(
                 local_sequence,
                 payload_json,
             ),
+            operation_name="insert_gps_point",
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to insert GPS point into %s: %s", DB_PATH, exc)
 
@@ -198,23 +234,21 @@ async def insert_heartbeat(
     payload_json = json.dumps(payload)
 
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write_with_retry(
             """
             INSERT INTO heartbeats (vehicle_id, heartbeat_type, captured_at_utc, payload_json)
             VALUES (?, ?, ?, ?)
             """,
             (vehicle_id, heartbeat_type, captured_at_utc, payload_json),
+            operation_name="insert_heartbeat",
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to insert heartbeat into %s: %s", DB_PATH, exc)
 
 
 async def record_edge_health(payload: dict[str, Any]) -> None:
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write_with_retry(
             """
             INSERT INTO edge_health (
                 captured_at_utc,
@@ -237,8 +271,8 @@ async def record_edge_health(payload: dict[str, Any]) -> None:
                 payload.get("process_state"),
                 json.dumps(payload),
             ),
+            operation_name="record_edge_health",
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to record edge health: %s", exc)
 
@@ -414,12 +448,11 @@ async def get_latest_power_snapshot(vehicle_id: str) -> dict[str, Any] | None:
 
 async def insert_wake_signal(signal_type: str) -> None:
     try:
-        db = await _get_db_connection()
-        await db.execute(
+        await _execute_write_with_retry(
             "INSERT INTO wake_signals (signal_type, created_at) VALUES (?, ?)",
             (signal_type, _utc_now_iso()),
+            operation_name="insert_wake_signal",
         )
-        await db.commit()
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to insert wake signal: %s", exc)
 
