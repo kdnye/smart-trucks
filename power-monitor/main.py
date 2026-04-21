@@ -608,6 +608,7 @@ async def write_reading(
         "INSERT INTO power_readings(vehicle_id, occurred_at, payload) VALUES(?, ?, ?)",
         (vehicle_id, occurred_at, json_payload),
     )
+    await conn.commit()
 
 
 async def enqueue_event(
@@ -1294,7 +1295,10 @@ async def run() -> None:
     async with aiosqlite.connect(
         config.db_path,
         timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
-        isolation_level="IMMEDIATE",
+        # Autocommit mode: each write helper controls its own transaction boundary.
+        # If we introduce batching later, use explicit BEGIN/COMMIT scopes only
+        # around write-heavy sections.
+        isolation_level=None,
     ) as conn:
         await configure_sqlite(conn)
         await init_db(conn)
