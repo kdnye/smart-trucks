@@ -40,22 +40,28 @@ async def _get_db_connection() -> aiosqlite.Connection:
             _db_connection = await aiosqlite.connect(
                 DB_PATH,
                 timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
-                isolation_level="IMMEDIATE",
+                isolation_level=None,
             )
             await _configure_sqlite_connection(_db_connection)
         return _db_connection
 
 
 async def _execute_write(sql: str, params: list[Any] | tuple[Any, ...]) -> None:
-    """Execute writes through a fresh IMMEDIATE transaction to honor busy timeout under contention."""
+    """Execute writes through a fresh explicit transaction to honor busy timeout under contention."""
     async with aiosqlite.connect(
         DB_PATH,
         timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
-        isolation_level="IMMEDIATE",
+        isolation_level=None,
     ) as db:
         await _configure_sqlite_connection(db)
-        await db.execute(sql, params)
-        await db.commit()
+        try:
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(sql, params)
+            await db.execute("COMMIT")
+        except Exception:
+            if db.in_transaction:
+                await db.execute("ROLLBACK")
+            raise
 
 
 def _utc_now_iso() -> str:
