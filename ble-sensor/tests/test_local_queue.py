@@ -46,6 +46,46 @@ class BleLocalQueueTests(unittest.TestCase):
             self.assertEqual(stored_payload["sensor_count"], 0)
 
 
+class MacNormalizationTests(unittest.TestCase):
+    def test_canonicalize_mac_enforces_uppercase_colon_format(self) -> None:
+        self.assertEqual(
+            ble_sensor_main._canonicalize_mac_address("e45f01aabbcc"),
+            "E4:5F:01:AA:BB:CC",
+        )
+        self.assertEqual(
+            ble_sensor_main._canonicalize_mac_address("e4-5f-01-aa-bb-cc"),
+            "E4:5F:01:AA:BB:CC",
+        )
+
+    def test_normalize_mac_hash_uses_canonicalized_input(self) -> None:
+        config = ble_sensor_main.Config(
+            webhook_url="https://example.test/ingest",
+            vehicle_id="truck-1",
+            post_interval_seconds=60,
+            scan_duration_seconds=20,
+            api_key="",
+            request_timeout_seconds=10,
+            anonymize_mac=True,
+            mac_hash_salt="salt",
+            include_name=False,
+            max_devices_per_scan=0,
+            key_beacon_uuids=frozenset(),
+            key_beacon_manufacturer_ids=frozenset(),
+            scan_contention_backoff_cap_seconds=12,
+            scan_contention_cooldown_threshold=3,
+            local_db_path=":memory:",
+            upload_batch_size=25,
+            pi_location_db_path="/data/telematics.db",
+            pi_location_cache_path="/data/telematics_last_locked.json",
+            pi_location_query_timeout_seconds=0.25,
+            pi_location_stale_after_seconds=180,
+        )
+        self.assertEqual(
+            ble_sensor_main._normalize_mac("e45f01aabbcc", config),
+            ble_sensor_main._normalize_mac("E4:5F:01:AA:BB:CC", config),
+        )
+
+
 class BleFlushTests(unittest.IsolatedAsyncioTestCase):
     async def test_flush_marks_payload_sent_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

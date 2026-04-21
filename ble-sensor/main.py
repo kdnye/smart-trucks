@@ -408,17 +408,28 @@ KNOWN_OUIS = {
 }
 
 
+def _canonicalize_mac_address(mac_address: str) -> str:
+    """Return MAC as canonical uppercase colon-delimited hex when possible."""
+    stripped = "".join(ch for ch in (mac_address or "") if ch.isalnum())
+    if len(stripped) == 12 and all(ch in "0123456789abcdefABCDEF" for ch in stripped):
+        octets = [stripped[i : i + 2].upper() for i in range(0, 12, 2)]
+        return ":".join(octets)
+
+    return (mac_address or "").upper()
+
+
 def _normalize_mac(mac_address: str, config: Config) -> str:
     """
     Return a stable, privacy-preserving identifier for each device by default.
     Set ANONYMIZE_MAC=false to send raw MAC addresses when explicitly required.
     """
+    canonical_mac = _canonicalize_mac_address(mac_address)
     if not config.anonymize_mac:
-        return mac_address
+        return canonical_mac
 
     digest = hmac.new(
         key=config.mac_hash_salt.encode("utf-8"),
-        msg=mac_address.lower().encode("utf-8"),
+        msg=canonical_mac.lower().encode("utf-8"),
         digestmod=hashlib.sha256,
     ).hexdigest()
     return digest[:20]
@@ -492,7 +503,7 @@ def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> st
     if "0201060303AAFE" in mfg_hex_dump:
         return "Eddystone Beacon"
 
-    oui = mac_address.upper()[:8]
+    oui = _canonicalize_mac_address(mac_address)[:8]
     return KNOWN_OUIS.get(oui, "Unknown")
 
 
@@ -818,12 +829,13 @@ async def collect_payload(config: Config) -> dict[str, Any]:
 
         metadata = _serialize_metadata(adv_data)
 
+        canonical_mac_address = _canonicalize_mac_address(device.address)
         sensor_payload = {
-            "device_id": _normalize_mac(device.address, config),
-            "mac_address": device.address,
+            "device_id": _normalize_mac(canonical_mac_address, config),
+            "mac_address": canonical_mac_address,
             "rssi": adv_data.rssi,
             "metadata": metadata,
-            "device_type": _device_type_from_metadata(device.address, metadata),
+            "device_type": _device_type_from_metadata(canonical_mac_address, metadata),
         }
 
         if config.include_name:
