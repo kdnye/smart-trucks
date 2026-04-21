@@ -100,6 +100,7 @@ services:
     environment:
       - UDEV=1
       - VEHICLE_ID=${VEHICLE_ID}
+      - ENABLE_CALIBRATION=false
       - IMU_I2C_BUS
       - IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS
 
@@ -117,6 +118,7 @@ services:
     environment:
       - UDEV=1
       - VEHICLE_ID=${VEHICLE_ID}
+      - ENABLE_CALIBRATION=false
       - BLE_CALIBRATION_SCAN_DURATION_SECONDS
       - BLE_CALIBRATION_REFRESH_SECONDS
 
