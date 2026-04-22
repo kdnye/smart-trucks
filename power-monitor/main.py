@@ -173,6 +173,9 @@ class Config:
     ina219_bus_voltage_range_v: int
     ina219_scl_gpio_pin: int
     battery_capacity_mah: int
+    soc_voltage_min_v: float
+    soc_voltage_full_resting_v: float
+    soc_voltage_full_charging_v: float
     invert_current: bool
     min_discharge_current_ma_for_runtime: int
     shutdown_soc_trip_pct: float
@@ -344,6 +347,9 @@ def load_config() -> Config:
         ina219_bus_voltage_range_v=_read_ina219_bus_voltage_range_env(16),
         ina219_scl_gpio_pin=_read_int_env("UPS_I2C_SCL_GPIO_PIN", 3, minimum=0),
         battery_capacity_mah=_read_int_env("UPS_BATTERY_CAPACITY_MAH", 2200, minimum=1),
+        soc_voltage_min_v=_read_float_env("UPS_SOC_VOLTAGE_MIN_V", 3.2),
+        soc_voltage_full_resting_v=_read_float_env("UPS_SOC_VOLTAGE_FULL_RESTING_V", 4.05),
+        soc_voltage_full_charging_v=_read_float_env("UPS_SOC_VOLTAGE_FULL_CHARGING_V", 4.25),
         invert_current=parse_bool_env("UPS_INVERT_CURRENT", False),
         min_discharge_current_ma_for_runtime=_read_int_env(
             "UPS_MIN_DISCHARGE_CURRENT_MA_FOR_RUNTIME_ESTIMATE",
@@ -381,6 +387,9 @@ class UpsMonitor:
         i2c_bus: int,
         i2c_scl_gpio_pin: int,
         battery_capacity_mah: int,
+        soc_voltage_min_v: float,
+        soc_voltage_full_resting_v: float,
+        soc_voltage_full_charging_v: float,
         min_discharge_current_ma_for_runtime: int,
         invert_current: bool = False,
     ) -> None:
@@ -392,6 +401,12 @@ class UpsMonitor:
         self._i2c_bus = i2c_bus
         self._i2c_scl_gpio_pin = i2c_scl_gpio_pin
         self._battery_capacity_mah = battery_capacity_mah
+        self._soc_voltage_min_v = soc_voltage_min_v
+        self._soc_voltage_full_resting_v = max(soc_voltage_min_v + 0.01, soc_voltage_full_resting_v)
+        self._soc_voltage_full_charging_v = max(
+            self._soc_voltage_full_resting_v,
+            soc_voltage_full_charging_v,
+        )
         self._invert_current = invert_current
         self._min_discharge_current_ma_for_runtime = min_discharge_current_ma_for_runtime
         self._ina: INA219Driver | None = None
@@ -461,17 +476,15 @@ class UpsMonitor:
         self._ina.set_calibration_profile(slope, 0.0)
         return True
 
-    @staticmethod
-    def _estimate_soc(voltage_v: float) -> int:
-        if voltage_v >= 4.10:
+    def _estimate_soc(self, voltage_v: float, *, is_charging: bool) -> int:
+        voltage_max_v = self._soc_voltage_full_charging_v if is_charging else self._soc_voltage_full_resting_v
+        if voltage_v <= self._soc_voltage_min_v:
+            return 0
+        if voltage_v >= voltage_max_v:
             return 100
-        if voltage_v >= 3.90:
-            return 75
-        if voltage_v >= 3.70:
-            return 50
-        if voltage_v >= 3.45:
-            return 25
-        return 0
+        curve_range_v = max(0.01, voltage_max_v - self._soc_voltage_min_v)
+        ratio = (voltage_v - self._soc_voltage_min_v) / curve_range_v
+        return int(round(ratio * 100.0))
 
     async def read(self) -> dict[str, Any]:
         read_started = asyncio.get_running_loop().time()
@@ -491,11 +504,14 @@ class UpsMonitor:
             current_ma = float(metrics["current_ma"])
             bus_voltage_v = float(metrics["bus_voltage_v"])
             total_mah = float(metrics.get("total_mAh", 0.0))
+            external_input_present = bus_voltage_v >= EXTERNAL_INPUT_PRESENT_MIN_BUS_V
+            charging = external_input_present and current_ma > CURRENT_FLOW_DEADBAND_MA
+            charging_for_soc = current_ma > CURRENT_FLOW_DEADBAND_MA
             if bus_voltage_v > self.COULOMB_SOC_SWITCHOVER_V:
                 state_of_charge_pct_estimate = int(round((total_mah / float(self._battery_capacity_mah)) * 100.0))
                 estimate_method = "coulomb_counter_output_rail"
             else:
-                state_of_charge_pct_estimate = self._estimate_soc(bus_voltage_v)
+                state_of_charge_pct_estimate = self._estimate_soc(bus_voltage_v, is_charging=charging_for_soc)
                 estimate_method = self.SOC_ESTIMATE_METHOD
             state_of_charge_pct_estimate = max(0, min(100, state_of_charge_pct_estimate))
             estimated_runtime_hours: float | None = None
@@ -503,8 +519,6 @@ class UpsMonitor:
             if current_ma < -self._min_discharge_current_ma_for_runtime:
                 remaining_capacity_mah = (state_of_charge_pct_estimate / 100.0) * float(self._battery_capacity_mah)
                 estimated_runtime_hours = round(remaining_capacity_mah / discharge_current_ma, 2)
-            external_input_present = bus_voltage_v >= EXTERNAL_INPUT_PRESENT_MIN_BUS_V
-            charging = external_input_present and current_ma > CURRENT_FLOW_DEADBAND_MA
             return _finalize({
                 "status": "ok",
                 **metrics,
@@ -950,6 +964,9 @@ async def run() -> None:
         config.i2c_bus,
         config.ina219_scl_gpio_pin,
         config.battery_capacity_mah,
+        config.soc_voltage_min_v,
+        config.soc_voltage_full_resting_v,
+        config.soc_voltage_full_charging_v,
         config.min_discharge_current_ma_for_runtime,
         invert_current=config.invert_current,
     )
