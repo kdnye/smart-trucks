@@ -6,24 +6,19 @@ import os
 import random
 import sqlite3 as _sqlite3
 from urllib.parse import quote as _urlquote
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import aiohttp
 import uvloop
 from bleak import BleakScanner
 
 
 @dataclass(frozen=True)
 class Config:
-    webhook_url: str | None
     vehicle_id: str
     post_interval_seconds: int
     scan_duration_seconds: float
-    api_key: str
-    request_timeout_seconds: float
     anonymize_mac: bool
     mac_hash_salt: str
     include_name: bool
@@ -34,7 +29,6 @@ class Config:
     scan_contention_cooldown_threshold: int
     scan_contention_max_attempts_before_reset: int
     local_db_path: str
-    upload_batch_size: int
     telematics_db_path: str
     pi_location_db_path: str
     pi_location_cache_path: str
@@ -45,9 +39,6 @@ class Config:
     resolver_candidate_window_seconds: int
     resolver_tie_epsilon: float
     resolver_stationary_mode_enabled: bool
-    upload_batch_max_bytes: int
-    upload_backoff_initial_seconds: int
-    upload_backoff_max_seconds: int
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -77,12 +68,9 @@ def load_config() -> Config:
     )
 
     return Config(
-        webhook_url=os.getenv("WEBHOOK_URL"),
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         post_interval_seconds=poll_interval_seconds,
         scan_duration_seconds=scan_duration_seconds,
-        api_key=os.getenv("API_KEY", ""),
-        request_timeout_seconds=max(2.0, float(os.getenv("HTTP_TIMEOUT_SECONDS", "10"))),
         anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "true"), default=True),
         mac_hash_salt=os.getenv("MAC_HASH_SALT", ""),
         include_name=_to_bool(os.getenv("INCLUDE_DEVICE_NAME", "false"), default=False),
@@ -102,7 +90,6 @@ def load_config() -> Config:
             int(os.getenv("SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", "10")),
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
-        upload_batch_size=max(1, int(os.getenv("UPLOAD_BATCH_SIZE", "25"))),
         telematics_db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
         pi_location_db_path=os.getenv(
             "PI_LOCATION_DB_PATH",
@@ -137,9 +124,6 @@ def load_config() -> Config:
             os.getenv("RESOLVER_STATIONARY_MODE_ENABLED", "false"),
             default=False,
         ),
-        upload_batch_max_bytes=max(1024, int(os.getenv("UPLOAD_BATCH_MAX_BYTES", "200000"))),
-        upload_backoff_initial_seconds=max(1, int(os.getenv("UPLOAD_BACKOFF_INITIAL_SECONDS", "5"))),
-        upload_backoff_max_seconds=max(5, int(os.getenv("UPLOAD_BACKOFF_MAX_SECONDS", "300"))),
     )
 
 
@@ -547,65 +531,10 @@ def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> st
     return KNOWN_OUIS.get(oui, "Unknown")
 
 
-async def push_to_cloud(
-    session: aiohttp.ClientSession, payload: dict[str, Any], config: Config
-) -> bool:
-    if not config.webhook_url:
-        return False
-
-    headers = {}
-    if config.api_key:
-        headers["X-Api-Key"] = config.api_key
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=config.request_timeout_seconds)
-        async with session.post(
-            config.webhook_url,
-            json=payload,
-            headers=headers,
-            timeout=timeout,
-        ) as response:
-            response_text = await response.text()
-            if response.status >= 400:
-                print(f"Upload failed [{response.status}]: {response_text[:200]}")
-                return False
-            print(f"Payload transmitted. Status: {response.status}")
-            return True
-    except Exception as exc:
-        print(f"Transmission failed: {exc}")
-        return False
-
-
 def _init_local_store(db_path: str) -> None:
     with _sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ble_scan_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                captured_at_utc TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                sent_at_utc TEXT,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                next_retry_at_utc TEXT
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_ble_scan_events_pending
-            ON ble_scan_events(sent_at_utc, captured_at_utc);
-            """
-        )
-        _ensure_column(conn, "ble_scan_events", "next_retry_at_utc", "TEXT")
-        conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_ble_scan_events_retry
-            ON ble_scan_events(sent_at_utc, next_retry_at_utc, captured_at_utc);
-            """
-        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ble_device_observations (
@@ -663,15 +592,6 @@ def _init_local_store(db_path: str) -> None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _ensure_column(conn: _sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:
-    existing_columns = {
-        str(row[1])
-        for row in conn.execute(f"PRAGMA table_info({table_name})")  # nosec B608
-    }
-    if column_name not in existing_columns:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")  # nosec B608
 
 
 def _parse_iso_utc(raw: str | None) -> datetime | None:
@@ -1090,236 +1010,45 @@ async def _collect_pi_location(config: Config) -> dict[str, Any]:
     )
 
 
-def _queue_scan_payload(db_path: str, payload: dict[str, Any]) -> None:
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+def _persist_scanned_devices_to_telematics_db(
+    telematics_db_path: str, sensors: Any
+) -> int:
+    if not isinstance(sensors, list):
+        return 0
+
+    rows: list[tuple[Any, Any, Any]] = []
+    for sensor in sensors:
+        if not isinstance(sensor, dict):
+            continue
+        normalized_mac = _canonicalize_mac_address(str(sensor.get("mac_address", "")))
+        if len(normalized_mac) != 17:
+            continue
+        rows.append(
+            (
+                normalized_mac,
+                sensor.get("rssi"),
+                sensor.get("device_type"),
+            )
+        )
+
+    if not rows:
+        return 0
+
+    with _sqlite3.connect(
+        telematics_db_path,
+        timeout=30.0,
+        isolation_level="IMMEDIATE",
+    ) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.executemany(
             """
-            INSERT INTO ble_scan_events (captured_at_utc, payload_json)
-            VALUES (?, ?)
+            INSERT INTO local_ble (mac_address, rssi, device_type)
+            VALUES (?, ?, ?)
             """,
-            (payload["captured_at_utc"], json.dumps(payload)),
+            rows,
         )
-    _record_scan_observations(db_path, payload)
-
-
-def _get_pending_scan_payloads(
-    db_path: str, limit: int
-) -> list[tuple[int, str, str, int]]:
-    now_utc = _utc_now_iso()
-    with _sqlite3.connect(db_path, timeout=30.0) as conn:
-        cursor = conn.execute(
-            """
-            SELECT id, captured_at_utc, payload_json, attempts
-            FROM ble_scan_events
-            WHERE sent_at_utc IS NULL
-              AND (next_retry_at_utc IS NULL OR next_retry_at_utc <= ?)
-            ORDER BY captured_at_utc ASC, id ASC
-            LIMIT ?
-            """,
-            (now_utc, limit),
-        )
-        return [
-            (int(row[0]), str(row[1]), str(row[2]), int(row[3] or 0))
-            for row in cursor.fetchall()
-        ]
-
-
-def _mark_scan_payload_sent(db_path: str, row_id: int) -> None:
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute(
-            """
-            UPDATE ble_scan_events
-            SET sent_at_utc = ?, last_error = NULL, next_retry_at_utc = NULL
-            WHERE id = ?
-            """,
-            (_utc_now_iso(), row_id),
-        )
-
-
-def _mark_scan_payloads_sent(db_path: str, row_ids: list[int]) -> None:
-    if not row_ids:
-        return
-    placeholders = ",".join("?" for _ in row_ids)
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute(
-            f"""
-            UPDATE ble_scan_events
-            SET sent_at_utc = ?, last_error = NULL, next_retry_at_utc = NULL
-            WHERE id IN ({placeholders})
-            """,
-            (_utc_now_iso(), *row_ids),
-        )
-
-
-def _record_scan_upload_failure(
-    db_path: str,
-    row_id: int,
-    error: str,
-    *,
-    attempts_so_far: int,
-    backoff_initial_seconds: int,
-    backoff_max_seconds: int,
-) -> None:
-    backoff_seconds = min(backoff_max_seconds, backoff_initial_seconds * (2 ** max(0, attempts_so_far)))
-    retry_at = datetime.now(timezone.utc).timestamp() + backoff_seconds
-    next_retry_at_utc = datetime.fromtimestamp(retry_at, tz=timezone.utc).isoformat()
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute(
-            """
-            UPDATE ble_scan_events
-            SET attempts = attempts + 1, last_error = ?, next_retry_at_utc = ?
-            WHERE id = ?
-            """,
-            (error[:500], next_retry_at_utc, row_id),
-        )
-
-
-def _build_scan_batch_payload(
-    pending_rows: list[tuple[int, str, str, int]],
-    max_event_count: int,
-    max_bytes: int,
-) -> tuple[list[tuple[int, str, str, int]], dict[str, Any]] | tuple[None, None]:
-    selected_rows: list[tuple[int, str, str, int]] = []
-    events: list[dict[str, Any]] = []
-    for row in pending_rows:
-        if len(selected_rows) >= max_event_count:
-            break
-        _, _, payload_json, _ = row
-        try:
-            event_payload = json.loads(payload_json)
-        except json.JSONDecodeError:
-            continue
-        candidate_events = [*events, event_payload]
-        batch_payload = {
-            "event_type": "ble_scan_batch",
-            "batch_id": str(uuid.uuid4()),
-            "events": candidate_events,
-        }
-        if len(json.dumps(batch_payload, separators=(",", ":")).encode("utf-8")) > max_bytes:
-            if not selected_rows:
-                selected_rows.append(row)
-                events.append(event_payload)
-            break
-        selected_rows.append(row)
-        events.append(event_payload)
-    if not selected_rows:
-        return None, None
-    return selected_rows, {
-        "event_type": "ble_scan_batch",
-        "batch_id": str(uuid.uuid4()),
-        "events": events,
-    }
-
-
-async def _post_scan_batch(
-    session: aiohttp.ClientSession,
-    payload: dict[str, Any],
-    config: Config,
-) -> tuple[bool, set[int] | None]:
-    if not config.webhook_url:
-        return False, None
-
-    headers = {}
-    if config.api_key:
-        headers["X-Api-Key"] = config.api_key
-    timeout = aiohttp.ClientTimeout(total=config.request_timeout_seconds)
-    try:
-        async with session.post(config.webhook_url, json=payload, headers=headers, timeout=timeout) as response:
-            response_text = await response.text()
-            if response.status >= 400:
-                print(f"Batch upload failed [{response.status}]: {response_text[:200]}")
-                return False, None
-            try:
-                response_json = json.loads(response_text) if response_text else {}
-            except json.JSONDecodeError:
-                response_json = {}
-            failed_row_ids: set[int] = set()
-            raw_failed = response_json.get("failed_row_ids")
-            if isinstance(raw_failed, list):
-                failed_row_ids = {int(item) for item in raw_failed if str(item).isdigit()}
-            print(f"BLE batch transmitted. Status: {response.status}, failed_ids={len(failed_row_ids)}")
-            return True, failed_row_ids
-    except Exception as exc:
-        print(f"Batch transmission failed: {exc}")
-        return False, None
-
-
-async def _flush_pending_scan_payloads(
-    session: aiohttp.ClientSession, config: Config
-) -> None:
-    pending_rows = _get_pending_scan_payloads(config.local_db_path, config.upload_batch_size)
-    if not pending_rows:
-        return
-
-    for row_id, _, payload_json, attempts in pending_rows:
-        try:
-            json.loads(payload_json)
-        except json.JSONDecodeError as exc:
-            _record_scan_upload_failure(
-                config.local_db_path,
-                row_id,
-                f"json_decode_error:{exc}",
-                attempts_so_far=attempts,
-                backoff_initial_seconds=config.upload_backoff_initial_seconds,
-                backoff_max_seconds=config.upload_backoff_max_seconds,
-            )
-
-    eligible_rows = _get_pending_scan_payloads(config.local_db_path, config.upload_batch_size)
-    selected_rows, batch_payload = _build_scan_batch_payload(
-        eligible_rows,
-        max_event_count=config.upload_batch_size,
-        max_bytes=config.upload_batch_max_bytes,
-    )
-    if not selected_rows or not batch_payload:
-        return
-
-    sent_ok, failed_row_ids = await _post_scan_batch(session, batch_payload, config)
-    selected_row_ids = [row[0] for row in selected_rows]
-    selected_attempts = {row_id: attempts for row_id, _, _, attempts in selected_rows}
-
-    if sent_ok:
-        if failed_row_ids is None:
-            failed_row_ids = set()
-        success_ids = [row_id for row_id in selected_row_ids if row_id not in failed_row_ids]
-        _mark_scan_payloads_sent(config.local_db_path, success_ids)
-        for failed_id in failed_row_ids:
-            _record_scan_upload_failure(
-                config.local_db_path,
-                failed_id,
-                "batch_partial_failure",
-                attempts_so_far=selected_attempts.get(failed_id, 0),
-                backoff_initial_seconds=config.upload_backoff_initial_seconds,
-                backoff_max_seconds=config.upload_backoff_max_seconds,
-            )
-        return
-
-    # Backward compatibility fallback for consumers that do not support ble_scan_batch.
-    for row_id, captured_at_utc, payload_json, attempts in selected_rows:
-        try:
-            payload = json.loads(payload_json)
-        except json.JSONDecodeError as exc:
-            _record_scan_upload_failure(
-                config.local_db_path,
-                row_id,
-                f"json_decode_error:{exc}",
-                attempts_so_far=attempts,
-                backoff_initial_seconds=config.upload_backoff_initial_seconds,
-                backoff_max_seconds=config.upload_backoff_max_seconds,
-            )
-            continue
-        was_uploaded = await push_to_cloud(session, payload, config)
-        if was_uploaded:
-            _mark_scan_payload_sent(config.local_db_path, row_id)
-            continue
-        _record_scan_upload_failure(
-            config.local_db_path,
-            row_id,
-            f"single_upload_failed:{captured_at_utc}",
-            attempts_so_far=selected_attempts.get(row_id, attempts),
-            backoff_initial_seconds=config.upload_backoff_initial_seconds,
-            backoff_max_seconds=config.upload_backoff_max_seconds,
-        )
+    return len(rows)
 
 
 def _write_ble_wake_signal() -> None:
@@ -1425,70 +1154,73 @@ async def run() -> None:
         f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}."
     )
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            apply_poll_sleep = True
+    while True:
+        apply_poll_sleep = True
+        try:
             try:
-                try:
-                    payload = await collect_payload(config)
-                    scan_retry_attempt = 0
-                except Exception as exc:
-                    err_text = f"{exc}".lower()
-                    cause_text = f"{exc.__cause__}".lower() if exc.__cause__ else ""
-                    class_text = f"{exc.__class__.__name__} {type(exc).__name__}".lower()
-                    combined_error_text = f"{err_text} {cause_text} {class_text}"
-                    is_op_in_progress = (
-                        "operation already in progress" in combined_error_text
-                        or "org.bluez.error.inprogress" in combined_error_text
-                    )
-
-                    if is_op_in_progress:
-                        apply_poll_sleep = False
-                        backoff_seconds = min(
-                            config.scan_contention_backoff_cap_seconds,
-                            0.75 * (2**scan_retry_attempt),
-                        )
-                        jitter_seconds = random.uniform(0, 0.5)
-                        sleep_seconds = backoff_seconds + jitter_seconds
-                        scan_retry_attempt += 1
-                        print(
-                            "BlueZ scan-start contention detected "
-                            f"(attempt {scan_retry_attempt}): {exc}. "
-                            f"Retrying in {sleep_seconds:.2f}s."
-                        )
-                        await asyncio.sleep(sleep_seconds)
-                        if scan_retry_attempt % config.scan_contention_cooldown_threshold == 0:
-                            print(
-                                "Repeated scan contention detected. Applying extended "
-                                f"cooldown of {config.post_interval_seconds}s before retry."
-                            )
-                            await asyncio.sleep(config.post_interval_seconds)
-
-                        if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
-                            print(
-                                "Persistent BlueZ scan contention detected. Resetting retry "
-                                f"counter after {config.post_interval_seconds}s cooldown. "
-                                "Check for competing BLE scanners on the host."
-                            )
-                            scan_retry_attempt = 0
-                            await asyncio.sleep(config.post_interval_seconds)
-                        continue
-
-                    raise
-
-                _queue_scan_payload(config.local_db_path, payload)
-                _sync_tracked_asset_registry(config)
-                _resolve_tracked_asset_positions(config)
-                print(
-                    f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
-                    f"for captured_at_utc={payload['captured_at_utc']}."
-                )
-                await _flush_pending_scan_payloads(session, config)
+                payload = await collect_payload(config)
+                scan_retry_attempt = 0
             except Exception as exc:
-                print(f"Scan loop error: {exc}")
+                err_text = f"{exc}".lower()
+                cause_text = f"{exc.__cause__}".lower() if exc.__cause__ else ""
+                class_text = f"{exc.__class__.__name__} {type(exc).__name__}".lower()
+                combined_error_text = f"{err_text} {cause_text} {class_text}"
+                is_op_in_progress = (
+                    "operation already in progress" in combined_error_text
+                    or "org.bluez.error.inprogress" in combined_error_text
+                )
 
-            if apply_poll_sleep:
-                await asyncio.sleep(config.post_interval_seconds)
+                if is_op_in_progress:
+                    apply_poll_sleep = False
+                    backoff_seconds = min(
+                        config.scan_contention_backoff_cap_seconds,
+                        0.75 * (2**scan_retry_attempt),
+                    )
+                    jitter_seconds = random.uniform(0, 0.5)
+                    sleep_seconds = backoff_seconds + jitter_seconds
+                    scan_retry_attempt += 1
+                    print(
+                        "BlueZ scan-start contention detected "
+                        f"(attempt {scan_retry_attempt}): {exc}. "
+                        f"Retrying in {sleep_seconds:.2f}s."
+                    )
+                    await asyncio.sleep(sleep_seconds)
+                    if scan_retry_attempt % config.scan_contention_cooldown_threshold == 0:
+                        print(
+                            "Repeated scan contention detected. Applying extended "
+                            f"cooldown of {config.post_interval_seconds}s before retry."
+                        )
+                        await asyncio.sleep(config.post_interval_seconds)
+
+                    if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
+                        print(
+                            "Persistent BlueZ scan contention detected. Resetting retry "
+                            f"counter after {config.post_interval_seconds}s cooldown. "
+                            "Check for competing BLE scanners on the host."
+                        )
+                        scan_retry_attempt = 0
+                        await asyncio.sleep(config.post_interval_seconds)
+                    continue
+
+                raise
+
+            _record_scan_observations(config.local_db_path, payload)
+            _sync_tracked_asset_registry(config)
+            _resolve_tracked_asset_positions(config)
+            inserted_count = _persist_scanned_devices_to_telematics_db(
+                config.telematics_db_path,
+                payload.get("sensors"),
+            )
+            print(
+                f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
+                f"for captured_at_utc={payload['captured_at_utc']}; "
+                f"inserted_into_local_ble={inserted_count}."
+            )
+        except Exception as exc:
+            print(f"Scan loop error: {exc}")
+
+        if apply_poll_sleep:
+            await asyncio.sleep(config.post_interval_seconds)
 
 
 if __name__ == "__main__":
