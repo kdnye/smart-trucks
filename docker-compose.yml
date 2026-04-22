@@ -27,13 +27,11 @@ services:
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the IMU
     volumes:
-      - telematics_data:/data
+      - shared-sqlite:/data
     cpuset: "1,2"
     environment:
       - UDEV=1
-      - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
-      - API_KEY=${API_KEY}
       - DB_PATH=/data/telematics.db
       - GPS_SERIAL_DEVICE=tcp://gps-multiplexer:2947
 
@@ -46,13 +44,11 @@ services:
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the UPS HAT
     volumes:
-      - telematics_data:/data
+      - shared-sqlite:/data
     cpuset: "3"
     environment:
       - UDEV=1
-      - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
-      - API_KEY=${API_KEY}
       - DB_PATH=/data/telematics.db
       - TELEMATICS_DB_PATH=/data/telematics.db
       - UPS_BATTERY_CAPACITY_MAH
@@ -72,20 +68,31 @@ services:
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to shared I2C bus
     volumes:
-      - telematics_data:/data
+      - shared-sqlite:/data
     environment:
       - UDEV=1
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true
-      - WEBHOOK_URL=${WEBHOOK_URL}
       - VEHICLE_ID=${VEHICLE_ID}
-      - API_KEY=${API_KEY}
       - SCAN_CONTENTION_BACKOFF_CAP_SECONDS=12
       - SCAN_CONTENTION_COOLDOWN_THRESHOLD=3
       - SCAN_DURATION_SECONDS=20
       - POLL_INTERVAL=60
       - TELEMATICS_DB_PATH=/data/telematics.db
       - UPLOAD_BATCH_SIZE=${BLE_UPLOAD_BATCH_SIZE:-25}
+
+  sync-service:
+    build:
+      context: .
+      dockerfile: sync-service/Dockerfile
+    restart: always
+    volumes:
+      - shared-sqlite:/data
+    environment:
+      - VEHICLE_ID=${VEHICLE_ID}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - MOTIVE_API_KEY=${MOTIVE_API_KEY}
+      - DB_PATH=/data/telematics.db
 
   imu-calibration:
     build:
@@ -125,4 +132,5 @@ services:
       - BLE_CALIBRATION_REFRESH_SECONDS
 
 volumes:
+  shared-sqlite:
   telematics_data:
