@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import random
 import os
 import shlex
 import sys
@@ -11,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 import aiosqlite
 import uvloop
 from ina219 import INA219, DeviceRangeError
@@ -28,13 +26,6 @@ from shared.hardware_probe import (
 
 logger = logging.getLogger(__name__)
 
-UPLOADABLE_EVENT_TYPES: tuple[str, ...] = (
-    "power_snapshot",
-    "power_state",
-    "power_health",
-    "power_diagnostic",
-    "power_event",
-)
 SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
 SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
 DEFAULT_UPS_MAX_EXPECTED_AMPS = 4.0
@@ -173,8 +164,6 @@ class INA219Driver:
 class Config:
     vehicle_id: str
     db_path: str
-    webhook_url: str | None
-    api_key: str
     sample_interval_seconds: int
     ina219_addresses: tuple[int, ...]
     i2c_bus: int
@@ -192,9 +181,6 @@ class Config:
     shutdown_voltage_recover_v: float
     shutdown_consecutive_samples: int
     shutdown_command_timeout_seconds: float
-    upload_batch_size: int
-    upload_backoff_initial_seconds: int
-    upload_backoff_max_seconds: int
     queue_max_events: int
     maintenance_interval_seconds: int
     imu_i2c_bus: int
@@ -346,8 +332,6 @@ def load_config() -> Config:
     return Config(
         vehicle_id=_sanitize_env_value(os.getenv("VEHICLE_ID")) or "UNKNOWN_TRUCK",
         db_path=_sanitize_env_value(os.getenv("TELEMATICS_DB_PATH")) or "/data/telematics.db",
-        webhook_url=_sanitize_env_value(os.getenv("WEBHOOK_URL")),
-        api_key=_sanitize_env_value(os.getenv("API_KEY")) or "",
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 2, minimum=1),
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
@@ -375,9 +359,6 @@ def load_config() -> Config:
             1.0,
             _read_float_env("UPS_SHUTDOWN_COMMAND_TIMEOUT_SECONDS", 10.0),
         ),
-        upload_batch_size=_read_int_env("POWER_UPLOAD_BATCH_SIZE", 50, minimum=1),
-        upload_backoff_initial_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_INITIAL_SECONDS", 5, minimum=1),
-        upload_backoff_max_seconds=_read_int_env("POWER_UPLOAD_BACKOFF_MAX_SECONDS", 300, minimum=10),
         queue_max_events=_read_int_env("POWER_QUEUE_MAX_EVENTS", 2000, minimum=100),
         maintenance_interval_seconds=_read_int_env("POWER_MAINTENANCE_INTERVAL_SECONDS", 30, minimum=10),
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
@@ -561,181 +542,26 @@ async def configure_sqlite(conn: aiosqlite.Connection) -> None:
 async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS power_readings (
+        CREATE TABLE IF NOT EXISTS local_power (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vehicle_id TEXT NOT NULL,
-            occurred_at TEXT NOT NULL,
-            payload TEXT NOT NULL
+            battery_percent REAL,
+            power_state TEXT NOT NULL,
+            occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vehicle_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            occurred_at TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            synced INTEGER DEFAULT 0,
-            upload_attempts INTEGER DEFAULT 0,
-            last_error TEXT
-        )
-        """
-    )
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_sync_id ON events(synced, id)")
-    await _ensure_column(conn, "events", "upload_attempts", "INTEGER DEFAULT 0")
-    await _ensure_column(conn, "events", "last_error", "TEXT")
     await conn.commit()
 
-
-async def _ensure_column(conn: aiosqlite.Connection, table_name: str, column_name: str, column_def: str) -> None:
-    try:
-        await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
-    except aiosqlite.OperationalError as exc:
-        if "duplicate column name" not in str(exc).lower():
-            raise
-
-
-async def write_reading(
+async def insert_local_power(
     conn: aiosqlite.Connection,
-    vehicle_id: str,
-    occurred_at: str,
-    payload: dict[str, Any],
+    battery_percent: float | int | None,
+    power_state: str,
 ) -> None:
-    json_payload = json.dumps(payload, separators=(",", ":"))
     await conn.execute(
-        "INSERT INTO power_readings(vehicle_id, occurred_at, payload) VALUES(?, ?, ?)",
-        (vehicle_id, occurred_at, json_payload),
+        "INSERT INTO local_power (battery_percent, power_state) VALUES (?, ?)",
+        (battery_percent, power_state),
     )
     await conn.commit()
-
-
-async def enqueue_event(
-    conn: aiosqlite.Connection,
-    vehicle_id: str,
-    event_type: str,
-    occurred_at: str,
-    payload: dict[str, Any],
-    queue_max_events: int,
-) -> None:
-    json_payload = json.dumps(payload, separators=(",", ":"))
-    await conn.execute(
-        "INSERT INTO events(vehicle_id, event_type, occurred_at, payload, synced) VALUES(?, ?, ?, ?, 0)",
-        (vehicle_id, event_type, occurred_at, json_payload),
-    )
-    await conn.execute(
-        """
-        DELETE FROM events
-        WHERE id IN (
-            SELECT id FROM events
-            WHERE synced = 0
-            ORDER BY id ASC
-            LIMIT (
-                SELECT CASE WHEN COUNT(*) > ? THEN COUNT(*) - ? ELSE 0 END FROM events WHERE synced = 0
-            )
-        )
-        """,
-        (queue_max_events, queue_max_events),
-    )
-    await conn.commit()
-
-
-async def get_pending_events(
-    conn: aiosqlite.Connection,
-    limit: int,
-    event_types: tuple[str, ...] = UPLOADABLE_EVENT_TYPES,
-) -> list[tuple[int, str, str, str, str]]:
-    placeholders = ",".join("?" for _ in event_types)
-    cursor = await conn.execute(
-        f"""
-        SELECT id, vehicle_id, event_type, occurred_at, payload
-        FROM events
-        WHERE synced = 0
-          AND event_type IN ({placeholders})
-        ORDER BY id ASC
-        LIMIT ?
-        """,
-        (*event_types, limit),
-    )
-    rows = await cursor.fetchall()
-    await cursor.close()
-    return [(int(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])) for row in rows]
-
-
-async def mark_event_uploaded(conn: aiosqlite.Connection, event_id: int) -> None:
-    await conn.execute("UPDATE events SET synced = 1, last_error = NULL WHERE id = ?", (event_id,))
-    await conn.commit()
-
-
-async def mark_event_failed(conn: aiosqlite.Connection, event_id: int, error_text: str) -> None:
-    await conn.execute(
-        "UPDATE events SET upload_attempts = upload_attempts + 1, last_error = ? WHERE id = ?",
-        (error_text[:300], event_id),
-    )
-    await conn.commit()
-
-
-async def publish_event(
-    session: aiohttp.ClientSession,
-    webhook_url: str | None,
-    api_key: str,
-    event_type: str,
-    vehicle_id: str,
-    occurred_at: str,
-    payload: dict[str, Any],
-) -> tuple[bool, str | None]:
-    if not webhook_url:
-        return False, "webhook_not_configured"
-
-    body = {
-        "event_type": event_type,
-        "vehicle_id": vehicle_id,
-        "occurred_at": occurred_at,
-        "payload": payload,
-    }
-    if event_type == "power_snapshot":
-        body["power_metrics"] = payload
-    headers = {"X-Api-Key": api_key} if api_key else {}
-    try:
-        async with session.post(webhook_url, json=body, headers=headers) as response:
-            if response.status >= 400:
-                response_text = (await response.text())[:300]
-                return False, f"http_{response.status}:{response_text}"
-            return True, None
-    except Exception as exc:
-        return False, f"{type(exc).__name__}:{exc}"
-
-
-async def drain_upload_queue(config: Config, conn: aiosqlite.Connection, session: aiohttp.ClientSession) -> tuple[bool, int]:
-    pending = await get_pending_events(conn, config.upload_batch_size, UPLOADABLE_EVENT_TYPES)
-    if not pending:
-        return True, 0
-
-    for event_id, vehicle_id, event_type, occurred_at, payload_json in pending:
-        payload = json.loads(payload_json)
-        success, error_text = await publish_event(
-            session=session,
-            webhook_url=config.webhook_url,
-            api_key=config.api_key,
-            event_type=event_type,
-            vehicle_id=vehicle_id,
-            occurred_at=occurred_at,
-            payload=payload,
-        )
-        if success:
-            await mark_event_uploaded(conn, event_id)
-            continue
-
-        reason = error_text or "unknown_error"
-        await mark_event_failed(conn, event_id, reason)
-        print(
-            "Power event upload error: "
-            f"event_id={event_id} event_type={event_type} queue_depth={len(pending)} reason={reason}"
-        )
-        return False, len(pending)
-
-    return True, len(pending)
 
 
 @dataclass
@@ -750,9 +576,6 @@ class RuntimeStats:
     sensor_reinit_attempts: int = 0
     sensor_reinit_successes: int = 0
     state_transitions: int = 0
-    uploader_failure_streak: int = 0
-    last_upload_ok_at: str | None = None
-    last_upload_attempt_at: str | None = None
     shutdown_requested: bool = False
 
 
@@ -980,7 +803,6 @@ async def state_engine_loop(
     stats: RuntimeStats,
 ) -> None:
     previous_state: str | None = None
-    previous_flags: dict[str, bool] | None = None
     low_battery_counter = 0
     while True:
         event = await in_queue.get()
@@ -991,63 +813,22 @@ async def state_engine_loop(
         payload.update(current_flags)
         current_state = _derive_power_state(current_flags)
         payload["power_state"] = current_state
+        battery_percent = payload.get("state_of_charge_pct_estimate")
 
-        await write_reading(conn, config.vehicle_id, occurred_at, payload)
-        await enqueue_event(conn, config.vehicle_id, "power_snapshot", occurred_at, payload, config.queue_max_events)
-        if bool(payload.get("ovf")):
-            overflow_diagnostic_payload = {
-                "state": current_state,
-                "flags": current_flags,
-                "diagnostic": payload.get("overflow_diagnostic", {}),
-                "reading": {
-                    "ina219_address": payload.get("ina219_address"),
-                    "bus_voltage_v": payload.get("bus_voltage_v"),
-                    "shunt_voltage_mv": payload.get("shunt_voltage_mv"),
-                    "current_ma": payload.get("current_ma"),
-                    "power_mw": payload.get("power_mw"),
-                },
-            }
-            await enqueue_event(
-                conn,
-                config.vehicle_id,
-                "power_diagnostic",
+        try:
+            await insert_local_power(conn, battery_percent, current_state)
+        except Exception as exc:
+            logger.exception(
+                "Failed to insert local_power row at %s (battery_percent=%s power_state=%s): %s",
                 occurred_at,
-                overflow_diagnostic_payload,
-                config.queue_max_events,
+                battery_percent,
+                current_state,
+                exc,
             )
 
         if previous_state is not None and current_state != previous_state:
             stats.state_transitions += 1
-            transition_payload = {
-                "state": current_state,
-                "previous_state": previous_state,
-                "flags": current_flags,
-            }
-            await enqueue_event(
-                conn,
-                config.vehicle_id,
-                "power_state",
-                occurred_at,
-                transition_payload,
-                config.queue_max_events,
-            )
             print(f"Power state transition: {previous_state} -> {current_state} at {occurred_at}")
-
-        if previous_flags is None or any(previous_flags.get(key) != value for key, value in current_flags.items()):
-            health_payload = {
-                "state": current_state,
-                "previous_state": previous_state,
-                "flags": current_flags,
-                "previous_flags": previous_flags or {},
-            }
-            await enqueue_event(
-                conn,
-                config.vehicle_id,
-                "power_health",
-                occurred_at,
-                health_payload,
-                config.queue_max_events,
-            )
 
         shutdown_breach = _evaluate_shutdown_trip(payload, config)
         if shutdown_breach is not None:
@@ -1057,34 +838,6 @@ async def state_engine_loop(
                 and not stats.shutdown_requested
             ):
                 stats.shutdown_requested = True
-                shutdown_event_payload = {
-                    "event": "shutdown_requested",
-                    "reason": shutdown_breach["reasons"],
-                    "trigger_sample_count": low_battery_counter,
-                    "required_consecutive_samples": config.shutdown_consecutive_samples,
-                    "thresholds": {
-                        "soc_trip_pct": config.shutdown_soc_trip_pct,
-                        "soc_recover_pct": config.shutdown_soc_recover_pct,
-                        "bus_voltage_trip_v": config.shutdown_voltage_trip_v,
-                        "bus_voltage_recover_v": config.shutdown_voltage_recover_v,
-                    },
-                    "measurement": {
-                        "soc_pct": shutdown_breach["soc_pct"],
-                        "bus_voltage_v": shutdown_breach["voltage_v"],
-                        "current_ma": shutdown_breach["current_ma"],
-                        "power_state": shutdown_breach["power_state"],
-                    },
-                    "debounce_started_at": occurred_at,
-                    "requested_at": datetime.now(timezone.utc).isoformat(),
-                }
-                await enqueue_event(
-                    conn,
-                    config.vehicle_id,
-                    "power_event",
-                    occurred_at,
-                    shutdown_event_payload,
-                    config.queue_max_events,
-                )
                 print(
                     "Power shutdown policy triggered: "
                     f"reasons={shutdown_breach['reasons']} "
@@ -1131,56 +884,13 @@ async def state_engine_loop(
                 )
             low_battery_counter = 0
 
-        previous_flags = current_flags
         previous_state = current_state
-        await conn.commit()
         in_queue.task_done()
         print(f"Stored power reading: {payload.get('status')} state={current_state} at {occurred_at}")
 
 
-async def uploader_loop(config: Config, conn: aiosqlite.Connection, session: aiohttp.ClientSession, stats: RuntimeStats) -> None:
-    upload_backoff_seconds = config.upload_backoff_initial_seconds
-    while True:
-        stats.last_upload_attempt_at = datetime.now(timezone.utc).isoformat()
-        uploaded, queue_depth = await drain_upload_queue(config, conn, session)
-        if uploaded:
-            upload_backoff_seconds = config.upload_backoff_initial_seconds
-            stats.uploader_failure_streak = 0
-            stats.last_upload_ok_at = datetime.now(timezone.utc).isoformat()
-            await asyncio.sleep(1)
-            continue
-
-        stats.uploader_failure_streak += 1
-        jitter = random.uniform(0, min(1.0, upload_backoff_seconds * 0.2))
-        upload_backoff_seconds = min(
-            config.upload_backoff_max_seconds,
-            max(config.upload_backoff_initial_seconds, upload_backoff_seconds * 2),
-        )
-        delay = upload_backoff_seconds + jitter
-        print(
-            "Uploader backoff active: "
-            f"next_delay={round(delay, 2)}s queue_depth={queue_depth}"
-        )
-        await asyncio.sleep(delay)
-
-
 async def maintenance_loop(config: Config, conn: aiosqlite.Connection, stats: RuntimeStats) -> None:
     while True:
-        queue_depth_cursor = await conn.execute("SELECT COUNT(*) FROM events WHERE synced = 0")
-        queue_depth_row = await queue_depth_cursor.fetchone()
-        await queue_depth_cursor.close()
-        queue_depth = int(queue_depth_row[0]) if queue_depth_row else 0
-
-        age_cursor = await conn.execute(
-            "SELECT occurred_at FROM events WHERE synced = 0 ORDER BY id ASC LIMIT 1"
-        )
-        age_row = await age_cursor.fetchone()
-        await age_cursor.close()
-        oldest_upload_age_seconds: float | None = None
-        if age_row and age_row[0]:
-            oldest = datetime.fromisoformat(str(age_row[0]))
-            oldest_upload_age_seconds = (datetime.now(timezone.utc) - oldest).total_seconds()
-
         sensor_staleness_seconds: float | None = None
         if stats.last_sensor_read_at:
             last_sensor_dt = datetime.fromisoformat(stats.last_sensor_read_at)
@@ -1193,54 +903,9 @@ async def maintenance_loop(config: Config, conn: aiosqlite.Connection, stats: Ru
             f"sensor_latency_ms={stats.last_sensor_latency_ms if stats.last_sensor_latency_ms is not None else 'n/a'} "
             f"reinit={stats.sensor_reinit_successes}/{stats.sensor_reinit_attempts} "
             f"state_transitions={stats.state_transitions} "
-            f"uploader_failure_streak={stats.uploader_failure_streak} "
-            f"queue_depth={queue_depth} "
-            f"oldest_upload_age_s={round(oldest_upload_age_seconds, 2) if oldest_upload_age_seconds is not None else 'n/a'} "
-            f"last_upload_ok_at={stats.last_upload_ok_at or 'n/a'}"
+            f"shutdown_requested={stats.shutdown_requested}"
         )
         await asyncio.sleep(config.maintenance_interval_seconds)
-
-
-async def health_emitter_loop(config: Config, conn: aiosqlite.Connection, stats: RuntimeStats) -> None:
-    while True:
-        occurred_at = datetime.now(timezone.utc).isoformat()
-        queue_depth_cursor = await conn.execute("SELECT COUNT(*) FROM events WHERE synced = 0")
-        queue_depth_row = await queue_depth_cursor.fetchone()
-        await queue_depth_cursor.close()
-        queue_depth = int(queue_depth_row[0]) if queue_depth_row else 0
-
-        last_upload_success_age_sec: float | None = None
-        if stats.last_upload_ok_at:
-            last_upload_ok_dt = datetime.fromisoformat(stats.last_upload_ok_at)
-            last_upload_success_age_sec = max(0.0, (datetime.now(timezone.utc) - last_upload_ok_dt).total_seconds())
-
-        health_payload: dict[str, Any] = {
-            "queue_depth": queue_depth,
-            "consecutive_read_failures": stats.consecutive_read_failures,
-            "last_upload_success_age_sec": round(last_upload_success_age_sec, 2) if last_upload_success_age_sec is not None else None,
-            "sensor_reinit_count": stats.sensor_reinit_count,
-            "sensor_status_marker": stats.last_sensor_marker or "unknown",
-            "sensor_status": stats.last_sensor_status or "unknown",
-        }
-        if stats.last_successful_read_at:
-            last_successful_read_dt = datetime.fromisoformat(stats.last_successful_read_at)
-            health_payload["last_successful_read_age_sec"] = round(
-                max(0.0, (datetime.now(timezone.utc) - last_successful_read_dt).total_seconds()),
-                2,
-            )
-
-        if stats.consecutive_read_failures > 0:
-            health_payload["sensor_fault"] = True
-
-        await enqueue_event(
-            conn,
-            config.vehicle_id,
-            "power_health",
-            occurred_at,
-            health_payload,
-            config.queue_max_events,
-        )
-        await asyncio.sleep(60)
 
 
 async def run() -> None:
@@ -1302,14 +967,10 @@ async def run() -> None:
     ) as conn:
         await configure_sqlite(conn)
         await init_db(conn)
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with asyncio.TaskGroup() as task_group:
-                task_group.create_task(sensor_loop(config, monitor, sensor_queue, stats))
-                task_group.create_task(state_engine_loop(config, conn, sensor_queue, stats))
-                task_group.create_task(uploader_loop(config, conn, session, stats))
-                task_group.create_task(maintenance_loop(config, conn, stats))
-                task_group.create_task(health_emitter_loop(config, conn, stats))
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(sensor_loop(config, monitor, sensor_queue, stats))
+            task_group.create_task(state_engine_loop(config, conn, sensor_queue, stats))
+            task_group.create_task(maintenance_loop(config, conn, stats))
 
 
 if __name__ == "__main__":
