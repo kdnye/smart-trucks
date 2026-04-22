@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-import aiohttp
+import aiosqlite
 import uvloop
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -20,15 +20,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from db import (
     get_db_stats,
     get_latest_power_snapshot,
-    get_pending_gps_points,
-    get_pending_heartbeats,
-    increment_gps_attempts,
-    increment_heartbeat_attempts,
     init_db,
-    insert_gps_point,
     insert_heartbeat,
-    mark_gps_points_sent,
-    mark_heartbeats_sent,
     pop_beacon_wake_signal,
     purge_old_sent_rows,
     record_edge_health,
@@ -50,16 +43,11 @@ logger = logging.getLogger(__name__)
 class Config:
     vehicle_id: str
     device_role: str
-    webhook_url: str | None
-    api_key: str
     gps_sample_interval_seconds: int
     heartbeat_interval_seconds: int
-    sync_interval_seconds: int
     gps_serial_candidates: tuple[str, ...]
     gps_probe_all_candidates: bool
     gps_baud_rate: int
-    sync_batch_size: int
-    sync_backoff_max_seconds: int
     queue_alert_depth: int
     power_snapshot_max_age_seconds: int
     imu_i2c_bus: int
@@ -137,16 +125,11 @@ def load_config() -> Config:
     return Config(
         vehicle_id=_read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
         device_role=device_role,
-        webhook_url=_read_str_env("WEBHOOK_URL"),
-        api_key=_read_str_env("API_KEY", "") or "",
         gps_sample_interval_seconds=max(1, int(_read_str_env("GPS_SAMPLE_INTERVAL_SECONDS", "5") or "5")),
         heartbeat_interval_seconds=max(10, int(_read_str_env("HEARTBEAT_INTERVAL_SECONDS", "60") or "60")),
-        sync_interval_seconds=max(5, int(_read_str_env("SYNC_INTERVAL_SECONDS", "20") or "20")),
         gps_serial_candidates=serial_devices,
         gps_probe_all_candidates=probe_all_candidates,
         gps_baud_rate=max(1200, int(_read_str_env("GPS_BAUD_RATE", "9600") or "9600")),
-        sync_batch_size=max(10, int(_read_str_env("SYNC_BATCH_SIZE", "50") or "50")),
-        sync_backoff_max_seconds=max(30, int(_read_str_env("SYNC_BACKOFF_MAX_SECONDS", "300") or "300")),
         queue_alert_depth=max(100, int(_read_str_env("QUEUE_ALERT_DEPTH", "1000") or "1000")),
         power_snapshot_max_age_seconds=max(5, int(_read_str_env("POWER_SNAPSHOT_MAX_AGE_SECONDS", "30") or "30")),
         network_watchdog_enabled=(_read_str_env("NETWORK_WATCHDOG_ENABLED", "true") or "true").lower() in {"1", "true", "yes"},
@@ -172,9 +155,7 @@ class RuntimeState:
     local_sequence: int = 0
     last_gps_fix_utc: str | None = None
     last_locked_gps_point_utc: str | None = None
-    last_upload_success_utc: str | None = None
     gps_reader_ok: bool = True
-    uploader_ok: bool = True
     power_monitor_ok: bool = True
     wifi_connected: bool = False
     latest_valid_gps: dict[str, Any] | None = None
@@ -473,36 +454,14 @@ async def gps_reader_worker(config: Config, state: RuntimeState) -> None:
         retry_backoff_seconds = min(max_retry_backoff_seconds, retry_backoff_seconds * 2)
 
 
-async def post_payload(
-    session: aiohttp.ClientSession,
-    config: Config,
-    payload: dict[str, Any],
-    idempotency_key: str,
-) -> bool:
-    if not config.webhook_url:
-        return False
-
-    headers = {"X-Idempotency-Key": idempotency_key}
-    if config.api_key:
-        headers["X-Api-Key"] = config.api_key
-
-    try:
-        async with session.post(config.webhook_url, json=payload, headers=headers) as response:
-            if 200 <= response.status < 300:
-                return True
-            body = await response.text()
-            print(f"Sync failed. Status={response.status} Body={body[:200]}")
-            return False
-    except Exception as exc:
-        print(f"Cloud connection failed: {exc}")
-        return False
-
 
 PARKED_SLEEP_SECONDS = 50.0
 # Truck is considered active for this many seconds after the last IMU motion event.
 ACTIVE_AFTER_MOTION_SECONDS = 300.0
 # GPS speed threshold below which the truck is considered stationary.
 _MOVING_SPEED_KMH = 5.0
+LOCAL_DB_PATH = "/data/telematics.db"
+SQLITE_BUSY_TIMEOUT_MS = int(_read_str_env("SQLITE_BUSY_TIMEOUT_MS", "30000") or "30000")
 
 
 def _adaptive_parked_sleep_seconds(power: dict[str, Any] | None) -> float:
@@ -527,33 +486,36 @@ def _truck_is_active(state: RuntimeState) -> bool:
         return True
     return False
 
+async def _insert_local_gps_point(
+    *,
+    lat: float | None,
+    lon: float | None,
+    speed: float | None,
+    fix_status: str,
+) -> None:
+    try:
+        async with aiosqlite.connect(LOCAL_DB_PATH) as db:
+            await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+            await db.execute("PRAGMA journal_mode=WAL;")
+            await db.execute(
+                "INSERT INTO local_gps (lat, lon, speed, fix_status) VALUES (?, ?, ?, ?)",
+                (lat, lon, speed, fix_status),
+            )
+            await db.commit()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Failed to insert local_gps row into %s: %s", LOCAL_DB_PATH, exc)
+
 
 async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
     """Lean GPS stash + WiFi re-check executed on every parked sleep tick."""
-    captured_at = utc_now_iso()
     gps = build_location_payload(get_latest_gps(config, state))
     if gps.get("fix_status") == "locked":
         state.local_sequence += 1
-        payload = {
-            "event_type": "gps_point",
-            "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
-            "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
-            "captured_at_utc": captured_at,
-            "local_sequence": state.local_sequence,
-            "location": gps,
-            "parked": True,
-        }
-        await insert_gps_point(
-            vehicle_id=config.vehicle_id,
-            captured_at_utc=captured_at,
+        await _insert_local_gps_point(
             lat=gps.get("latitude"),
             lon=gps.get("longitude"),
-            speed_kmh=gps.get("speed_kmh"),
+            speed=gps.get("speed_kmh"),
             fix_status=gps.get("fix_status", "searching"),
-            source_device=gps.get("device"),
-            trip_id=None,
-            local_sequence=state.local_sequence,
-            payload=payload,
         )
 
     if _truck_is_active(state):
@@ -600,10 +562,10 @@ async def parked_scan_worker(config: Config, state: RuntimeState) -> None:
             else:
                 logger.info("Parked mode: motion wake — exiting parked mode.")
                 state.parked_mode = False
-            # Immediately check WiFi so the sync worker can start draining the queue.
+            # Immediately check WiFi so buffered workers can resume normal cadence.
             if is_network_connected():
                 state.wifi_connected = True
-                logger.info("Parked wake: WiFi available — sync worker will upload queued data.")
+                logger.info("Parked wake: WiFi available — exiting low-power mode.")
             continue
         except asyncio.TimeoutError:
             pass
@@ -624,26 +586,11 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
             state.last_locked_gps_point_utc = captured_at
             state.local_sequence += 1
 
-            payload = {
-                "event_type": "gps_point",
-                "pi_device_id": os.environ.get("BALENA_DEVICE_NAME_AT_INIT", "Unknown_Pi"),
-                "motive_vehicle_id": os.environ.get("MOTIVE_VEHICLE_ID"),
-                "captured_at_utc": captured_at,
-                "local_sequence": state.local_sequence,
-                "location": gps,
-            }
-
-            await insert_gps_point(
-                vehicle_id=config.vehicle_id,
-                captured_at_utc=captured_at,
+            await _insert_local_gps_point(
                 lat=gps.get("latitude"),
                 lon=gps.get("longitude"),
-                speed_kmh=gps.get("speed_kmh"),
+                speed=gps.get("speed_kmh"),
                 fix_status=gps.get("fix_status", "searching"),
-                source_device=gps.get("device"),
-                trip_id=None,
-                local_sequence=state.local_sequence,
-                payload=payload,
             )
         else:
             stale_for = age_seconds(state.last_gps_fix_utc)
@@ -708,62 +655,6 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
         await asyncio.sleep(config.heartbeat_interval_seconds)
 
 
-async def sync_worker(config: Config, state: RuntimeState, session: aiohttp.ClientSession) -> None:
-    backoff_seconds = config.sync_interval_seconds
-
-    while True:
-        if not config.webhook_url:
-            await asyncio.sleep(config.sync_interval_seconds)
-            continue
-
-        if not is_network_connected():
-            state.wifi_connected = False
-            state.uploader_ok = False
-            await asyncio.sleep(backoff_seconds)
-            backoff_seconds = min(config.sync_backoff_max_seconds, backoff_seconds * 2)
-            continue
-
-        state.wifi_connected = True
-        did_send = False
-
-        pending_gps = await get_pending_gps_points(limit=config.sync_batch_size)
-        for row_id, captured_at, payload_json, local_sequence in pending_gps:
-            payload = json.loads(payload_json)
-            idempotency_key = f"{config.vehicle_id}:{captured_at}:{local_sequence}"
-            await increment_gps_attempts([row_id])
-            success = await post_payload(session, config, payload, idempotency_key)
-            if success:
-                await mark_gps_points_sent([row_id])
-                state.last_upload_success_utc = utc_now_iso()
-                state.uploader_ok = True
-                did_send = True
-            else:
-                state.uploader_ok = False
-                break
-
-        if state.uploader_ok:
-            pending_heartbeats = await get_pending_heartbeats(limit=config.sync_batch_size)
-            for row_id, captured_at, payload_json in pending_heartbeats:
-                payload = json.loads(payload_json)
-                idempotency_key = f"{config.vehicle_id}:{captured_at}:heartbeat:{row_id}"
-                await increment_heartbeat_attempts([row_id])
-                success = await post_payload(session, config, payload, idempotency_key)
-                if success:
-                    await mark_heartbeats_sent([row_id])
-                    state.last_upload_success_utc = utc_now_iso()
-                    state.uploader_ok = True
-                    did_send = True
-                else:
-                    state.uploader_ok = False
-                    break
-
-        if did_send:
-            backoff_seconds = config.sync_interval_seconds
-        else:
-            backoff_seconds = min(config.sync_backoff_max_seconds, max(config.sync_interval_seconds, backoff_seconds))
-
-        await asyncio.sleep(backoff_seconds)
-
 
 async def maintenance_worker(config: Config, state: RuntimeState) -> None:
     while True:
@@ -777,17 +668,12 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
         disk_free_mb = round(disk.free / (1024 * 1024), 2)
 
         last_gps_fix_age = age_seconds(state.last_gps_fix_utc)
-        last_upload_age = age_seconds(state.last_upload_success_utc)
         queue_depth = db_stats["queue_depth"]
 
         alerts: list[str] = []
         if config.device_role != "warehouse" and last_gps_fix_age is not None and last_gps_fix_age > 300:
             alerts.append("gps_reader_stale")
             state.gps_reader_ok = False
-
-        if last_upload_age is not None and last_upload_age > 300 and queue_depth > 0:
-            alerts.append("uploader_stale")
-            state.uploader_ok = False
 
         if queue_depth > config.queue_alert_depth:
             alerts.append("queue_depth_high")
@@ -804,15 +690,12 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
             "vehicle_id": config.vehicle_id,
             "captured_at_utc": utc_now_iso(),
             "last_gps_fix_utc": state.last_gps_fix_utc,
-            "last_upload_success_utc": state.last_upload_success_utc,
             "last_gps_fix_age_sec": last_gps_fix_age,
             "last_locked_gps_point_age_sec": age_seconds(state.last_locked_gps_point_utc),
-            "last_upload_success_age_sec": last_upload_age,
             "pending_gps_points": db_stats["pending_gps_points"],
             "pending_heartbeats": db_stats["pending_heartbeats"],
             "wifi_connected": state.wifi_connected,
             "gps_reader_ok": state.gps_reader_ok,
-            "uploader_ok": state.uploader_ok,
             "power_monitor_ok": state.power_monitor_ok,
             "disk_free_mb": disk_free_mb,
             "process_uptime_sec": int(time.monotonic() - state.start_monotonic),
@@ -829,7 +712,7 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
             {
                 "captured_at_utc": edge_payload["captured_at_utc"],
                 "last_gps_fix_utc": state.last_gps_fix_utc,
-                "last_upload_success_utc": state.last_upload_success_utc,
+                "last_upload_success_utc": None,
                 "queue_depth": queue_depth,
                 "disk_free_mb": disk_free_mb,
                 "wifi_state": "connected" if state.wifi_connected else "disconnected",
@@ -893,24 +776,21 @@ async def run() -> None:
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
 
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [
-            asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
-            asyncio.create_task(sync_worker(config, state, session)),
-            asyncio.create_task(maintenance_worker(config, state)),
-            asyncio.create_task(network_watchdog_worker(config, state)),
-        ]
-        if not warehouse_mode and imu is not None:
-            tasks.extend(
-                [
-                    asyncio.create_task(imu.start()),
-                    asyncio.create_task(gps_reader_worker(config, state)),
-                    asyncio.create_task(gps_collector_worker(config, state)),
-                    asyncio.create_task(parked_scan_worker(config, state)),
-                ]
-            )
-        await asyncio.gather(*tasks)
+    tasks = [
+        asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
+        asyncio.create_task(maintenance_worker(config, state)),
+        asyncio.create_task(network_watchdog_worker(config, state)),
+    ]
+    if not warehouse_mode and imu is not None:
+        tasks.extend(
+            [
+                asyncio.create_task(imu.start()),
+                asyncio.create_task(gps_reader_worker(config, state)),
+                asyncio.create_task(gps_collector_worker(config, state)),
+                asyncio.create_task(parked_scan_worker(config, state)),
+            ]
+        )
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
