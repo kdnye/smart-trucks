@@ -7,9 +7,9 @@ from typing import Any
 
 import requests
 
-DB_PATH = "/data/telematics.db"
-SYNC_INTERVAL_SECONDS = 60
-HTTP_TIMEOUT_SECONDS = 15
+DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
+SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -124,9 +124,15 @@ def _send_payload(payload: dict[str, Any]) -> requests.Response:
     if not webhook_url:
         raise RuntimeError("WEBHOOK_URL is not set.")
 
+    headers = {}
+    motive_api_key = os.environ.get("MOTIVE_API_KEY")
+    if motive_api_key:
+        headers["X-API-Key"] = motive_api_key
+
     return requests.post(
         webhook_url,
         json=payload,
+        headers=headers or None,
         timeout=HTTP_TIMEOUT_SECONDS,
     )
 
