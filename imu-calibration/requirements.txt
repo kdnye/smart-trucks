@@ -1,4 +1,4 @@
-aiohttp==3.9.3
+aiohttp==3.13.4
 aiosqlite==0.19.0
 smbus2==0.4.3
 uvloop==0.19.0
