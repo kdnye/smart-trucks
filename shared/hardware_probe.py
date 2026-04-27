@@ -208,17 +208,32 @@ def validate_inventory(inventory: HardwareInventory, *, imu_required: bool, ups_
 
     if i2c.overlap_addresses:
         overlaps = ", ".join(f"0x{addr:02X}" for addr in i2c.overlap_addresses)
-        errors.append(f"UPS/IMU I2C overlap detected: {overlaps}")
+        errors.append(
+            "UPS/IMU I2C overlap detected: "
+            f"{overlaps}. Action: configure non-overlapping IMU_EXPECTED_ADDRESSES and "
+            "UPS_I2C_ADDRESSES so each sensor has a unique address."
+        )
 
     if imu_required and not i2c.imu_found_addresses:
         expected = ", ".join(f"0x{addr:02X}" for addr in i2c.imu_expected_addresses) or "<none>"
-        errors.append(f"Required IMU device missing on bus {i2c.bus}; expected one of [{expected}]")
+        errors.append(
+            f"Required IMU device missing on bus {i2c.bus}; expected one of [{expected}]. "
+            "Action: verify IMU power/wiring, confirm IMU_I2C_BUS, and set "
+            "IMU_EXPECTED_ADDRESSES to the detected IMU address."
+        )
 
     if ups_required and not i2c.ups_found_addresses:
         expected = ", ".join(f"0x{addr:02X}" for addr in i2c.ups_expected_addresses) or "<none>"
-        errors.append(f"Required UPS device missing on bus {i2c.bus}; expected one of [{expected}]")
+        errors.append(
+            f"Required UPS device missing on bus {i2c.bus}; expected one of [{expected}]. "
+            "Action: verify UPS HAT seating/wiring, confirm UPS_I2C_BUS, and set "
+            "UPS_I2C_ADDRESSES to the detected INA219 address."
+        )
 
     if i2c.error:
-        errors.append(f"I2C probe failed on bus {i2c.bus}: {i2c.error}")
+        errors.append(
+            f"I2C probe failed on bus {i2c.bus}: {i2c.error}. Action: ensure I2C is enabled "
+            "on the host, check /dev/i2c-* permissions, and verify no other process is locking the bus."
+        )
 
     return errors
