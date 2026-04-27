@@ -95,7 +95,10 @@ def _read_float_env(name: str) -> float | None:
     try:
         return float(value)
     except ValueError:
-        raise ValueError(f"{name} must be a numeric value; received {value!r}.") from None
+        raise ValueError(
+            f"{name} must be a numeric value; received {value!r}. "
+            f"Action: set {name} to a valid decimal number in Balena device/fleet variables."
+        ) from None
 
 
 def load_config() -> Config:
@@ -103,7 +106,10 @@ def load_config() -> Config:
     warehouse_latitude = _read_float_env("WAREHOUSE_LAT")
     warehouse_longitude = _read_float_env("WAREHOUSE_LON")
     if device_role == "warehouse" and (warehouse_latitude is None or warehouse_longitude is None):
-        raise RuntimeError("DEVICE_ROLE=warehouse requires WAREHOUSE_LAT and WAREHOUSE_LON.")
+        raise RuntimeError(
+            "DEVICE_ROLE=warehouse requires WAREHOUSE_LAT and WAREHOUSE_LON. "
+            "Action: set both variables to valid decimal coordinates in Balena for this device."
+        )
 
     raw_candidates = _read_str_env("GPS_SERIAL_CANDIDATES", "/dev/serial0,/dev/ttyS0") or ""
     serial_candidates = tuple(
@@ -758,7 +764,11 @@ async def run() -> None:
         ups_required=False,
     )
     if inventory_errors:
-        raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
+        raise RuntimeError(
+            "Hardware probe failed: "
+            f"{'; '.join(inventory_errors)} "
+            "Action: resolve the hardware and environment variable issues above, then restart telematics-edge."
+        )
 
     imu = ImuMonitor(bus_num=config.imu_i2c_bus) if not warehouse_mode else None
     state = RuntimeState(start_monotonic=time.monotonic())

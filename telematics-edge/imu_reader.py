@@ -87,7 +87,10 @@ def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> l
             if attempt == retries - 1:
                 raise
             time.sleep(0.05)
-    raise RuntimeError("I2C read exhausted retries")
+    raise RuntimeError(
+        "I2C read exhausted retries. Action: check IMU wiring and power, confirm IMU_I2C_BUS matches the host "
+        "bus, and verify no competing process is holding /dev/i2c-*."
+    )
 
 
 class IMUReader:

@@ -953,7 +953,11 @@ async def run() -> None:
         json.dump(inventory.to_dict(), handle, sort_keys=True)
     inventory_errors = validate_inventory(inventory, imu_required=False, ups_required=True)
     if inventory_errors:
-        raise RuntimeError(f"Hardware probe failed: {'; '.join(inventory_errors)}")
+        raise RuntimeError(
+            "Hardware probe failed: "
+            f"{'; '.join(inventory_errors)} "
+            "Action: resolve the hardware and environment variable issues above, then restart power-monitor."
+        )
 
     monitor = UpsMonitor(
         config.ina219_addresses,
