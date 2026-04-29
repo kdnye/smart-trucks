@@ -1,14 +1,15 @@
 import asyncio
+import json
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
 from typing import Any
 
 import requests
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
+SYNC_BATCH_SIZE = max(1, int(os.getenv("SYNC_BATCH_SIZE", "50")))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 
 logging.basicConfig(
@@ -18,108 +19,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PendingRows:
-    gps_id: int | None
-    gps_payload: dict[str, Any]
-    power_id: int | None
-    power_payload: dict[str, Any]
-    ble_ids: list[int]
-    ble_payloads: list[dict[str, Any]]
-
-    @property
-    def has_data(self) -> bool:
-        return self.gps_id is not None or self.power_id is not None or bool(self.ble_ids)
-
-
-def _row_to_payload(row: sqlite3.Row) -> dict[str, Any]:
-    payload = dict(row)
-    payload.pop("synced", None)
-    return payload
-
-
-def _fetch_pending_rows() -> PendingRows:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
+def _load_pending_rows(table: str, limit: int) -> list[tuple[int, str, dict[str, Any]]]:
+    conn = sqlite3.connect(DB_PATH)
     try:
-        gps_row = connection.execute(
-            """
-            SELECT *
-            FROM local_gps
-            WHERE synced = 0
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-        power_row = connection.execute(
-            """
-            SELECT *
-            FROM local_power
-            WHERE synced = 0
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-        ble_rows = connection.execute(
-            """
-            SELECT *
-            FROM local_ble
-            WHERE synced = 0
-            ORDER BY id ASC
-            """
+        rows = conn.execute(
+            f"""
+            SELECT id, captured_at_utc, payload_json
+            FROM {table}
+            WHERE sent_at_utc IS NULL
+            ORDER BY captured_at_utc ASC, id ASC
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
+        return [(int(r[0]), str(r[1]), json.loads(str(r[2]))) for r in rows]
     finally:
-        connection.close()
-
-    return PendingRows(
-        gps_id=None if gps_row is None else int(gps_row["id"]),
-        gps_payload={} if gps_row is None else _row_to_payload(gps_row),
-        power_id=None if power_row is None else int(power_row["id"]),
-        power_payload={} if power_row is None else _row_to_payload(power_row),
-        ble_ids=[int(row["id"]) for row in ble_rows],
-        ble_payloads=[_row_to_payload(row) for row in ble_rows],
-    )
+        conn.close()
 
 
-def _mark_rows_synced(rows: PendingRows) -> None:
-    connection = sqlite3.connect(DB_PATH)
+def _mark_rows_sent(table: str, row_ids: list[int]) -> None:
+    if not row_ids:
+        return
+    placeholders = ",".join("?" for _ in row_ids)
+    conn = sqlite3.connect(DB_PATH)
     try:
-        connection.execute("BEGIN")
-
-        if rows.gps_id is not None:
-            connection.execute("UPDATE local_gps SET synced = 1 WHERE id = ?", (rows.gps_id,))
-
-        if rows.power_id is not None:
-            connection.execute("UPDATE local_power SET synced = 1 WHERE id = ?", (rows.power_id,))
-
-        if rows.ble_ids:
-            placeholders = ",".join("?" for _ in rows.ble_ids)
-            connection.execute(
-                f"UPDATE local_ble SET synced = 1 WHERE id IN ({placeholders})",
-                rows.ble_ids,
-            )
-
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
+        conn.execute(
+            f"UPDATE {table} SET sent_at_utc = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
+            row_ids,
+        )
+        conn.commit()
     finally:
-        connection.close()
+        conn.close()
 
 
-def _build_payload(rows: PendingRows) -> dict[str, Any]:
-    return {
-        "vehicle_id": os.environ.get("VEHICLE_ID"),
-        "event_type": "unified_heartbeat",
-        "gps": rows.gps_payload,
-        "power": rows.power_payload,
-        "ble_scans": rows.ble_payloads,
-    }
+def _increment_attempts(table: str, row_ids: list[int]) -> None:
+    if not row_ids:
+        return
+    placeholders = ",".join("?" for _ in row_ids)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            f"UPDATE {table} SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",
+            row_ids,
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def _send_payload(payload: dict[str, Any]) -> requests.Response:
+def _send_events(events: list[dict[str, Any]]) -> requests.Response:
     webhook_url = os.environ.get("WEBHOOK_URL")
     if not webhook_url:
         raise RuntimeError("WEBHOOK_URL is not set.")
@@ -131,39 +79,65 @@ def _send_payload(payload: dict[str, Any]) -> requests.Response:
 
     return requests.post(
         webhook_url,
-        json=payload,
+        json={"events": events},
         headers=headers or None,
         timeout=HTTP_TIMEOUT_SECONDS,
     )
 
 
 async def sync_cycle() -> None:
-    pending_rows = await asyncio.to_thread(_fetch_pending_rows)
-    if not pending_rows.has_data:
-        logger.debug("No unsynced local rows found; skipping cycle.")
+    pending = {
+        "heartbeats": await asyncio.to_thread(_load_pending_rows, "heartbeats", SYNC_BATCH_SIZE),
+        "gps_points": await asyncio.to_thread(_load_pending_rows, "gps_points", SYNC_BATCH_SIZE),
+        "edge_health": await asyncio.to_thread(_load_pending_rows, "edge_health", SYNC_BATCH_SIZE),
+    }
+    all_rows: list[tuple[str, int, str, dict[str, Any]]] = []
+    for table_name, rows in pending.items():
+        for row_id, captured_at_utc, payload in rows:
+            all_rows.append((table_name, row_id, captured_at_utc, payload))
+
+    all_rows.sort(key=lambda item: (item[2], item[1]))
+    if not all_rows:
+        logger.debug("No pending rows found; skipping cycle.")
         return
 
-    payload = _build_payload(pending_rows)
-    response = await asyncio.to_thread(_send_payload, payload)
+    events = [row[3] for row in all_rows]
+    response = await asyncio.to_thread(_send_events, events)
 
-    if response.status_code == 200:
-        await asyncio.to_thread(_mark_rows_synced, pending_rows)
-        logger.info(
-            "Unified heartbeat synced (gps_id=%s power_id=%s ble_count=%s).",
-            pending_rows.gps_id,
-            pending_rows.power_id,
-            len(pending_rows.ble_ids),
+    ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": []}
+    for table_name, row_id, _, _ in all_rows:
+        ids_by_table[table_name].append(row_id)
+
+    if 200 <= response.status_code < 300:
+        await asyncio.gather(
+            asyncio.to_thread(_mark_rows_sent, "heartbeats", ids_by_table["heartbeats"]),
+            asyncio.to_thread(_mark_rows_sent, "gps_points", ids_by_table["gps_points"]),
+            asyncio.to_thread(_mark_rows_sent, "edge_health", ids_by_table["edge_health"]),
         )
-        return
-
-    logger.warning(
-        "Unified heartbeat not acknowledged (status=%s); leaving rows unsynced.",
-        response.status_code,
-    )
+        logger.info(
+            "Synced events batch (heartbeats=%d gps_points=%d edge_health=%d).",
+            len(ids_by_table["heartbeats"]),
+            len(ids_by_table["gps_points"]),
+            len(ids_by_table["edge_health"]),
+        )
+    elif 400 <= response.status_code < 500:
+        await asyncio.gather(
+            asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
+            asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
+            asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
+        )
+        logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
+    else:
+        logger.warning("5xx/non-2xx response (%s): leaving rows pending for retry.", response.status_code)
 
 
 async def run() -> None:
-    logger.info("Starting sync-service loop: interval=%ss db=%s", SYNC_INTERVAL_SECONDS, DB_PATH)
+    logger.info(
+        "Starting sync-service loop: interval=%ss db=%s batch_size=%s",
+        SYNC_INTERVAL_SECONDS,
+        DB_PATH,
+        SYNC_BATCH_SIZE,
+    )
     while True:
         try:
             await sync_cycle()
