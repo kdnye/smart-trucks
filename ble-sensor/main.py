@@ -1010,47 +1010,6 @@ async def _collect_pi_location(config: Config) -> dict[str, Any]:
     )
 
 
-def _persist_scanned_devices_to_telematics_db(
-    telematics_db_path: str, sensors: Any
-) -> int:
-    if not isinstance(sensors, list):
-        return 0
-
-    rows: list[tuple[Any, Any, Any]] = []
-    for sensor in sensors:
-        if not isinstance(sensor, dict):
-            continue
-        normalized_mac = _canonicalize_mac_address(str(sensor.get("mac_address", "")))
-        if len(normalized_mac) != 17:
-            continue
-        rows.append(
-            (
-                normalized_mac,
-                sensor.get("rssi"),
-                sensor.get("device_type"),
-            )
-        )
-
-    if not rows:
-        return 0
-
-    with _sqlite3.connect(
-        telematics_db_path,
-        timeout=30.0,
-        isolation_level="IMMEDIATE",
-    ) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=5000;")
-        conn.executemany(
-            """
-            INSERT INTO local_ble (mac_address, rssi, device_type)
-            VALUES (?, ?, ?)
-            """,
-            rows,
-        )
-    return len(rows)
-
-
 def _write_ble_wake_signal() -> None:
     try:
         with _sqlite3.connect(
@@ -1207,14 +1166,10 @@ async def run() -> None:
             _record_scan_observations(config.local_db_path, payload)
             _sync_tracked_asset_registry(config)
             _resolve_tracked_asset_positions(config)
-            inserted_count = _persist_scanned_devices_to_telematics_db(
-                config.telematics_db_path,
-                payload.get("sensors"),
-            )
             print(
                 f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
                 f"for captured_at_utc={payload['captured_at_utc']}; "
-                f"inserted_into_local_ble={inserted_count}."
+                "local_ble_write=disabled."
             )
         except Exception as exc:
             print(f"Scan loop error: {exc}")

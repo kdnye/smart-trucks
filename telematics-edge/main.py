@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-import aiosqlite
 import uvloop
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -466,8 +465,6 @@ PARKED_SLEEP_SECONDS = 50.0
 ACTIVE_AFTER_MOTION_SECONDS = 300.0
 # GPS speed threshold below which the truck is considered stationary.
 _MOVING_SPEED_KMH = 5.0
-LOCAL_DB_PATH = "/data/telematics.db"
-SQLITE_BUSY_TIMEOUT_MS = int(_read_str_env("SQLITE_BUSY_TIMEOUT_MS", "30000") or "30000")
 
 
 def _adaptive_parked_sleep_seconds(power: dict[str, Any] | None) -> float:
@@ -492,38 +489,9 @@ def _truck_is_active(state: RuntimeState) -> bool:
         return True
     return False
 
-async def _insert_local_gps_point(
-    *,
-    lat: float | None,
-    lon: float | None,
-    speed: float | None,
-    fix_status: str,
-) -> None:
-    try:
-        async with aiosqlite.connect(LOCAL_DB_PATH) as db:
-            await db.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
-            await db.execute("PRAGMA journal_mode=WAL;")
-            await db.execute(
-                "INSERT INTO local_gps (lat, lon, speed, fix_status) VALUES (?, ?, ?, ?)",
-                (lat, lon, speed, fix_status),
-            )
-            await db.commit()
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to insert local_gps row into %s: %s", LOCAL_DB_PATH, exc)
-
-
 async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
     """Lean GPS stash + WiFi re-check executed on every parked sleep tick."""
     gps = build_location_payload(get_latest_gps(config, state))
-    if gps.get("fix_status") == "locked":
-        state.local_sequence += 1
-        await _insert_local_gps_point(
-            lat=gps.get("latitude"),
-            lon=gps.get("longitude"),
-            speed=gps.get("speed_kmh"),
-            fix_status=gps.get("fix_status", "searching"),
-        )
-
     if _truck_is_active(state):
         logger.info("Parked scan: truck is active — resuming full-rate collection.")
         state.parked_mode = False
@@ -592,12 +560,6 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
             state.last_locked_gps_point_utc = captured_at
             state.local_sequence += 1
 
-            await _insert_local_gps_point(
-                lat=gps.get("latitude"),
-                lon=gps.get("longitude"),
-                speed=gps.get("speed_kmh"),
-                fix_status=gps.get("fix_status", "searching"),
-            )
         else:
             stale_for = age_seconds(state.last_gps_fix_utc)
             state.gps_reader_ok = stale_for is None or stale_for <= 300
@@ -637,6 +599,9 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
             "event_type": "edge_telematics_heartbeat",
             "vehicle_id": config.vehicle_id,
             "captured_at_utc": captured_at,
+            "idempotency_key": (
+                f"{config.vehicle_id}:edge_telematics_heartbeat:{captured_at}:{state.local_sequence:08d}"
+            ),
             "process_uptime_sec": int(time.monotonic() - state.start_monotonic),
             # Keep GPS in multiple locations to maximize compatibility while
             # clients migrate to location/location_status.

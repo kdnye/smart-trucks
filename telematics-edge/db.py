@@ -170,42 +170,9 @@ async def init_db() -> None:
             );
             """
         )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS local_gps (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                lat          REAL,
-                lon          REAL,
-                speed        REAL,
-                fix_status   TEXT,
-                created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                synced       INTEGER NOT NULL DEFAULT 0
-            );
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS local_power (
-                id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                battery_percent  REAL,
-                power_state      TEXT,
-                created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                synced           INTEGER NOT NULL DEFAULT 0
-            );
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS local_ble (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                mac_address  TEXT,
-                rssi         INTEGER,
-                device_type  TEXT,
-                created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                synced       INTEGER NOT NULL DEFAULT 0
-            );
-            """
-        )
+        await db.execute("DROP TABLE IF EXISTS local_gps;")
+        await db.execute("DROP TABLE IF EXISTS local_power;")
+        await db.execute("DROP TABLE IF EXISTS local_ble;")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_gps_points_pending ON gps_points(sent_at_utc, captured_at_utc);"
         )
@@ -491,63 +458,6 @@ async def insert_wake_signal(signal_type: str) -> None:
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to insert wake signal: %s", exc)
-
-
-async def insert_local_gps(
-    *,
-    lat: float | None,
-    lon: float | None,
-    speed: float | None,
-    fix_status: str | None,
-) -> None:
-    try:
-        await _execute_write_with_retry(
-            """
-            INSERT INTO local_gps (lat, lon, speed, fix_status)
-            VALUES (?, ?, ?, ?)
-            """,
-            (lat, lon, speed, fix_status),
-            operation_name="insert_local_gps",
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to insert local GPS row: %s", exc)
-
-
-async def insert_local_power(
-    *,
-    battery_percent: float | None,
-    power_state: str | None,
-) -> None:
-    try:
-        await _execute_write_with_retry(
-            """
-            INSERT INTO local_power (battery_percent, power_state)
-            VALUES (?, ?)
-            """,
-            (battery_percent, power_state),
-            operation_name="insert_local_power",
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to insert local power row: %s", exc)
-
-
-async def insert_local_ble(
-    *,
-    mac_address: str | None,
-    rssi: int | None,
-    device_type: str | None,
-) -> None:
-    try:
-        await _execute_write_with_retry(
-            """
-            INSERT INTO local_ble (mac_address, rssi, device_type)
-            VALUES (?, ?, ?)
-            """,
-            (mac_address, rssi, device_type),
-            operation_name="insert_local_ble",
-        )
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to insert local BLE row: %s", exc)
 
 
 async def pop_beacon_wake_signal() -> bool:
