@@ -135,7 +135,7 @@ services:
     build: ./health
     ports:
       - "8080:8080"
-    restart: unless-stopped
+    restart: always
     environment:
       - SERVICE_NAME=smart-trucks
 
