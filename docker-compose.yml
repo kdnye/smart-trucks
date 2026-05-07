@@ -131,6 +131,14 @@ services:
       - BLE_CALIBRATION_SCAN_DURATION_SECONDS
       - BLE_CALIBRATION_REFRESH_SECONDS
 
+  health:
+    build: ./health
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - SERVICE_NAME=smart-trucks
+
 volumes:
   shared-sqlite:
   telematics_data:
