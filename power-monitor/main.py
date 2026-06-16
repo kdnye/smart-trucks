@@ -389,6 +389,9 @@ class PowerReader(Protocol):
 
 
 class DummyPowerMonitor:
+    SOURCE = "dummy_power_monitor"
+    SENSOR_STATUS_MARKER = "dummy"
+
     def calibrate(self) -> bool:
         return True
 
@@ -398,7 +401,9 @@ class DummyPowerMonitor:
     async def read(self) -> dict[str, Any]:
         return {
             "status": "ok",
-            "source": "dummy_power_monitor",
+            "source": self.SOURCE,
+            "hardware_present": False,
+            "sensor_status_marker": self.SENSOR_STATUS_MARKER,
             "power_state": "external_input_present",
             "state_of_charge_pct_estimate": 100.0,
             "voltage_v": 5.0,
@@ -637,6 +642,9 @@ class RuntimeStats:
 
 
 def _evaluate_shutdown_trip(payload: dict[str, Any], config: Config) -> dict[str, Any] | None:
+    if payload.get("source") == DummyPowerMonitor.SOURCE or payload.get("hardware_present") is False:
+        return None
+
     status = str(payload.get("read_status", payload.get("status", "unknown")))
     if status != "ok":
         return None
@@ -834,7 +842,12 @@ async def sensor_loop(config: Config, monitor: PowerReader, out_queue: asyncio.Q
             "read_error": "read_error",
             "range_error": "range_error",
         }
-        sensor_status_marker = "recovered_after_reinit" if recovered_after_reinit else marker_map.get(status, "ok")
+        sensor_status_marker = str(
+            payload.get(
+                "sensor_status_marker",
+                "recovered_after_reinit" if recovered_after_reinit else marker_map.get(status, "ok"),
+            )
+        )
         payload["sensor_status_marker"] = sensor_status_marker
         if recovery_steps:
             payload["recovery_steps"] = recovery_steps
@@ -991,10 +1004,7 @@ async def run() -> None:
         f"command_timeout_s={config.shutdown_command_timeout_seconds}"
     )
     if _is_dummy_mode(config):
-        print(
-            "Power monitor dummy mode enabled; "
-            "skipping hardware inventory, UPS validation, and INA219 initialization."
-        )
+        logger.warning("Power monitor running in dummy mode; INA219 hardware checks disabled")
         monitor: PowerReader = DummyPowerMonitor()
     else:
         inventory = build_hardware_inventory(
