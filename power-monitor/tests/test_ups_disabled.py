@@ -5,6 +5,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# main.py imports the Pi-only `ina219` library at module level. Stub it so the
+# module loads in non-Pi CI/dev environments where the wheel can't be built.
+sys.modules.setdefault("ina219", mock.MagicMock())
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "main.py"
 sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("power_monitor_main", MODULE_PATH)
