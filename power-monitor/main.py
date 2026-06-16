@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import aiosqlite
 import uvloop
@@ -189,6 +189,8 @@ class Config:
     imu_i2c_bus: int
     imu_expected_addresses: tuple[int, ...]
     imu_required: bool
+    power_monitor_mode: str
+    power_monitor_hardware_required: bool
 
 
 def _sanitize_env_value(raw_value: str | None) -> str | None:
@@ -370,7 +372,43 @@ def load_config() -> Config:
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=False,  # power-monitor does not use the IMU; telematics-edge owns it
+        power_monitor_mode=(_sanitize_env_value(os.getenv("POWER_MONITOR_MODE")) or "hardware").strip().lower(),
+        power_monitor_hardware_required=parse_bool_env("POWER_MONITOR_HARDWARE_REQUIRED", True),
     )
+
+
+class PowerReader(Protocol):
+    async def read(self) -> dict[str, Any]:
+        ...
+
+    def calibrate(self) -> bool:
+        ...
+
+    async def reinitialize(self) -> bool:
+        ...
+
+
+class DummyPowerMonitor:
+    def calibrate(self) -> bool:
+        return True
+
+    async def reinitialize(self) -> bool:
+        return True
+
+    async def read(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "source": "dummy_power_monitor",
+            "power_state": "external_input_present",
+            "state_of_charge_pct_estimate": 100.0,
+            "voltage_v": 5.0,
+            "bus_voltage_v": 5.0,
+            "current_ma": 0.0,
+            "power_mw": 0.0,
+            "is_charging": False,
+            "read_status": "ok",
+            "dummy_mode": True,
+        }
 
 
 class UpsMonitor:
@@ -556,6 +594,19 @@ async def configure_sqlite(conn: aiosqlite.Connection) -> None:
 async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS power_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vehicle_id TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_power_readings_latest ON power_readings(vehicle_id, occurred_at DESC, id DESC)"
+    )
+    await conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS local_power (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             battery_percent REAL,
@@ -565,6 +616,20 @@ async def init_db(conn: aiosqlite.Connection) -> None:
         """
     )
     await conn.commit()
+
+async def insert_power_reading(
+    conn: aiosqlite.Connection,
+    *,
+    vehicle_id: str,
+    occurred_at: str,
+    payload: dict[str, Any],
+) -> None:
+    await conn.execute(
+        "INSERT INTO power_readings (vehicle_id, occurred_at, payload) VALUES (?, ?, ?)",
+        (vehicle_id, occurred_at, json.dumps(payload, separators=(",", ":"), sort_keys=True)),
+    )
+    await conn.commit()
+
 
 async def insert_local_power(
     conn: aiosqlite.Connection,
@@ -737,7 +802,7 @@ def _derive_power_state(flags: dict[str, bool]) -> str:
     return "idle"
 
 
-async def sensor_loop(config: Config, monitor: UpsMonitor, out_queue: asyncio.Queue[dict[str, Any]], stats: RuntimeStats) -> None:
+async def sensor_loop(config: Config, monitor: PowerReader, out_queue: asyncio.Queue[dict[str, Any]], stats: RuntimeStats) -> None:
     while True:
         started = asyncio.get_running_loop().time()
         occurred_at = datetime.now(timezone.utc).isoformat()
@@ -830,10 +895,26 @@ async def state_engine_loop(
         battery_percent = payload.get("state_of_charge_pct_estimate")
 
         try:
+            await insert_power_reading(
+                conn,
+                vehicle_id=config.vehicle_id,
+                occurred_at=occurred_at,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to insert power_readings row at %s (vehicle_id=%s power_state=%s): %s",
+                occurred_at,
+                config.vehicle_id,
+                current_state,
+                exc,
+            )
+
+        try:
             await insert_local_power(conn, battery_percent, current_state)
         except Exception as exc:
             logger.exception(
-                "Failed to insert local_power row at %s (battery_percent=%s power_state=%s): %s",
+                "Failed to insert local_power compatibility row at %s (battery_percent=%s power_state=%s): %s",
                 occurred_at,
                 battery_percent,
                 current_state,
@@ -922,6 +1003,11 @@ async def maintenance_loop(config: Config, conn: aiosqlite.Connection, stats: Ru
         await asyncio.sleep(config.maintenance_interval_seconds)
 
 
+def _is_dummy_mode(config: Config) -> bool:
+    mode = config.power_monitor_mode.strip().lower()
+    return mode in {"dummy", "mock", "simulated"} or not config.power_monitor_hardware_required
+
+
 async def run() -> None:
     if os.getenv("DEVICE_ROLE", "truck").lower() == "warehouse":
         logger.info("DEVICE_ROLE is set to warehouse. Disabling UPS hardware probes.")
@@ -939,42 +1025,49 @@ async def run() -> None:
         f"consecutive_samples={config.shutdown_consecutive_samples} "
         f"command_timeout_s={config.shutdown_command_timeout_seconds}"
     )
-    inventory = build_hardware_inventory(
-        gps_candidates=(),  # power-monitor does not own the GPS serial port
-        gps_baud_rate=9600,
-        i2c_bus=config.i2c_bus,
-        ups_expected_addresses=config.ina219_addresses,
-        imu_expected_addresses=(),  # power-monitor does not own the IMU
-        probe_serial=False,
-    )
-    print(f"Hardware inventory: {inventory.to_json()}")
-    os.makedirs("/data", exist_ok=True)
-    with open("/data/power_hardware_inventory.json", "w", encoding="utf-8") as handle:
-        json.dump(inventory.to_dict(), handle, sort_keys=True)
-    inventory_errors = validate_inventory(inventory, imu_required=False, ups_required=True)
-    if inventory_errors:
-        raise RuntimeError(
-            "Hardware probe failed: "
-            f"{'; '.join(inventory_errors)} "
-            "Action: resolve the hardware and environment variable issues above, then restart power-monitor."
+    if _is_dummy_mode(config):
+        print(
+            "Power monitor dummy mode enabled; "
+            "skipping hardware inventory, UPS validation, and INA219 initialization."
         )
+        monitor: PowerReader = DummyPowerMonitor()
+    else:
+        inventory = build_hardware_inventory(
+            gps_candidates=(),  # power-monitor does not own the GPS serial port
+            gps_baud_rate=9600,
+            i2c_bus=config.i2c_bus,
+            ups_expected_addresses=config.ina219_addresses,
+            imu_expected_addresses=(),  # power-monitor does not own the IMU
+            probe_serial=False,
+        )
+        print(f"Hardware inventory: {inventory.to_json()}")
+        os.makedirs("/data", exist_ok=True)
+        with open("/data/power_hardware_inventory.json", "w", encoding="utf-8") as handle:
+            json.dump(inventory.to_dict(), handle, sort_keys=True)
+        inventory_errors = validate_inventory(inventory, imu_required=False, ups_required=True)
+        if inventory_errors:
+            raise RuntimeError(
+                "Hardware probe failed: "
+                f"{'; '.join(inventory_errors)} "
+                "Action: resolve the hardware and environment variable issues above, then restart power-monitor."
+            )
 
-    monitor = UpsMonitor(
-        config.ina219_addresses,
-        config.ina219_shunt_ohms,
-        config.ina219_max_expected_amps,
-        config.ina219_gain_strategy,
-        config.ina219_bus_voltage_range_v,
-        config.i2c_bus,
-        config.ina219_scl_gpio_pin,
-        config.battery_capacity_mah,
-        config.soc_voltage_min_v,
-        config.soc_voltage_full_resting_v,
-        config.soc_voltage_full_charging_v,
-        config.min_discharge_current_ma_for_runtime,
-        invert_current=config.invert_current,
-    )
-    await monitor.reinitialize()
+        monitor = UpsMonitor(
+            config.ina219_addresses,
+            config.ina219_shunt_ohms,
+            config.ina219_max_expected_amps,
+            config.ina219_gain_strategy,
+            config.ina219_bus_voltage_range_v,
+            config.i2c_bus,
+            config.ina219_scl_gpio_pin,
+            config.battery_capacity_mah,
+            config.soc_voltage_min_v,
+            config.soc_voltage_full_resting_v,
+            config.soc_voltage_full_charging_v,
+            config.min_discharge_current_ma_for_runtime,
+            invert_current=config.invert_current,
+        )
+        await monitor.reinitialize()
     stats = RuntimeStats()
     sensor_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=max(1, config.queue_max_events // 2))
 
