@@ -48,6 +48,8 @@ Next, the Python containers need to know *where* to send their data and *who* th
    * **Name:** `UPS_GAIN_STRATEGY` | **Value:** `auto` *(recommended; lets INA219 pick gain from expected amps).*
    * **Name:** `UPS_BUS_VOLTAGE_RANGE_V` | **Value:** `32` *(default for 5V UPS rails with transient headroom).*
 
+> **Devices with no UPS HAT:** Some devices have no INA219-based UPS — for example a solar/MPPT charge board that supplies 5V but exposes no battery telemetry over I2C. For those devices, set **Name:** `UPS` | **Value:** `no`. `power-monitor` then skips the I2C UPS probe and idles instead of crash-looping with `Hardware probe failed: Required UPS device missing`. Leave `UPS` unset (or `yes`) on devices that do have a UPS HAT. Accepted "no UPS" values: `no`, `n`, `false`, `0`, `off`, `none`, `absent`, `disabled`.
+
 > `VEHICLE_ID` is the required identity variable for this stack. Do **not** use `MOTIVE_TRUCK_NUMBER` as a substitute.
 
 *(Note: If you want all trucks to share the same Webhook URL and API keys, you can set those at the **Fleet Variables** level instead, so you only have to set the `VEHICLE_ID` for new trucks).*

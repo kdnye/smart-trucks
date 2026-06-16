@@ -986,9 +986,33 @@ def _is_dummy_mode(config: Config) -> bool:
     return mode in {"dummy", "mock", "simulated"} or not config.power_monitor_hardware_required
 
 
+# Per-device opt-out for hardware that has no UPS HAT (for example, a solar/MPPT
+# board that supplies 5V but exposes no INA219 telemetry). Set the balena device
+# variable UPS=no to mark a device as having no UPS so power-monitor skips the
+# I2C probe and idles instead of crash-looping. The UPS code path below is left
+# untouched for devices that do have a HAT.
+_UPS_DISABLED_VALUES = {"no", "n", "false", "0", "off", "none", "absent", "disabled"}
+
+
+def _ups_disabled() -> bool:
+    raw = os.getenv("UPS")
+    if raw is None:
+        return False
+    return raw.strip().lower() in _UPS_DISABLED_VALUES
+
+
 async def run() -> None:
     if os.getenv("DEVICE_ROLE", "truck").lower() == "warehouse":
         logger.info("DEVICE_ROLE is set to warehouse. Disabling UPS hardware probes.")
+        logger.info("Power Monitor container going into idle sleep mode.")
+        while True:
+            await asyncio.sleep(86400)
+
+    if _ups_disabled():
+        logger.info(
+            "UPS=%s set; this device has no UPS HAT. Disabling UPS hardware probes.",
+            (os.getenv("UPS") or "").strip(),
+        )
         logger.info("Power Monitor container going into idle sleep mode.")
         while True:
             await asyncio.sleep(86400)

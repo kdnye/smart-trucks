@@ -57,6 +57,9 @@ services:
       - UPS_BUS_VOLTAGE_RANGE_V
       - POWER_MONITOR_MODE=${POWER_MONITOR_MODE:-dummy}
       - POWER_MONITOR_HARDWARE_REQUIRED=${POWER_MONITOR_HARDWARE_REQUIRED:-false}
+      # Set UPS=no (per-device balena variable) for hardware with no UPS HAT,
+      # e.g. solar/MPPT boards. power-monitor then idles instead of crash-looping.
+      - UPS=${UPS:-yes}
 
   ble-sensor:
     build:
