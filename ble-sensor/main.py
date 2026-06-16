@@ -449,8 +449,10 @@ def _normalize_mac(mac_address: str, config: Config) -> str:
     By default (ANONYMIZE_MAC=false) this is the canonical raw MAC address, which
     matches the value Ops/HR provision as ``ble_tag_id`` in the Lifecycle app and
     lets the dashboard worker bind detections to the master inventory record.
-    Set ANONYMIZE_MAC=true to emit a stable HMAC-SHA256 pseudonym instead when raw
-    MAC addresses must not leave the device.
+    Set ANONYMIZE_MAC=true to emit a stable HMAC-SHA256 pseudonym as the cloud-facing
+    ``device_id`` instead. Note: this only pseudonymizes ``device_id``; the raw MAC
+    is still carried in the payload's separate ``mac_address`` field, which on-device
+    features (local observation recording and tracked-asset resolution) require.
     """
     canonical_mac = _canonicalize_mac_address(mac_address)
     if not config.anonymize_mac:
