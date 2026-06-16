@@ -35,8 +35,7 @@ Five containers run on each Pi via Balena (`docker-compose.yml`):
                                      └──────────────────┘
 ```
 
-`telematics-edge/db.py::init_db()` creates **eight** tables in the shared
-SQLite WAL:
+`telematics-edge/db.py::init_db()` owns the telematics-edge SQLite WAL tables, while `power-monitor/main.py` owns the local `power_readings` snapshot table it writes for telematics-edge to read:
 
 | Table | Producer | Drained by `sync-service`? | Notes |
 |---|---|---|---|
@@ -46,7 +45,6 @@ SQLite WAL:
 | `power_readings` | `power-monitor/main.py` | ❌ no | INA219 voltage/current/SoC; read in-process by `get_latest_power_snapshot` |
 | `wake_signals` | `ble-sensor` (key beacon) | ❌ no | Parked-mode wake triggers, consumed locally |
 | `local_gps` | `_insert_local_gps_point` (in `telematics-edge/main.py` and `parked_scan_worker`) | ✅ yes | Thin stub: `lat, lon, speed, fix_status` |
-| `local_power` | (no producer) | ✅ yes | Always empty in production |
 | `local_ble` | `ble-sensor` legacy path | ✅ yes | Thin: `mac_address, rssi, device_type` |
 
 The outbound payload assembled by `sync-service/main.py::_build_payload`:
@@ -72,10 +70,7 @@ Three independent failures stack:
    `heartbeats` / `edge_health` rows that the rest of the codebase fills
    with proper timestamps, `local_sequence` idempotency keys, IMU snapshots,
    queue depth, alerts, and `location_status.fix_status`.
-2. **`local_power` has no producer.** `power-monitor/main.py` writes to
-   `power_readings` (rich) and `telematics-edge` reads from there via
-   `get_latest_power_snapshot()`. Nothing ever inserts into `local_power`,
-   so the `power: {}` field on every outbound payload is empty.
+2. **`local_power` is intentionally not a health contract.** `power-monitor/main.py` writes rich snapshots to `power_readings`, and `telematics-edge` reads those rows via `get_latest_power_snapshot()`. `telematics-edge/db.py::init_db()` drops `local_power`, so dashboard and health flows must not depend on it.
 3. **`unified_heartbeat` is not the cloud worker's primary contract.**
    `motive-dashboard/edge-telematics-worker/main.py` accepts both
    `unified_heartbeat` and `edge_telematics_heartbeat`, but its
@@ -96,13 +91,13 @@ into `fleet_status_monitor.pi_*` columns; the Streamlit live map reads
 - `gps_points` — every fix `_is_valid_fix()` returns true for
 - `heartbeats` — `edge_telematics_heartbeat` + `edge_health` (rich)
 - `edge_health` — structured columns for triage queries
-- `power_readings` — INA219 snapshots (already correct)
+- `power_readings` — INA219 snapshots (already correct). If the cloud dashboard needs a durable PostgreSQL table for these rows, define it in the dashboard-owned migration repository with at least `id`, `vehicle_id`, `occurred_at`, and JSON payload columns matching `telematics-edge/db.py::get_latest_power_snapshot`; do not add unmanaged DDL in this edge repository.
 - `wake_signals` — local-only, not synced
 
 ### 3.2 Tables we drop
 
 - `local_gps` — duplicate of `gps_points`
-- `local_power` — duplicate of `power_readings`, also unused
+- `local_power` — removed legacy duplicate; `telematics-edge/db.py::init_db()` drops it and no health/dashboard path should read it
 - `local_ble` — duplicate of `ble_scans` block already embedded in heartbeats
 
 ### 3.3 Sync algorithm

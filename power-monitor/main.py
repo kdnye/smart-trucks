@@ -605,16 +605,6 @@ async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_power_readings_latest ON power_readings(vehicle_id, occurred_at DESC, id DESC)"
     )
-    await conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS local_power (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            battery_percent REAL,
-            power_state TEXT NOT NULL,
-            occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
     await conn.commit()
 
 async def insert_power_reading(
@@ -627,18 +617,6 @@ async def insert_power_reading(
     await conn.execute(
         "INSERT INTO power_readings (vehicle_id, occurred_at, payload) VALUES (?, ?, ?)",
         (vehicle_id, occurred_at, json.dumps(payload, separators=(",", ":"), sort_keys=True)),
-    )
-    await conn.commit()
-
-
-async def insert_local_power(
-    conn: aiosqlite.Connection,
-    battery_percent: float | int | None,
-    power_state: str,
-) -> None:
-    await conn.execute(
-        "INSERT INTO local_power (battery_percent, power_state) VALUES (?, ?)",
-        (battery_percent, power_state),
     )
     await conn.commit()
 
@@ -892,8 +870,6 @@ async def state_engine_loop(
         payload.update(current_flags)
         current_state = _derive_power_state(current_flags)
         payload["power_state"] = current_state
-        battery_percent = payload.get("state_of_charge_pct_estimate")
-
         try:
             await insert_power_reading(
                 conn,
@@ -906,17 +882,6 @@ async def state_engine_loop(
                 "Failed to insert power_readings row at %s (vehicle_id=%s power_state=%s): %s",
                 occurred_at,
                 config.vehicle_id,
-                current_state,
-                exc,
-            )
-
-        try:
-            await insert_local_power(conn, battery_percent, current_state)
-        except Exception as exc:
-            logger.exception(
-                "Failed to insert local_power compatibility row at %s (battery_percent=%s power_state=%s): %s",
-                occurred_at,
-                battery_percent,
                 current_state,
                 exc,
             )
