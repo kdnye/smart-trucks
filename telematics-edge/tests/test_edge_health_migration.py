@@ -29,56 +29,59 @@ CREATE TABLE edge_health (
 class EdgeHealthMigrationTests(unittest.TestCase):
     def test_ensure_column_adds_sync_columns_idempotently(self) -> None:
         async def scenario() -> None:
-            path = tempfile.mktemp(suffix=".db")
-            conn = await aiosqlite.connect(path)
-            try:
-                await conn.execute(OLD_EDGE_HEALTH)
-                await conn.execute(
-                    "INSERT INTO edge_health (captured_at_utc, queue_depth, payload_json) "
-                    "VALUES ('2026-06-16T00:00:00Z', 0, '{}')"
-                )
-                await conn.commit()
-
-                # The sync-service query fails on the old schema.
-                with self.assertRaises(aiosqlite.OperationalError):
-                    await conn.execute("SELECT id FROM edge_health WHERE sent_at_utc IS NULL")
-
-                # Apply the migration twice to prove idempotency.
-                for _ in range(2):
-                    await db._ensure_column(conn, "edge_health", "sent_at_utc", "TEXT")
-                    await db._ensure_column(
-                        conn, "edge_health", "attempt_count", "INTEGER NOT NULL DEFAULT 0"
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                path = os.path.join(tmp_dir, "telematics.db")
+                conn = await aiosqlite.connect(path)
+                try:
+                    await conn.execute(OLD_EDGE_HEALTH)
+                    await conn.execute(
+                        "INSERT INTO edge_health (captured_at_utc, queue_depth, payload_json) "
+                        "VALUES ('2026-06-16T00:00:00Z', 0, '{}')"
                     )
-                await conn.commit()
+                    await conn.commit()
 
-                async with conn.execute("PRAGMA table_info(edge_health)") as cursor:
-                    columns = {row[1] for row in await cursor.fetchall()}
-                self.assertIn("sent_at_utc", columns)
-                self.assertIn("attempt_count", columns)
+                    # The sync-service query fails on the old schema.
+                    with self.assertRaises(aiosqlite.OperationalError):
+                        await conn.execute("SELECT id FROM edge_health WHERE sent_at_utc IS NULL")
 
-                # Full sync-service workflow now succeeds.
-                async with conn.execute(
-                    "SELECT id, captured_at_utc, payload_json FROM edge_health WHERE sent_at_utc IS NULL"
-                ) as cursor:
-                    rows = await cursor.fetchall()
-                self.assertEqual(len(rows), 1)
-                row_id = rows[0][0]
-                await conn.execute(
-                    "UPDATE edge_health SET sent_at_utc = CURRENT_TIMESTAMP WHERE id IN (?)", (row_id,)
-                )
-                await conn.execute(
-                    "UPDATE edge_health SET attempt_count = attempt_count + 1 WHERE id IN (?)", (row_id,)
-                )
-                await conn.commit()
+                    # Apply the migration twice to prove idempotency.
+                    for _ in range(2):
+                        await db._ensure_column(conn, "edge_health", "sent_at_utc", "TEXT")
+                        await db._ensure_column(
+                            conn, "edge_health", "attempt_count", "INTEGER NOT NULL DEFAULT 0"
+                        )
+                    await conn.commit()
 
-                async with conn.execute(
-                    "SELECT attempt_count FROM edge_health WHERE sent_at_utc IS NOT NULL"
-                ) as cursor:
-                    sent = await cursor.fetchall()
-                self.assertEqual(sent, [(1,)])
-            finally:
-                await conn.close()
-                os.unlink(path)
+                    async with conn.execute("PRAGMA table_info(edge_health)") as cursor:
+                        columns = {row[1] for row in await cursor.fetchall()}
+                    self.assertIn("sent_at_utc", columns)
+                    self.assertIn("attempt_count", columns)
+
+                    # Full sync-service workflow now succeeds.
+                    async with conn.execute(
+                        "SELECT id, captured_at_utc, payload_json "
+                        "FROM edge_health WHERE sent_at_utc IS NULL"
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                    self.assertEqual(len(rows), 1)
+                    row_id = rows[0][0]
+                    await conn.execute(
+                        "UPDATE edge_health SET sent_at_utc = CURRENT_TIMESTAMP WHERE id IN (?)",
+                        (row_id,),
+                    )
+                    await conn.execute(
+                        "UPDATE edge_health SET attempt_count = attempt_count + 1 WHERE id IN (?)",
+                        (row_id,),
+                    )
+                    await conn.commit()
+
+                    async with conn.execute(
+                        "SELECT attempt_count FROM edge_health WHERE sent_at_utc IS NOT NULL"
+                    ) as cursor:
+                        sent = await cursor.fetchall()
+                    self.assertEqual(sent, [(1,)])
+                finally:
+                    await conn.close()
 
         asyncio.run(scenario())
 

@@ -105,7 +105,9 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _ensure_column(db: Any, table: str, column: str, column_def: str) -> None:
+async def _ensure_column(
+    db: aiosqlite.Connection, table: str, column: str, column_def: str
+) -> None:
     """Add a column to an existing table if it is missing.
 
     SQLite has no ``ADD COLUMN IF NOT EXISTS``, so we inspect the table and
