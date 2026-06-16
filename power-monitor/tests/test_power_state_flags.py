@@ -1,5 +1,7 @@
 import importlib.util
+import tempfile
 from pathlib import Path
+import aiosqlite
 import sys
 import unittest
 
@@ -152,6 +154,54 @@ class UpsMonitorSocTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(payload["is_charging"])
         self.assertEqual(payload["state_of_charge_pct_estimate"], 81)
+
+
+class PowerMonitorSqliteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_init_db_creates_power_readings_without_local_power(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "power.db"
+            async with aiosqlite.connect(db_path) as conn:
+                await main.configure_sqlite(conn)
+                await main.init_db(conn)
+
+                async with conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+
+        table_names = {str(row[0]) for row in rows}
+        self.assertIn("power_readings", table_names)
+        self.assertNotIn("local_power", table_names)
+
+    async def test_insert_power_reading_matches_latest_snapshot_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "power.db"
+            async with aiosqlite.connect(db_path) as conn:
+                await main.configure_sqlite(conn)
+                await main.init_db(conn)
+                payload = {
+                    "status": "ok",
+                    "bus_voltage_v": 4.1,
+                    "state_of_charge_pct_estimate": 88,
+                    "power_state": "charging",
+                }
+
+                await main.insert_power_reading(
+                    conn,
+                    vehicle_id="TRK-TEST",
+                    occurred_at="2026-06-16T00:00:00+00:00",
+                    payload=payload,
+                )
+
+                async with conn.execute(
+                    "SELECT occurred_at, payload FROM power_readings WHERE vehicle_id = ?",
+                    ("TRK-TEST",),
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "2026-06-16T00:00:00+00:00")
+        self.assertIn('"state_of_charge_pct_estimate":88', row[1])
 
 
 class _FakeIna:
