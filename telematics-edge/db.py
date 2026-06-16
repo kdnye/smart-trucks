@@ -105,6 +105,19 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def _ensure_column(db: Any, table: str, column: str, column_def: str) -> None:
+    """Add a column to an existing table if it is missing.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so we inspect the table and
+    ALTER only when needed. This upgrades databases created by older schema
+    versions in place (idempotent on each boot).
+    """
+    async with db.execute(f"PRAGMA table_info({table})") as cursor:  # nosec B608
+        existing = {row[1] for row in await cursor.fetchall()}
+    if column not in existing:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")  # nosec B608
+
+
 async def init_db() -> None:
     """Initialize SQLite schema and enable WAL for concurrent readers/writers."""
     db_dir = os.path.dirname(DB_PATH)
@@ -156,7 +169,9 @@ async def init_db() -> None:
                 disk_free_mb             REAL,
                 wifi_state               TEXT,
                 process_state            TEXT,
-                payload_json             TEXT NOT NULL
+                payload_json             TEXT NOT NULL,
+                sent_at_utc              TEXT,
+                attempt_count            INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -173,11 +188,19 @@ async def init_db() -> None:
         await db.execute("DROP TABLE IF EXISTS local_gps;")
         await db.execute("DROP TABLE IF EXISTS local_power;")
         await db.execute("DROP TABLE IF EXISTS local_ble;")
+        # Upgrade databases created before edge_health gained store-and-forward
+        # bookkeeping columns. sync-service selects/updates these, so a table
+        # missing them crash-loops with "no such column: sent_at_utc".
+        await _ensure_column(db, "edge_health", "sent_at_utc", "TEXT")
+        await _ensure_column(db, "edge_health", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_gps_points_pending ON gps_points(sent_at_utc, captured_at_utc);"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_heartbeats_pending ON heartbeats(sent_at_utc, captured_at_utc);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edge_health_pending ON edge_health(sent_at_utc, captured_at_utc);"
         )
         await db.commit()
         logger.info("Database initialized at %s with WAL mode enabled", DB_PATH)
