@@ -372,8 +372,8 @@ def load_config() -> Config:
         imu_i2c_bus=parse_int_env("IMU_I2C_BUS", i2c_bus, minimum=0),
         imu_expected_addresses=parse_hex_list_env("IMU_EXPECTED_ADDRESSES", (0x6A,)),
         imu_required=False,  # power-monitor does not use the IMU; telematics-edge owns it
-        power_monitor_mode=(_sanitize_env_value(os.getenv("POWER_MONITOR_MODE")) or "hardware").strip().lower(),
-        power_monitor_hardware_required=parse_bool_env("POWER_MONITOR_HARDWARE_REQUIRED", True),
+        power_monitor_mode=(_sanitize_env_value(os.getenv("POWER_MONITOR_MODE")) or "dummy").strip().lower(),
+        power_monitor_hardware_required=parse_bool_env("POWER_MONITOR_HARDWARE_REQUIRED", False),
     )
 
 
