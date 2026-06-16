@@ -173,6 +173,37 @@ class PowerMonitorSqliteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("power_readings", table_names)
         self.assertNotIn("local_power", table_names)
 
+
+    async def test_dummy_monitor_writes_healthy_power_reading_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "power.db"
+            async with aiosqlite.connect(db_path) as conn:
+                await main.configure_sqlite(conn)
+                await main.init_db(conn)
+                payload = await main.DummyPowerMonitor().read()
+                flags = main._derive_power_flags(payload)
+                payload.update(flags)
+                payload["power_state"] = main._derive_power_state(flags)
+
+                await main.insert_power_reading(
+                    conn,
+                    vehicle_id="TRK-DUMMY",
+                    occurred_at="2026-06-16T00:00:00+00:00",
+                    payload=payload,
+                )
+
+                async with conn.execute(
+                    "SELECT payload FROM power_readings WHERE vehicle_id = ?",
+                    ("TRK-DUMMY",),
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertIn('"dummy_mode":true', row[0])
+        self.assertIn('"hardware_present":false', row[0])
+        self.assertIn('"power_state":"external_input_present"', row[0])
+        self.assertIn('"state_of_charge_pct_estimate":100.0', row[0])
+
     async def test_insert_power_reading_matches_latest_snapshot_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "power.db"
