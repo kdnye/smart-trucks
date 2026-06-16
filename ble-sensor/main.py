@@ -71,7 +71,7 @@ def load_config() -> Config:
         vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
         post_interval_seconds=poll_interval_seconds,
         scan_duration_seconds=scan_duration_seconds,
-        anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "true"), default=True),
+        anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "false"), default=False),
         mac_hash_salt=os.getenv("MAC_HASH_SALT", ""),
         include_name=_to_bool(os.getenv("INCLUDE_DEVICE_NAME", "false"), default=False),
         max_devices_per_scan=max(0, int(os.getenv("MAX_DEVICES_PER_SCAN", "0"))),
@@ -444,8 +444,13 @@ def _canonicalize_mac_address(mac_address: str) -> str:
 
 def _normalize_mac(mac_address: str, config: Config) -> str:
     """
-    Return a stable, privacy-preserving identifier for each device by default.
-    Set ANONYMIZE_MAC=false to send raw MAC addresses when explicitly required.
+    Return the device identifier emitted in the payload's ``device_id`` field.
+
+    By default (ANONYMIZE_MAC=false) this is the canonical raw MAC address, which
+    matches the value Ops/HR provision as ``ble_tag_id`` in the Lifecycle app and
+    lets the dashboard worker bind detections to the master inventory record.
+    Set ANONYMIZE_MAC=true to emit a stable HMAC-SHA256 pseudonym instead when raw
+    MAC addresses must not leave the device.
     """
     canonical_mac = _canonicalize_mac_address(mac_address)
     if not config.anonymize_mac:

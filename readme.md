@@ -106,7 +106,7 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 | :--- | :--- | :--- |
 | `SCAN_DURATION_SECONDS` | BLE scan window length per cycle. | `15` |
 | `POLL_INTERVAL` | Seconds between each scan/upload cycle. | `60` |
-| `ANONYMIZE_MAC` | Hashes device MAC addresses before upload. | `true` |
+| `ANONYMIZE_MAC` | When `true`, hashes device MAC addresses before upload. Default `false` so `device_id` carries the raw canonical MAC that matches the `ble_tag_id` provisioned in the Lifecycle inventory app. | `false` |
 | `MAC_HASH_SALT` | Secret salt used to hash MAC addresses. Set per deployment. | `""` |
 | `INCLUDE_DEVICE_NAME` | Includes BLE local names in payloads when enabled. | `false` |
 | `MAX_DEVICES_PER_SCAN` | Caps payload size in busy RF environments. | `500` |
