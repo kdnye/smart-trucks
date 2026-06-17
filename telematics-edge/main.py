@@ -27,6 +27,7 @@ from db import (
 )
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 from nmea_reader import GpsReading, NMEAReader
+from shared.env import sanitize_env_value as _sanitize_env_value
 from shared.hardware_probe import (
     build_hardware_inventory,
     parse_bool_env,
@@ -59,25 +60,6 @@ class Config:
     network_watchdog_max_failures: int = 3
     network_watchdog_recovery_pause_seconds: int = 30
     network_watchdog_connection_name: str | None = None
-
-
-def _sanitize_env_value(raw_value: str | None) -> str | None:
-    if raw_value is None:
-        return None
-
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    if value.startswith("${") and value.endswith("}"):
-        body = value[2:-1]
-        if ":-" in body:
-            _, fallback = body.split(":-", 1)
-            fallback_value = fallback.strip()
-            return fallback_value or None
-        return None
-
-    return value
 
 
 def _read_str_env(name: str, default: str | None = None) -> str | None:

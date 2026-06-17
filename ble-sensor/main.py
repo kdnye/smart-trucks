@@ -13,6 +13,8 @@ from typing import Any
 import uvloop
 from bleak import BleakScanner
 
+from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
+
 
 @dataclass(frozen=True)
 class Config:
@@ -46,15 +48,9 @@ class Config:
     scan_duration_low_power_seconds: float
 
 
-def _to_bool(raw: str | None, default: bool = False) -> bool:
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def load_config() -> Config:
-    poll_interval_seconds = max(5, int(os.getenv("POLL_INTERVAL", "60")))
-    scan_duration_seconds = max(1.0, float(os.getenv("SCAN_DURATION_SECONDS", "20")))
+    poll_interval_seconds = read_int_env("POLL_INTERVAL", 60, minimum=5)
+    scan_duration_seconds = read_float_env("SCAN_DURATION_SECONDS", 20.0, minimum=1.0)
     recommended_poll_minimum = scan_duration_seconds + 15
     if poll_interval_seconds < recommended_poll_minimum:
         print(
@@ -73,26 +69,23 @@ def load_config() -> Config:
     )
 
     return Config(
-        vehicle_id=os.getenv("VEHICLE_ID", "UNKNOWN_TRUCK"),
+        vehicle_id=read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
         post_interval_seconds=poll_interval_seconds,
         scan_duration_seconds=scan_duration_seconds,
-        anonymize_mac=_to_bool(os.getenv("ANONYMIZE_MAC", "false"), default=False),
+        anonymize_mac=read_bool_env("ANONYMIZE_MAC", default=False),
         mac_hash_salt=os.getenv("MAC_HASH_SALT", ""),
-        include_name=_to_bool(os.getenv("INCLUDE_DEVICE_NAME", "false"), default=False),
-        max_devices_per_scan=max(0, int(os.getenv("MAX_DEVICES_PER_SCAN", "0"))),
+        include_name=read_bool_env("INCLUDE_DEVICE_NAME", default=False),
+        max_devices_per_scan=read_int_env("MAX_DEVICES_PER_SCAN", 0, minimum=0),
         key_beacon_uuids=key_beacon_uuids,
         key_beacon_manufacturer_ids=key_beacon_manufacturer_ids,
-        scan_contention_backoff_cap_seconds=max(
-            2.0,
-            float(os.getenv("SCAN_CONTENTION_BACKOFF_CAP_SECONDS", "12")),
+        scan_contention_backoff_cap_seconds=read_float_env(
+            "SCAN_CONTENTION_BACKOFF_CAP_SECONDS", 12.0, minimum=2.0
         ),
-        scan_contention_cooldown_threshold=max(
-            1,
-            int(os.getenv("SCAN_CONTENTION_COOLDOWN_THRESHOLD", "3")),
+        scan_contention_cooldown_threshold=read_int_env(
+            "SCAN_CONTENTION_COOLDOWN_THRESHOLD", 3, minimum=1
         ),
-        scan_contention_max_attempts_before_reset=max(
-            1,
-            int(os.getenv("SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", "10")),
+        scan_contention_max_attempts_before_reset=read_int_env(
+            "SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", 10, minimum=1
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         telematics_db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
@@ -104,49 +97,39 @@ def load_config() -> Config:
             "PI_LOCATION_CACHE_PATH",
             "/data/telematics_last_locked.json",
         ),
-        pi_location_query_timeout_seconds=max(
-            0.05,
-            float(os.getenv("PI_LOCATION_QUERY_TIMEOUT_SECONDS", "0.25")),
+        pi_location_query_timeout_seconds=read_float_env(
+            "PI_LOCATION_QUERY_TIMEOUT_SECONDS", 0.25, minimum=0.05
         ),
-        pi_location_stale_after_seconds=max(
-            30,
-            int(os.getenv("PI_LOCATION_STALE_AFTER_SECONDS", "180")),
+        pi_location_stale_after_seconds=read_int_env(
+            "PI_LOCATION_STALE_AFTER_SECONDS", 180, minimum=30
         ),
         pi_id=os.getenv("PI_ID") or os.getenv("HOSTNAME") or "unknown-pi",
         tracked_asset_registry_path=os.getenv(
             "TRACKED_ASSET_REGISTRY_PATH",
             "/data/tracked-assets-registry.json",
         ),
-        resolver_candidate_window_seconds=max(
-            5,
-            int(os.getenv("RESOLVER_CANDIDATE_WINDOW_SECONDS", "60")),
+        resolver_candidate_window_seconds=read_int_env(
+            "RESOLVER_CANDIDATE_WINDOW_SECONDS", 60, minimum=5
         ),
-        resolver_tie_epsilon=max(
-            0.0,
-            float(os.getenv("RESOLVER_TIE_EPSILON", "0.02")),
+        resolver_tie_epsilon=read_float_env("RESOLVER_TIE_EPSILON", 0.02, minimum=0.0),
+        resolver_stationary_mode_enabled=read_bool_env(
+            "RESOLVER_STATIONARY_MODE_ENABLED", default=False
         ),
-        resolver_stationary_mode_enabled=_to_bool(
-            os.getenv("RESOLVER_STATIONARY_MODE_ENABLED", "false"),
-            default=False,
-        ),
-        battery_saver_enabled=_to_bool(
-            os.getenv("BLE_BATTERY_SAVER_ENABLED", "true"),
-            default=True,
-        ),
+        battery_saver_enabled=read_bool_env("BLE_BATTERY_SAVER_ENABLED", default=True),
         poll_interval_discharging_seconds=max(
             poll_interval_seconds,
-            int(os.getenv("BLE_POLL_INTERVAL_DISCHARGING_SECONDS", "300")),
+            read_int_env("BLE_POLL_INTERVAL_DISCHARGING_SECONDS", 300),
         ),
         poll_interval_low_battery_seconds=max(
             poll_interval_seconds,
-            int(os.getenv("BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS", "900")),
+            read_int_env("BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS", 900),
         ),
-        low_battery_soc_pct=max(0.0, float(os.getenv("BLE_LOW_BATTERY_SOC_PCT", "25"))),
+        low_battery_soc_pct=read_float_env("BLE_LOW_BATTERY_SOC_PCT", 25.0, minimum=0.0),
         scan_duration_low_power_seconds=max(
             1.0,
             min(
                 scan_duration_seconds,
-                float(os.getenv("BLE_SCAN_DURATION_LOW_POWER_SECONDS", "10")),
+                read_float_env("BLE_SCAN_DURATION_LOW_POWER_SECONDS", 10.0),
             ),
         ),
     )
