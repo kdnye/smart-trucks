@@ -118,6 +118,15 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 
 > ⚠️ Legal/Privacy note: only collect BLE broadcasts where you have explicit permission and a lawful basis to process device identifiers.
 
+## Power Optimization (Battery / Solar)
+For solar/battery deployments, the services throttle their highest-cost work
+(IMU polling, BLE scanning, INA219 sampling) when the truck is parked and on
+battery, and resume full cadence when driving or charging. See
+[`docs/power-optimization.md`](docs/power-optimization.md) for the tunable
+environment variables (`IMU_PARKED_SAMPLE_INTERVAL_SECONDS`, `BLE_*`,
+`POWER_SAMPLE_INTERVAL_IDLE_SECONDS`, ...) and host-level recommendations
+(disable HDMI/LEDs, Wi-Fi power-save).
+
 ## Technical Integration Points
 * **Power Management**: Monitors INA219 chip on the UPS HAT via I2C to trigger low-power modes.
 * **Data Optimization**: Uses Balena's binary delta updates to minimize data consumption on limited 2GB monthly cellular plans.

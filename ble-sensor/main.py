@@ -39,6 +39,11 @@ class Config:
     resolver_candidate_window_seconds: int
     resolver_tie_epsilon: float
     resolver_stationary_mode_enabled: bool
+    battery_saver_enabled: bool
+    poll_interval_discharging_seconds: int
+    poll_interval_low_battery_seconds: int
+    low_battery_soc_pct: float
+    scan_duration_low_power_seconds: float
 
 
 def _to_bool(raw: str | None, default: bool = False) -> bool:
@@ -123,6 +128,26 @@ def load_config() -> Config:
         resolver_stationary_mode_enabled=_to_bool(
             os.getenv("RESOLVER_STATIONARY_MODE_ENABLED", "false"),
             default=False,
+        ),
+        battery_saver_enabled=_to_bool(
+            os.getenv("BLE_BATTERY_SAVER_ENABLED", "true"),
+            default=True,
+        ),
+        poll_interval_discharging_seconds=max(
+            poll_interval_seconds,
+            int(os.getenv("BLE_POLL_INTERVAL_DISCHARGING_SECONDS", "300")),
+        ),
+        poll_interval_low_battery_seconds=max(
+            poll_interval_seconds,
+            int(os.getenv("BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS", "900")),
+        ),
+        low_battery_soc_pct=max(0.0, float(os.getenv("BLE_LOW_BATTERY_SOC_PCT", "25"))),
+        scan_duration_low_power_seconds=max(
+            1.0,
+            min(
+                scan_duration_seconds,
+                float(os.getenv("BLE_SCAN_DURATION_LOW_POWER_SECONDS", "10")),
+            ),
         ),
     )
 
@@ -977,6 +1002,89 @@ def _read_pi_gps_from_telematics_db(
     }
 
 
+def _read_latest_power_from_telematics_db(
+    db_path: str,
+    lock_timeout_seconds: float,
+) -> dict[str, Any] | None:
+    """Return latest battery state from the shared power_readings table.
+
+    Read-only access mirrors ``_read_pi_gps_from_telematics_db`` so the BLE
+    scanner never blocks the power-monitor writer. Returns ``None`` when the
+    table/row is missing so callers can fall back to normal (full) cadence
+    rather than throttling on unknown power state.
+    """
+    if not db_path or not os.path.exists(db_path):
+        return None
+
+    read_only_uri = f"file:{_urlquote(db_path)}?mode=ro"
+    try:
+        with _sqlite3.connect(
+            read_only_uri,
+            uri=True,
+            timeout=max(0.05, lock_timeout_seconds),
+        ) as conn:
+            row = conn.execute(
+                """
+                SELECT payload
+                FROM power_readings
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+    except _sqlite3.Error:
+        return None
+
+    if row is None:
+        return None
+
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    return {
+        "soc_pct": payload.get("state_of_charge_pct_estimate"),
+        "is_charging": bool(payload.get("is_charging")),
+    }
+
+
+def _effective_scan_cadence(
+    config: Config,
+    power: dict[str, Any] | None,
+) -> tuple[int, float]:
+    """Return (poll_interval_seconds, scan_duration_seconds) for current power.
+
+    Pure function (no I/O) so it is unit-testable without hardware. Full cadence
+    is used while charging, when battery saving is disabled, or when the power
+    state is unknown; on battery it stretches the poll interval (further when the
+    SOC is low) and shortens the active scan window.
+    """
+    full = (config.post_interval_seconds, config.scan_duration_seconds)
+    if not config.battery_saver_enabled or power is None:
+        return full
+    if power.get("is_charging"):
+        return full
+
+    soc = power.get("soc_pct")
+    try:
+        soc_value = float(soc) if soc is not None else None
+    except (TypeError, ValueError):
+        # Malformed SOC in the shared table must not crash the scan loop;
+        # fall through to the (still conservative) discharging cadence.
+        soc_value = None
+    if soc_value is not None and soc_value < config.low_battery_soc_pct:
+        return (
+            config.poll_interval_low_battery_seconds,
+            config.scan_duration_low_power_seconds,
+        )
+    return (
+        config.poll_interval_discharging_seconds,
+        config.scan_duration_low_power_seconds,
+    )
+
+
 async def _collect_pi_location(config: Config) -> dict[str, Any]:
     def _from_cache() -> tuple[Any, Any, str | None] | None:
         return _read_pi_location_from_cache(config.pi_location_cache_path)
@@ -1033,9 +1141,17 @@ def _write_ble_wake_signal() -> None:
         print(f"Failed to write BLE wake signal: {exc}")
 
 
-async def collect_payload(config: Config) -> dict[str, Any]:
+async def collect_payload(
+    config: Config,
+    scan_duration_seconds: float | None = None,
+) -> dict[str, Any]:
+    effective_scan_duration = (
+        config.scan_duration_seconds
+        if scan_duration_seconds is None
+        else scan_duration_seconds
+    )
     devices = await BleakScanner.discover(
-        timeout=config.scan_duration_seconds,
+        timeout=effective_scan_duration,
         return_adv=True,
     )
 
@@ -1077,7 +1193,7 @@ async def collect_payload(config: Config) -> dict[str, Any]:
         "pi_id": config.pi_id,
         "captured_at_utc": _utc_now_iso(),
         "event_type": "ble_sensor_scan",
-        "scan_duration_seconds": config.scan_duration_seconds,
+        "scan_duration_seconds": effective_scan_duration,
         "sensor_count": len(sensors),
         "sensors": sensors,
         "pi_location": pi_location,
@@ -1122,9 +1238,26 @@ async def run() -> None:
 
     while True:
         apply_poll_sleep = True
+        # Throttle scan cadence on battery to cut radio power overnight. Read the
+        # latest battery state (read-only) and fall back to full cadence if the
+        # power-monitor data is unavailable.
+        try:
+            power_state = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _read_latest_power_from_telematics_db,
+                    config.telematics_db_path,
+                    config.pi_location_query_timeout_seconds,
+                ),
+                timeout=config.pi_location_query_timeout_seconds,
+            )
+        except Exception:
+            power_state = None
+        poll_interval_seconds, scan_duration_seconds = _effective_scan_cadence(
+            config, power_state
+        )
         try:
             try:
-                payload = await collect_payload(config)
+                payload = await collect_payload(config, scan_duration_seconds)
                 scan_retry_attempt = 0
             except Exception as exc:
                 err_text = f"{exc}".lower()
@@ -1182,7 +1315,7 @@ async def run() -> None:
             print(f"Scan loop error: {exc}")
 
         if apply_poll_sleep:
-            await asyncio.sleep(config.post_interval_seconds)
+            await asyncio.sleep(poll_interval_seconds)
 
 
 if __name__ == "__main__":

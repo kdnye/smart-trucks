@@ -165,6 +165,9 @@ class Config:
     vehicle_id: str
     db_path: str
     sample_interval_seconds: int
+    sample_interval_idle_seconds: int
+    fast_sample_soc_margin_pct: float
+    fast_sample_voltage_margin_v: float
     ina219_addresses: tuple[int, ...]
     i2c_bus: int
     ina219_shunt_ohms: float
@@ -338,6 +341,9 @@ def load_config() -> Config:
         vehicle_id=_sanitize_env_value(os.getenv("VEHICLE_ID")) or "UNKNOWN_TRUCK",
         db_path=_sanitize_env_value(os.getenv("TELEMATICS_DB_PATH")) or "/data/telematics.db",
         sample_interval_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_SECONDS", 2, minimum=1),
+        sample_interval_idle_seconds=_read_int_env("POWER_SAMPLE_INTERVAL_IDLE_SECONDS", 20, minimum=1),
+        fast_sample_soc_margin_pct=_read_float_env("POWER_FAST_SAMPLE_SOC_MARGIN_PCT", 15.0),
+        fast_sample_voltage_margin_v=_read_float_env("POWER_FAST_SAMPLE_VOLTAGE_MARGIN_V", 0.20),
         ina219_addresses=ina219_addresses,
         i2c_bus=i2c_bus,
         ina219_shunt_ohms=_read_float_env("UPS_SHUNT_OHMS", 0.01),
@@ -788,7 +794,46 @@ def _derive_power_state(flags: dict[str, bool]) -> str:
     return "idle"
 
 
+def _select_next_sample_interval(
+    payload: dict[str, Any],
+    config: Config,
+    *,
+    charging_changed: bool,
+) -> int:
+    """Choose the next sensor sampling interval, trading rate for power.
+
+    Pure function (no I/O) for unit testing. Stays at the fast cadence whenever a
+    fast reaction matters — sensor faults/recovery, a just-observed charging-state
+    change, or a battery getting close to the shutdown thresholds — and otherwise
+    backs off to the idle cadence to cut I2C reads and SD-card writes. Because the
+    fast band covers the approach to the shutdown cliff, brownout debounce timing
+    near the threshold is unchanged.
+    """
+    status = str(payload.get("read_status", payload.get("status", "unknown")))
+    if status != "ok":
+        return config.sample_interval_seconds
+    if charging_changed:
+        return config.sample_interval_seconds
+
+    try:
+        soc = float(payload.get("state_of_charge_pct_estimate") or 0.0)
+        voltage = float(payload.get("bus_voltage_v") or 0.0)
+    except (TypeError, ValueError):
+        # Unparseable telemetry is treated as worst-case (near the cliff): keep
+        # sampling fast rather than crashing the sensor loop.
+        return config.sample_interval_seconds
+    soc_near_trip = soc <= config.shutdown_soc_trip_pct + config.fast_sample_soc_margin_pct
+    voltage_near_trip = (
+        voltage <= config.shutdown_voltage_trip_v + config.fast_sample_voltage_margin_v
+    )
+    if soc_near_trip or voltage_near_trip:
+        return config.sample_interval_seconds
+
+    return max(config.sample_interval_seconds, config.sample_interval_idle_seconds)
+
+
 async def sensor_loop(config: Config, monitor: PowerReader, out_queue: asyncio.Queue[dict[str, Any]], stats: RuntimeStats) -> None:
+    previous_is_charging: bool | None = None
     while True:
         started = asyncio.get_running_loop().time()
         occurred_at = datetime.now(timezone.utc).isoformat()
@@ -863,7 +908,16 @@ async def sensor_loop(config: Config, monitor: PowerReader, out_queue: asyncio.Q
 
         event = {"occurred_at": occurred_at, "payload": payload, "sensor_latency_ms": latency_ms}
         await out_queue.put(event)
-        await asyncio.sleep(config.sample_interval_seconds)
+
+        current_is_charging = bool(payload.get("is_charging"))
+        charging_changed = (
+            previous_is_charging is not None and current_is_charging != previous_is_charging
+        )
+        previous_is_charging = current_is_charging
+        next_interval_seconds = _select_next_sample_interval(
+            payload, config, charging_changed=charging_changed
+        )
+        await asyncio.sleep(next_interval_seconds)
 
 
 async def state_engine_loop(

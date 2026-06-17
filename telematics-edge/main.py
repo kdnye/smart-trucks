@@ -175,9 +175,14 @@ class ImuMonitor:
         self._latest_snapshot: dict[str, Any] = {"status": "initializing"}
         self._latest_harsh_event: dict[str, Any] | None = None
         self._motion_wake_callback: Callable[[], Awaitable[None]] | None = None
+        self._parked_predicate: Callable[[], bool] | None = None
 
     def set_motion_wake_callback(self, cb: Callable[[], Awaitable[None]]) -> None:
         self._motion_wake_callback = cb
+
+    def set_parked_predicate(self, predicate: Callable[[], bool]) -> None:
+        """Register a callable used to throttle IMU polling while parked."""
+        self._parked_predicate = predicate
 
     async def start(self) -> None:
         async def on_snapshot(snapshot: ImuSnapshot) -> None:
@@ -188,7 +193,11 @@ class ImuMonitor:
             if self._motion_wake_callback:
                 await self._motion_wake_callback()
 
-        await self._reader.read_loop(on_snapshot, on_harsh_event)
+        await self._reader.read_loop(
+            on_snapshot,
+            on_harsh_event,
+            parked_predicate=self._parked_predicate,
+        )
 
     def read(self) -> dict[str, Any]:
         payload = dict(self._latest_snapshot)
@@ -747,6 +756,7 @@ async def run() -> None:
 
     if imu is not None:
         imu.set_motion_wake_callback(_on_motion_wake)
+        imu.set_parked_predicate(lambda: state.parked_mode)
 
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
