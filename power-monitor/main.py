@@ -16,6 +16,7 @@ from ina219 import INA219, DeviceRangeError
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from shared.env import sanitize_env_value as _sanitize_env_value
 from shared.hardware_probe import (
     build_hardware_inventory,
     parse_bool_env,
@@ -194,25 +195,6 @@ class Config:
     imu_required: bool
     power_monitor_mode: str
     power_monitor_hardware_required: bool
-
-
-def _sanitize_env_value(raw_value: str | None) -> str | None:
-    if raw_value is None:
-        return None
-
-    value = raw_value.strip()
-    if not value:
-        return None
-
-    if value.startswith("${") and value.endswith("}"):
-        body = value[2:-1]
-        if ":-" in body:
-            _, fallback = body.split(":-", 1)
-            fallback_value = fallback.strip()
-            return fallback_value or None
-        return None
-
-    return value
 
 
 def _read_int_env(name: str, default: int, *, minimum: int | None = None) -> int:

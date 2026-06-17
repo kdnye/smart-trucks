@@ -8,6 +8,8 @@ from typing import Any
 
 from smbus2 import SMBus
 
+from .env import read_bool_env, read_int_env, sanitize_env_value
+
 
 @dataclass(frozen=True)
 class NmeaProbeResult:
@@ -45,30 +47,21 @@ class HardwareInventory:
 
 
 def parse_bool_env(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return read_bool_env(name, default)
 
 
 def parse_int_env(name: str, default: int, minimum: int = 0) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return max(minimum, default)
-    try:
-        return max(minimum, int(raw.strip()))
-    except ValueError:
-        return max(minimum, default)
+    return read_int_env(name, default, minimum=minimum)
 
 
 def parse_hex_list_env(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
+    value = sanitize_env_value(os.getenv(name))
+    if value is None:
         return default
 
     deduped: list[int] = []
     seen: set[int] = set()
-    for token in raw.split(","):
+    for token in value.split(","):
         item = token.strip()
         if not item:
             continue
