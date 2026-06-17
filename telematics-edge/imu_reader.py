@@ -73,6 +73,22 @@ class IMUSnapshot:
 ImuSnapshot = IMUSnapshot
 
 
+def effective_sample_interval(
+    *,
+    parked: bool,
+    active_interval_seconds: float,
+    parked_interval_seconds: float,
+) -> float:
+    """Return the accelerometer poll interval, throttled while parked.
+
+    Pure helper (no I/O) for unit testing. The parked interval is never faster
+    than the active interval.
+    """
+    if parked:
+        return max(active_interval_seconds, parked_interval_seconds)
+    return active_interval_seconds
+
+
 def read_i2c_atomic(bus_num: int, address: int, register: int, length: int) -> list[int]:
     """Executes a hardware-locked combined I2C transaction."""
     retries = 3
@@ -226,10 +242,24 @@ class IMUReader:
         snapshot_callback: Callable[[ImuSnapshot], Awaitable[None]],
         harsh_event_callback: Callable[[ImuSnapshot], Awaitable[None]],
         sample_interval_seconds: float = 0.1,
+        parked_predicate: Callable[[], bool] | None = None,
+        parked_sample_interval_seconds: float | None = None,
     ) -> None:
         snapshot_interval_seconds = 1.0
         debounce_seconds = 2.0
         last_snapshot_time = 0.0
+        # While parked we poll the accelerometer far less often to let the CPU
+        # reach deep idle (the dominant overnight-on-battery power draw). Motion
+        # is still detected within one parked interval, which is enough to wake
+        # the device back to full-rate collection.
+        if parked_sample_interval_seconds is None:
+            parked_sample_interval_seconds = float(
+                os.getenv("IMU_PARKED_SAMPLE_INTERVAL_SECONDS", "1.0")
+            )
+        # The parked rate should never be faster than the active rate.
+        parked_sample_interval_seconds = max(
+            sample_interval_seconds, parked_sample_interval_seconds
+        )
 
         while not self.connect():
             await asyncio.sleep(5)
@@ -305,7 +335,14 @@ class IMUReader:
                 logger.error("IMU read error: %s", exc)
                 await asyncio.sleep(1)
 
-            await asyncio.sleep(sample_interval_seconds)
+            parked = bool(parked_predicate()) if parked_predicate is not None else False
+            await asyncio.sleep(
+                effective_sample_interval(
+                    parked=parked,
+                    active_interval_seconds=sample_interval_seconds,
+                    parked_interval_seconds=parked_sample_interval_seconds,
+                )
+            )
 
 
 def snapshot_as_dict(snapshot: ImuSnapshot) -> dict[str, Any]:
