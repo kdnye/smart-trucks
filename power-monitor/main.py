@@ -815,8 +815,13 @@ def _select_next_sample_interval(
     if charging_changed:
         return config.sample_interval_seconds
 
-    soc = float(payload.get("state_of_charge_pct_estimate", 0.0))
-    voltage = float(payload.get("bus_voltage_v", 0.0))
+    try:
+        soc = float(payload.get("state_of_charge_pct_estimate") or 0.0)
+        voltage = float(payload.get("bus_voltage_v") or 0.0)
+    except (TypeError, ValueError):
+        # Unparseable telemetry is treated as worst-case (near the cliff): keep
+        # sampling fast rather than crashing the sensor loop.
+        return config.sample_interval_seconds
     soc_near_trip = soc <= config.shutdown_soc_trip_pct + config.fast_sample_soc_margin_pct
     voltage_near_trip = (
         voltage <= config.shutdown_voltage_trip_v + config.fast_sample_voltage_margin_v

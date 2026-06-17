@@ -1068,7 +1068,13 @@ def _effective_scan_cadence(
         return full
 
     soc = power.get("soc_pct")
-    if soc is not None and float(soc) < config.low_battery_soc_pct:
+    try:
+        soc_value = float(soc) if soc is not None else None
+    except (TypeError, ValueError):
+        # Malformed SOC in the shared table must not crash the scan loop;
+        # fall through to the (still conservative) discharging cadence.
+        soc_value = None
+    if soc_value is not None and soc_value < config.low_battery_soc_pct:
         return (
             config.poll_interval_low_battery_seconds,
             config.scan_duration_low_power_seconds,

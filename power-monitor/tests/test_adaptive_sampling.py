@@ -51,6 +51,12 @@ class AdaptiveSamplingTests(unittest.TestCase):
         interval = main._select_next_sample_interval(payload, config, charging_changed=False)
         self.assertEqual(interval, config.sample_interval_seconds)
 
+    def test_malformed_payload_stays_fast_without_raising(self) -> None:
+        config = _config()
+        payload = {"status": "ok", "state_of_charge_pct_estimate": "n/a", "bus_voltage_v": None}
+        interval = main._select_next_sample_interval(payload, config, charging_changed=False)
+        self.assertEqual(interval, config.sample_interval_seconds)
+
 
 if __name__ == "__main__":
     unittest.main()

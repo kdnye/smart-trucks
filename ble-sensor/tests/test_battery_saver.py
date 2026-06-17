@@ -51,6 +51,15 @@ class EffectiveScanCadenceTests(unittest.TestCase):
         self.assertEqual(interval, config.poll_interval_low_battery_seconds)
         self.assertEqual(scan, config.scan_duration_low_power_seconds)
 
+    def test_malformed_soc_does_not_raise(self) -> None:
+        config = _config()
+        interval, scan = main._effective_scan_cadence(
+            config, {"soc_pct": "n/a", "is_charging": False}
+        )
+        # Falls through to the conservative discharging cadence instead of crashing.
+        self.assertEqual(interval, config.poll_interval_discharging_seconds)
+        self.assertEqual(scan, config.scan_duration_low_power_seconds)
+
 
 class ReadLatestPowerTests(unittest.TestCase):
     def test_missing_db_returns_none(self) -> None:

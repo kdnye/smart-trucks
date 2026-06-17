@@ -253,9 +253,15 @@ class IMUReader:
         # is still detected within one parked interval, which is enough to wake
         # the device back to full-rate collection.
         if parked_sample_interval_seconds is None:
-            parked_sample_interval_seconds = float(
-                os.getenv("IMU_PARKED_SAMPLE_INTERVAL_SECONDS", "1.0")
-            )
+            raw_interval = os.getenv("IMU_PARKED_SAMPLE_INTERVAL_SECONDS", "1.0")
+            try:
+                parked_sample_interval_seconds = float(raw_interval)
+            except ValueError:
+                logger.warning(
+                    "Invalid IMU_PARKED_SAMPLE_INTERVAL_SECONDS %r; falling back to 1.0",
+                    raw_interval,
+                )
+                parked_sample_interval_seconds = 1.0
         # The parked rate should never be faster than the active rate.
         parked_sample_interval_seconds = max(
             sample_interval_seconds, parked_sample_interval_seconds
