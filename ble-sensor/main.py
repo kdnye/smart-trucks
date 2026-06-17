@@ -69,7 +69,7 @@ def load_config() -> Config:
     )
 
     return Config(
-        vehicle_id=read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
+        vehicle_id=read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK"),
         post_interval_seconds=poll_interval_seconds,
         scan_duration_seconds=scan_duration_seconds,
         anonymize_mac=read_bool_env("ANONYMIZE_MAC", default=False),
@@ -116,13 +116,11 @@ def load_config() -> Config:
             "RESOLVER_STATIONARY_MODE_ENABLED", default=False
         ),
         battery_saver_enabled=read_bool_env("BLE_BATTERY_SAVER_ENABLED", default=True),
-        poll_interval_discharging_seconds=max(
-            poll_interval_seconds,
-            read_int_env("BLE_POLL_INTERVAL_DISCHARGING_SECONDS", 300),
+        poll_interval_discharging_seconds=read_int_env(
+            "BLE_POLL_INTERVAL_DISCHARGING_SECONDS", 300, minimum=poll_interval_seconds
         ),
-        poll_interval_low_battery_seconds=max(
-            poll_interval_seconds,
-            read_int_env("BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS", 900),
+        poll_interval_low_battery_seconds=read_int_env(
+            "BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS", 900, minimum=poll_interval_seconds
         ),
         low_battery_soc_pct=read_float_env("BLE_LOW_BATTERY_SOC_PCT", 25.0, minimum=0.0),
         scan_duration_low_power_seconds=max(
