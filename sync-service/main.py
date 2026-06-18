@@ -69,6 +69,17 @@ def _increment_attempts(table: str, row_ids: list[int]) -> None:
         conn.close()
 
 
+async def _apply_all(op, ids_by_table: dict[str, list[int]]) -> None:
+    """Run a per-table write across all tables SEQUENTIALLY.
+
+    SQLite allows only one writer, so concurrent writes (e.g. via asyncio.gather)
+    just contend for the lock with no benefit; serialize them. Empty id lists are
+    no-ops in the underlying ops.
+    """
+    for table_name, row_ids in ids_by_table.items():
+        await asyncio.to_thread(op, table_name, row_ids)
+
+
 def _send_events(events: list[dict[str, Any]]) -> requests.Response:
     webhook_url = os.environ.get("WEBHOOK_URL")
     if not webhook_url:
@@ -116,22 +127,12 @@ async def sync_cycle() -> None:
         # Network/transport failure (DNS, connection refused, timeout, etc.).
         # Leave rows pending (sent_at_utc NULL) so they retry on the next cycle,
         # but bump attempt_count for backoff/observability visibility.
-        await asyncio.gather(
-            asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
-            asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
-            asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
-            asyncio.to_thread(_increment_attempts, "ble_scans", ids_by_table["ble_scans"]),
-        )
+        await _apply_all(_increment_attempts, ids_by_table)
         logger.warning("Network error sending events: %s. Rows remain pending for retry.", exc)
         return
 
     if 200 <= response.status_code < 300:
-        await asyncio.gather(
-            asyncio.to_thread(_mark_rows_sent, "heartbeats", ids_by_table["heartbeats"]),
-            asyncio.to_thread(_mark_rows_sent, "gps_points", ids_by_table["gps_points"]),
-            asyncio.to_thread(_mark_rows_sent, "edge_health", ids_by_table["edge_health"]),
-            asyncio.to_thread(_mark_rows_sent, "ble_scans", ids_by_table["ble_scans"]),
-        )
+        await _apply_all(_mark_rows_sent, ids_by_table)
         logger.info(
             "Synced events batch (heartbeats=%d gps_points=%d edge_health=%d ble_scans=%d).",
             len(ids_by_table["heartbeats"]),
@@ -140,12 +141,7 @@ async def sync_cycle() -> None:
             len(ids_by_table["ble_scans"]),
         )
     elif 400 <= response.status_code < 500:
-        await asyncio.gather(
-            asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
-            asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
-            asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
-            asyncio.to_thread(_increment_attempts, "ble_scans", ids_by_table["ble_scans"]),
-        )
+        await _apply_all(_increment_attempts, ids_by_table)
         logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
     else:
         logger.warning("5xx/non-2xx response (%s): leaving rows pending for retry.", response.status_code)
