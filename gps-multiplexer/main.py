@@ -21,15 +21,17 @@ import threading
 import serial
 import uvloop
 
+from shared.env import read_int_env
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-GPS_BAUD = int(os.getenv("GPS_BAUD_RATE", "9600"))
+GPS_BAUD = read_int_env("GPS_BAUD_RATE", 9600)
 LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = int(os.getenv("GPS_TCP_PORT", "2947"))
+LISTEN_PORT = read_int_env("GPS_TCP_PORT", 2947)
 DEFAULT_GPS_PORT = "/dev/serial0"
 DEFAULT_GPS_CANDIDATES = (
     "/dev/serial0",
@@ -149,7 +151,12 @@ class GPSBroadcaster:
                 break
             if not serial_connected:
                 logger.warning(
-                    "No usable GPS serial device found among candidates: %s",
+                    "SETUP: no usable GPS serial device among candidates: %s. "
+                    "Action: confirm the GPS is wired and powered; if it's a USB receiver it "
+                    "enumerates as /dev/ttyACM0 or /dev/ttyUSB0 — add that path to the "
+                    "GPS_SERIAL_CANDIDATES variable (and the container's devices: mapping). "
+                    "If it's a UART HAT, ensure the serial port is enabled on the Pi "
+                    "(/dev/serial0). Heartbeats still upload, but without lat/lon until GPS is found.",
                     ", ".join(GPS_PORT_CANDIDATES),
                 )
 

@@ -1214,11 +1214,25 @@ async def collect_payload(
         sensors.append(sensor_payload)
 
     pi_location = await _collect_pi_location(config)
+    captured_at_utc = _utc_now_iso()
+    # Hash over a stable, sorted view (BLE discovery order varies run-to-run) so
+    # the idempotency key is deterministic for the same set of devices. Don't
+    # mutate the emitted sensors list.
+    sensors_hash = hashlib.sha256(
+        json.dumps(
+            sorted(sensors, key=lambda s: str(s.get("mac_address") or s.get("device_id") or "")),
+            sort_keys=True,
+            default=str,
+        ).encode()
+    ).hexdigest()[:12]
     payload: dict[str, Any] = {
         "vehicle_id": config.vehicle_id,
         "pi_id": config.pi_id,
-        "captured_at_utc": _utc_now_iso(),
+        "captured_at_utc": captured_at_utc,
         "event_type": "ble_sensor_scan",
+        "idempotency_key": (
+            f"{config.vehicle_id}:ble_sensor_scan:{captured_at_utc}:{sensors_hash}"
+        ),
         "scan_duration_seconds": effective_scan_duration,
         "sensor_count": len(sensors),
         "sensors": sensors,

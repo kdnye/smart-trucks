@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY gps-multiplexer/start.sh /usr/local/bin/start.sh
 RUN chmod +x /usr/local/bin/start.sh
 
+COPY shared/ /usr/src/app/shared/
 COPY gps-multiplexer/ .
 
 ENTRYPOINT ["/usr/local/bin/start.sh"]

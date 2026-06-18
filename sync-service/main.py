@@ -7,10 +7,12 @@ from typing import Any
 
 import requests
 
+from shared.env import read_int_env
+
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
-SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
-SYNC_BATCH_SIZE = max(1, int(os.getenv("SYNC_BATCH_SIZE", "50")))
-HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
+SYNC_INTERVAL_SECONDS = read_int_env("SYNC_INTERVAL_SECONDS", 60)
+SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 50, minimum=1)
+HTTP_TIMEOUT_SECONDS = read_int_env("HTTP_TIMEOUT_SECONDS", 15)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -67,15 +69,26 @@ def _increment_attempts(table: str, row_ids: list[int]) -> None:
         conn.close()
 
 
+async def _apply_all(op, ids_by_table: dict[str, list[int]]) -> None:
+    """Run a per-table write across all tables SEQUENTIALLY.
+
+    SQLite allows only one writer, so concurrent writes (e.g. via asyncio.gather)
+    just contend for the lock with no benefit; serialize them. Empty id lists are
+    no-ops in the underlying ops.
+    """
+    for table_name, row_ids in ids_by_table.items():
+        await asyncio.to_thread(op, table_name, row_ids)
+
+
 def _send_events(events: list[dict[str, Any]]) -> requests.Response:
     webhook_url = os.environ.get("WEBHOOK_URL")
     if not webhook_url:
         raise RuntimeError("WEBHOOK_URL is not set.")
 
     headers = {}
-    motive_api_key = os.environ.get("MOTIVE_API_KEY")
-    if motive_api_key:
-        headers["X-API-Key"] = motive_api_key
+    api_key = os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")
+    if api_key:
+        headers["X-API-Key"] = api_key
 
     return requests.post(
         webhook_url,
@@ -103,19 +116,23 @@ async def sync_cycle() -> None:
         return
 
     events = [row[3] for row in all_rows]
-    response = await asyncio.to_thread(_send_events, events)
 
     ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": [], "ble_scans": []}
     for table_name, row_id, _, _ in all_rows:
         ids_by_table[table_name].append(row_id)
 
+    try:
+        response = await asyncio.to_thread(_send_events, events)
+    except (requests.RequestException, OSError) as exc:
+        # Network/transport failure (DNS, connection refused, timeout, etc.).
+        # Leave rows pending (sent_at_utc NULL) so they retry on the next cycle,
+        # but bump attempt_count for backoff/observability visibility.
+        await _apply_all(_increment_attempts, ids_by_table)
+        logger.warning("Network error sending events: %s. Rows remain pending for retry.", exc)
+        return
+
     if 200 <= response.status_code < 300:
-        await asyncio.gather(
-            asyncio.to_thread(_mark_rows_sent, "heartbeats", ids_by_table["heartbeats"]),
-            asyncio.to_thread(_mark_rows_sent, "gps_points", ids_by_table["gps_points"]),
-            asyncio.to_thread(_mark_rows_sent, "edge_health", ids_by_table["edge_health"]),
-            asyncio.to_thread(_mark_rows_sent, "ble_scans", ids_by_table["ble_scans"]),
-        )
+        await _apply_all(_mark_rows_sent, ids_by_table)
         logger.info(
             "Synced events batch (heartbeats=%d gps_points=%d edge_health=%d ble_scans=%d).",
             len(ids_by_table["heartbeats"]),
@@ -124,23 +141,51 @@ async def sync_cycle() -> None:
             len(ids_by_table["ble_scans"]),
         )
     elif 400 <= response.status_code < 500:
-        await asyncio.gather(
-            asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
-            asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
-            asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
-            asyncio.to_thread(_increment_attempts, "ble_scans", ids_by_table["ble_scans"]),
-        )
-        logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
+        await _apply_all(_increment_attempts, ids_by_table)
+        if response.status_code in (401, 403):
+            logger.error(
+                "SETUP: %s from the ingest endpoint — the API key this device sends does "
+                "NOT match the cloud ingest secret. Action: set EDGE_INGEST_KEY (or the "
+                "transitional MOTIVE_API_KEY) for this device in Balena to the same value "
+                "the ingest function expects. WEBHOOK_URL=%s",
+                response.status_code,
+                os.environ.get("WEBHOOK_URL", "<unset>"),
+            )
+        else:
+            logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
     else:
         logger.warning("5xx/non-2xx response (%s): leaving rows pending for retry.", response.status_code)
 
 
+def _validate_startup_config() -> None:
+    """Log obvious, actionable setup problems once at boot."""
+    if not os.environ.get("WEBHOOK_URL"):
+        logger.error(
+            "SETUP: WEBHOOK_URL is not set — nothing can be uploaded. "
+            "Action: set WEBHOOK_URL (the cloud ingest URL) for this device in Balena."
+        )
+    if not (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")):
+        logger.error(
+            "SETUP: no ingest key set (EDGE_INGEST_KEY / MOTIVE_API_KEY) — the cloud will "
+            "reject every upload with 401. Action: set EDGE_INGEST_KEY in Balena to the "
+            "cloud ingest secret."
+        )
+    if (os.environ.get("VEHICLE_ID") or "").strip() in ("", "UNKNOWN_TRUCK"):
+        logger.warning(
+            "SETUP: VEHICLE_ID is not set — uploaded data will not map to a truck/warehouse. "
+            "Action: set VEHICLE_ID for this device in Balena."
+        )
+
+
 async def run() -> None:
+    _validate_startup_config()
     logger.info(
-        "Starting sync-service loop: interval=%ss db=%s batch_size=%s",
+        "Starting sync-service loop: interval=%ss db=%s batch_size=%s webhook_url=%s key=%s",
         SYNC_INTERVAL_SECONDS,
         DB_PATH,
         SYNC_BATCH_SIZE,
+        "set" if os.environ.get("WEBHOOK_URL") else "UNSET",
+        "set" if (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")) else "UNSET",
     )
     while True:
         try:

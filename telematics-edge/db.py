@@ -7,13 +7,15 @@ from typing import Any
 
 import aiosqlite
 
+from shared.env import read_float_env, read_int_env
+
 logger = logging.getLogger(__name__)
 
 DB_PATH = "/data/telematics.db"
-SQLITE_CONNECT_TIMEOUT_SECONDS = float(os.getenv("SQLITE_CONNECT_TIMEOUT_SECONDS", "30"))
-SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000"))
-SQLITE_LOCKED_RETRY_COUNT = int(os.getenv("SQLITE_LOCKED_RETRY_COUNT", "3"))
-SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS = float(os.getenv("SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS", "0.05"))
+SQLITE_CONNECT_TIMEOUT_SECONDS = read_float_env("SQLITE_CONNECT_TIMEOUT_SECONDS", 30.0)
+SQLITE_BUSY_TIMEOUT_MS = read_int_env("SQLITE_BUSY_TIMEOUT_MS", 30000)
+SQLITE_LOCKED_RETRY_COUNT = read_int_env("SQLITE_LOCKED_RETRY_COUNT", 3)
+SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS = read_float_env("SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS", 0.05)
 
 _db_connection: aiosqlite.Connection | None = None
 _db_lock = asyncio.Lock()
@@ -201,6 +203,23 @@ async def init_db() -> None:
                 attempt_count   INTEGER NOT NULL DEFAULT 0
             );
             """
+        )
+        # Forward-compat: the battery-saver path reads the latest row here and a
+        # future power board (CN3791/IP5356/STM32) will write to it. Create it
+        # idempotently so readers never hit "no such table" before the writer
+        # exists.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS power_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vehicle_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_power_readings_latest ON power_readings(vehicle_id, occurred_at DESC, id DESC);"
         )
         await db.execute("DROP TABLE IF EXISTS local_gps;")
         await db.execute("DROP TABLE IF EXISTS local_power;")

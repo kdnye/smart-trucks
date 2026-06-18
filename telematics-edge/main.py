@@ -647,10 +647,12 @@ async def maintenance_worker(config: Config, state: RuntimeState) -> None:
         if not state.wifi_connected:
             alerts.append("wifi_disconnected")
 
+        edge_health_captured_at = utc_now_iso()
         edge_payload = {
             "event_type": "edge_health",
             "vehicle_id": config.vehicle_id,
-            "captured_at_utc": utc_now_iso(),
+            "captured_at_utc": edge_health_captured_at,
+            "idempotency_key": f"{config.vehicle_id}:edge_health:{edge_health_captured_at}",
             "last_gps_fix_utc": state.last_gps_fix_utc,
             "last_gps_fix_age_sec": last_gps_fix_age,
             "last_locked_gps_point_age_sec": age_seconds(state.last_locked_gps_point_utc),
@@ -742,6 +744,12 @@ async def run() -> None:
 
     await init_db()
     print(f"Starting telematics-edge for vehicle {config.vehicle_id}.")
+    if config.vehicle_id == "UNKNOWN_TRUCK":
+        logger.warning(
+            "SETUP: VEHICLE_ID is not set, so this device reports as 'UNKNOWN_TRUCK'. "
+            "Its data will not map to a real truck/warehouse on the dashboard. "
+            "Action: set the VEHICLE_ID variable for this device in Balena."
+        )
 
     tasks = [
         asyncio.create_task(heartbeat_builder_worker(config, state, imu)),
