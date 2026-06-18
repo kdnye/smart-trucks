@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable
 
 from smbus2 import SMBus, i2c_msg
 
+from shared.env import read_float_env
+
 logger = logging.getLogger(__name__)
 
 WHO_AM_I = 0x0F
@@ -114,8 +116,8 @@ class IMUReader:
 
     def __init__(self, bus_num: int = 1) -> None:
         self.bus_num = bus_num
-        self.harsh_threshold_g = float(os.getenv("HARSH_EVENT_G_THRESHOLD", "0.4"))
-        self.gravity_baseline_g = float(os.getenv("GRAVITY_BASELINE_G", "1.0"))
+        self.harsh_threshold_g = read_float_env("HARSH_EVENT_G_THRESHOLD", 0.4)
+        self.gravity_baseline_g = read_float_env("GRAVITY_BASELINE_G", 1.0)
         self._imu_address: int = LSM6DSL_ADDRESS
         self._chip: str = "lsm6dsl"
         self._has_mag: bool = False

@@ -1,2 +1,2 @@
-bleak
+bleak>=0.21,<0.23
 uvloop==0.19.0

@@ -7,10 +7,12 @@ from typing import Any
 
 import requests
 
+from shared.env import read_int_env
+
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
-SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
-SYNC_BATCH_SIZE = max(1, int(os.getenv("SYNC_BATCH_SIZE", "50")))
-HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
+SYNC_INTERVAL_SECONDS = read_int_env("SYNC_INTERVAL_SECONDS", 60)
+SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 50, minimum=1)
+HTTP_TIMEOUT_SECONDS = read_int_env("HTTP_TIMEOUT_SECONDS", 15)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -73,9 +75,9 @@ def _send_events(events: list[dict[str, Any]]) -> requests.Response:
         raise RuntimeError("WEBHOOK_URL is not set.")
 
     headers = {}
-    motive_api_key = os.environ.get("MOTIVE_API_KEY")
-    if motive_api_key:
-        headers["X-API-Key"] = motive_api_key
+    api_key = os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")
+    if api_key:
+        headers["X-API-Key"] = api_key
 
     return requests.post(
         webhook_url,
@@ -103,11 +105,25 @@ async def sync_cycle() -> None:
         return
 
     events = [row[3] for row in all_rows]
-    response = await asyncio.to_thread(_send_events, events)
 
     ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": [], "ble_scans": []}
     for table_name, row_id, _, _ in all_rows:
         ids_by_table[table_name].append(row_id)
+
+    try:
+        response = await asyncio.to_thread(_send_events, events)
+    except (requests.RequestException, OSError) as exc:
+        # Network/transport failure (DNS, connection refused, timeout, etc.).
+        # Leave rows pending (sent_at_utc NULL) so they retry on the next cycle,
+        # but bump attempt_count for backoff/observability visibility.
+        await asyncio.gather(
+            asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
+            asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
+            asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
+            asyncio.to_thread(_increment_attempts, "ble_scans", ids_by_table["ble_scans"]),
+        )
+        logger.warning("Network error sending events: %s. Rows remain pending for retry.", exc)
+        return
 
     if 200 <= response.status_code < 300:
         await asyncio.gather(

@@ -21,15 +21,17 @@ import threading
 import serial
 import uvloop
 
+from shared.env import read_int_env
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-GPS_BAUD = int(os.getenv("GPS_BAUD_RATE", "9600"))
+GPS_BAUD = read_int_env("GPS_BAUD_RATE", 9600)
 LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = int(os.getenv("GPS_TCP_PORT", "2947"))
+LISTEN_PORT = read_int_env("GPS_TCP_PORT", 2947)
 DEFAULT_GPS_PORT = "/dev/serial0"
 DEFAULT_GPS_CANDIDATES = (
     "/dev/serial0",

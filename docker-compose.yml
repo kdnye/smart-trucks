@@ -80,6 +80,9 @@ services:
     environment:
       - VEHICLE_ID=${VEHICLE_ID}
       - WEBHOOK_URL=${WEBHOOK_URL}
+      # EDGE_INGEST_KEY is the preferred auth key; MOTIVE_API_KEY is kept as a
+      # transitional fallback until Balena + cloud are cut over to the new name.
+      - EDGE_INGEST_KEY=${EDGE_INGEST_KEY}
       - MOTIVE_API_KEY=${MOTIVE_API_KEY}
       - DB_PATH=/data/telematics.db
 
