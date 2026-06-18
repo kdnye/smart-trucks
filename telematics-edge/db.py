@@ -527,23 +527,30 @@ async def purge_old_sent_rows(days: int = 7) -> int:
     deleted_total = 0
     try:
         db = await _get_db_connection()
-        gps_cursor = await db.execute(
-            "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
-        )
-        hb_cursor = await db.execute(
-            "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
-        )
-        health_cursor = await db.execute(
-            "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
-        )
-        ble_cursor = await db.execute(
-            "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
-        )
-        await db.commit()
+        # The shared connection runs in autocommit (isolation_level=None), so wrap
+        # the deletes in one explicit transaction: a single fsync and atomic purge.
+        await db.execute("BEGIN IMMEDIATE;")
+        try:
+            gps_cursor = await db.execute(
+                "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            hb_cursor = await db.execute(
+                "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            health_cursor = await db.execute(
+                "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            ble_cursor = await db.execute(
+                "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            await db.execute("COMMIT;")
+        except Exception:
+            await db.execute("ROLLBACK;")
+            raise
         deleted_total = (
             (gps_cursor.rowcount or 0)
             + (hb_cursor.rowcount or 0)

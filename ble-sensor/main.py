@@ -749,8 +749,9 @@ def _enqueue_ble_scan(db_path: str, payload: dict[str, Any]) -> None:
     store-and-forward columns the uploader expects (sent_at_utc / attempt_count).
     """
     captured_at_utc = str(payload.get("captured_at_utc") or _utc_now_iso())
+    # WAL is already enabled persistently by _init_shared_queue_store; no need to
+    # re-issue the pragma on every write.
     with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             "INSERT INTO ble_scans (captured_at_utc, payload_json) VALUES (?, ?)",
             (captured_at_utc, json.dumps(payload)),
