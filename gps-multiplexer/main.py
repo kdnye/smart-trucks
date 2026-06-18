@@ -151,7 +151,12 @@ class GPSBroadcaster:
                 break
             if not serial_connected:
                 logger.warning(
-                    "No usable GPS serial device found among candidates: %s",
+                    "SETUP: no usable GPS serial device among candidates: %s. "
+                    "Action: confirm the GPS is wired and powered; if it's a USB receiver it "
+                    "enumerates as /dev/ttyACM0 or /dev/ttyUSB0 — add that path to the "
+                    "GPS_SERIAL_CANDIDATES variable (and the container's devices: mapping). "
+                    "If it's a UART HAT, ensure the serial port is enabled on the Pi "
+                    "(/dev/serial0). Heartbeats still upload, but without lat/lon until GPS is found.",
                     ", ".join(GPS_PORT_CANDIDATES),
                 )
 

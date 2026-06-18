@@ -142,17 +142,50 @@ async def sync_cycle() -> None:
         )
     elif 400 <= response.status_code < 500:
         await _apply_all(_increment_attempts, ids_by_table)
-        logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
+        if response.status_code in (401, 403):
+            logger.error(
+                "SETUP: %s from the ingest endpoint — the API key this device sends does "
+                "NOT match the cloud ingest secret. Action: set EDGE_INGEST_KEY (or the "
+                "transitional MOTIVE_API_KEY) for this device in Balena to the same value "
+                "the ingest function expects. WEBHOOK_URL=%s",
+                response.status_code,
+                os.environ.get("WEBHOOK_URL", "<unset>"),
+            )
+        else:
+            logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
     else:
         logger.warning("5xx/non-2xx response (%s): leaving rows pending for retry.", response.status_code)
 
 
+def _validate_startup_config() -> None:
+    """Log obvious, actionable setup problems once at boot."""
+    if not os.environ.get("WEBHOOK_URL"):
+        logger.error(
+            "SETUP: WEBHOOK_URL is not set — nothing can be uploaded. "
+            "Action: set WEBHOOK_URL (the cloud ingest URL) for this device in Balena."
+        )
+    if not (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")):
+        logger.error(
+            "SETUP: no ingest key set (EDGE_INGEST_KEY / MOTIVE_API_KEY) — the cloud will "
+            "reject every upload with 401. Action: set EDGE_INGEST_KEY in Balena to the "
+            "cloud ingest secret."
+        )
+    if (os.environ.get("VEHICLE_ID") or "").strip() in ("", "UNKNOWN_TRUCK"):
+        logger.warning(
+            "SETUP: VEHICLE_ID is not set — uploaded data will not map to a truck/warehouse. "
+            "Action: set VEHICLE_ID for this device in Balena."
+        )
+
+
 async def run() -> None:
+    _validate_startup_config()
     logger.info(
-        "Starting sync-service loop: interval=%ss db=%s batch_size=%s",
+        "Starting sync-service loop: interval=%ss db=%s batch_size=%s webhook_url=%s key=%s",
         SYNC_INTERVAL_SECONDS,
         DB_PATH,
         SYNC_BATCH_SIZE,
+        "set" if os.environ.get("WEBHOOK_URL") else "UNSET",
+        "set" if (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")) else "UNSET",
     )
     while True:
         try:
