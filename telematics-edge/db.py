@@ -187,6 +187,21 @@ async def init_db() -> None:
             );
             """
         )
+        # Store-and-forward queue for BLE scans. ble-sensor enqueues each
+        # ble_sensor_scan payload here and sync-service uploads it alongside the
+        # other queues. Co-created here (idempotent) in case telematics-edge
+        # initializes the shared DB before ble-sensor does.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ble_scans (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                sent_at_utc     TEXT,
+                attempt_count   INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
         await db.execute("DROP TABLE IF EXISTS local_gps;")
         await db.execute("DROP TABLE IF EXISTS local_power;")
         await db.execute("DROP TABLE IF EXISTS local_ble;")
@@ -203,6 +218,9 @@ async def init_db() -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_edge_health_pending ON edge_health(sent_at_utc, captured_at_utc);"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ble_scans_pending ON ble_scans(sent_at_utc, captured_at_utc);"
         )
         await db.commit()
         logger.info("Database initialized at %s with WAL mode enabled", DB_PATH)
@@ -509,16 +527,36 @@ async def purge_old_sent_rows(days: int = 7) -> int:
     deleted_total = 0
     try:
         db = await _get_db_connection()
-        gps_cursor = await db.execute(
-            "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
+        # The shared connection runs in autocommit (isolation_level=None), so wrap
+        # the deletes in one explicit transaction: a single fsync and atomic purge.
+        await db.execute("BEGIN IMMEDIATE;")
+        try:
+            gps_cursor = await db.execute(
+                "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            hb_cursor = await db.execute(
+                "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            health_cursor = await db.execute(
+                "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            ble_cursor = await db.execute(
+                "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                (cutoff,),
+            )
+            await db.execute("COMMIT;")
+        except Exception:
+            await db.execute("ROLLBACK;")
+            raise
+        deleted_total = (
+            (gps_cursor.rowcount or 0)
+            + (hb_cursor.rowcount or 0)
+            + (health_cursor.rowcount or 0)
+            + (ble_cursor.rowcount or 0)
         )
-        hb_cursor = await db.execute(
-            "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-            (cutoff,),
-        )
-        await db.commit()
-        deleted_total = (gps_cursor.rowcount or 0) + (hb_cursor.rowcount or 0)
         if deleted_total:
             logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
         return deleted_total
