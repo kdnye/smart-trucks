@@ -59,7 +59,9 @@ The outbound payload assembled by `sync-service/main.py::_build_payload`:
 }
 ```
 
-Headers: `X-API-Key: $MOTIVE_API_KEY`. Endpoint: `WEBHOOK_URL`.
+Headers: `X-API-Key: $EDGE_INGEST_KEY` (falls back to `$MOTIVE_API_KEY` when
+`EDGE_INGEST_KEY` is unset — see § "Parked / to reintegrate later" for the full
+cutover plan). Endpoint: `WEBHOOK_URL`.
 
 ## 2. Why the dashboard saw nothing
 
@@ -177,11 +179,29 @@ worker's `_heartbeat_view` and `_collect_ble_detections` exactly.
   },
   "ble_scans": [
     {
-      "timestamp_utc": "2026-04-28T17:51:30Z",
+      "event_type": "ble_sensor_scan",
+      "vehicle_id": "TRK-905",
+      "pi_id": "smart-truck-pi-01",
       "captured_at_utc": "2026-04-28T17:51:30Z",
+      "idempotency_key": "TRK-905:ble_sensor_scan:2026-04-28T17:51:30Z:9af1c2b3d4e5",
+      "scan_duration_seconds": 20.0,
+      "sensor_count": 1,
       "sensors": [
-        { "mac_address": "A4:C1:38:11:22:33", "rssi": -67, "name": "GVH5075", "temp_c": 4.1, "humidity_pct": 62.0, "battery_pct": 88 }
-      ]
+        {
+          "device_id": "A4:C1:38:11:22:33",
+          "mac_address": "A4:C1:38:11:22:33",
+          "rssi": -67,
+          "name": "GVH5075",
+          "device_type": "Govee Temp Sensor",
+          "metadata": {
+            "manufacturer_data": { "1": "0a01..." },
+            "service_uuids": [],
+            "service_data": {},
+            "tx_power": null
+          }
+        }
+      ],
+      "pi_location": { "latitude": 41.96, "longitude": -88.02, "fix_status": "locked", "location_age_sec": 12 }
     }
   ],
   "queue": {
@@ -276,9 +296,45 @@ map.
    `local_gps` rows into `gps_points` before dropping the table. Option B:
    accept loss of pre-rollout queued rows (the fleet is currently down, so
    the queue is small). Recommend B for simplicity.
-2. **BLE wire shape.** The cloud worker accepts both flat detection objects
-   and `{ sensors: [...] }` blocks. Edge should consistently emit the
-   `sensors[]` form going forward.
+2. **BLE wire shape.** *(Resolved.)* The edge now consistently emits the flat
+   `sensors[]` form: a `ble_sensor_scan` payload carries `vehicle_id`, `pi_id`,
+   `captured_at_utc`, an explicit `idempotency_key`
+   (`vehicle_id:ble_sensor_scan:captured_at_utc:<sha256(sensors)[:12]>`), and a
+   `sensors[]` array where each entry carries its own `metadata`
+   (`manufacturer_data`, `service_uuids`, `service_data`, `tx_power`). See the
+   `ble_scans` example in § 3.4.
 3. **Wake-signal events.** Today they're SQLite-local. Should harsh-event
    wakes also project to the cloud as a distinct event type for safety
    triage? Out of scope for this rebuild but flagged.
+
+## 9. Parked / to reintegrate later
+
+The base-model stack runs only the four active services (`gps-multiplexer`,
+`telematics-edge`, `ble-sensor`, `sync-service`). The items below are
+intentionally parked. Each lists where to restore it from.
+
+1. **Power-board monitoring.** The `power-monitor` service (CN3791 / IP5356 /
+   STM32 power board → `power_readings`) is not in the active compose. With no
+   writer, BLE battery-saver is disabled and `UPS_*`/`POWER_*` variables are
+   unwired. `telematics-edge/db.py::init_db()` still creates an empty
+   `power_readings` table so readers (battery-saver, `get_latest_power_snapshot`)
+   degrade gracefully to full cadence. **Restore pointer:** `docs/EDGE_REBUILD_RECORD.md`
+   (power-board wiring + service definition); re-add `power-monitor` to
+   `docker-compose.yml` and set `BLE_BATTERY_SAVER_ENABLED=true`.
+
+2. **IMU / 10-DOF harsh-event + motion pipeline.** Accel/gyro/mag/baro reads and
+   harsh-event detection live in `telematics-edge/imu_reader.py` and feed parked-mode
+   motion-wake. The thresholds (`HARSH_EVENT_G_THRESHOLD`, `GRAVITY_BASELINE_G`)
+   need per-vehicle calibration before the harsh-event stream is trustworthy for
+   cloud safety triage. **Restore pointer:** run the `imu-calibration` container
+   (see `readme.md` § "IMU Calibration Container") to generate
+   `/data/imu-truth-table.json`, then wire calibrated thresholds before promoting
+   harsh events to a cloud event type.
+
+3. **`EDGE_INGEST_KEY` full cutover.** `sync-service` already sends
+   `X-API-Key: EDGE_INGEST_KEY` with a fallback to `MOTIVE_API_KEY`. Retire
+   `MOTIVE_API_KEY` only after Balena fleet variables and the cloud ingest side
+   are both set to the new name. **Restore pointer:** set `EDGE_INGEST_KEY` in
+   Balena + cloud, confirm traffic authenticates, then remove the
+   `MOTIVE_API_KEY` line from `docker-compose.yml` and the fallback in
+   `sync-service/main.py::_send_events`.

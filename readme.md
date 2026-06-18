@@ -7,11 +7,17 @@ This repository contains the containerized telematics stack for independent GPS,
 The system provides a forward-thinking solution for cold-chain logistics, ensuring data integrity across intermittent Wi-Fi connections and power-conscious operation.
 
 ## Architecture Overview
-The stack is structured into decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization:
+The stack is structured into decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization.
 
-* **`ble-sensor`**: Scans for Govee BLE advertisements. Extracts temperature, humidity, and battery health.
-* **`telematics-edge`**: Reads BerryGPS UART data and BerryIMU metrics via I2C, then syncs unified payloads to the cloud.
-* **`power-monitor`**: Dedicated UPS HAT (B) telemetry service that reads INA219 battery metrics via I2C, persists snapshots locally, and optionally syncs power events upstream.
+**Active services (base-model stack):**
+
+* **`gps-multiplexer`**: Reads raw NMEA from the hardware UART and broadcasts it over TCP (port 2947) so other containers never touch the serial port directly.
+* **`telematics-edge`**: Reads GPS via TCP + BerryIMU metrics via I2C, manages the SQLite WAL store, and builds heartbeat / edge-health payloads.
+* **`ble-sensor`**: Scans for Govee BLE advertisements. Extracts temperature, humidity, and battery health. Runs at full scan cadence (battery-saver disabled — there is no active `power_readings` writer in the base-model stack).
+* **`sync-service`**: Drains the SQLite store-and-forward queues (`gps_points`, `heartbeats`, `edge_health`, `ble_scans`) and POSTs them to the cloud ingest endpoint.
+
+> **Parked (not active in the current base-model compose):**
+> **`power-monitor`** — Dedicated UPS HAT (B) / power-board telemetry service that reads battery metrics via I2C and persists snapshots to `power_readings`. It is removed from the active stack; with it gone, `UPS_*`/`POWER_*` variables are not wired and BLE battery-saver is disabled. `telematics-edge` still creates an empty `power_readings` table for forward compatibility. Restore details: see `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later".
 
 ## Project Structure
 ```text
@@ -68,12 +74,14 @@ Set the following variables in the **Balena Dashboard > Device Configuration** t
 ## Fleet Variables
 Use **Environment Variables** in Balena to manage unique truck settings without code changes:
 
-> Note: UPS / INA219 variables (`UPS_*`, `POWER_*`) are consumed by the `power-monitor` service. `telematics-edge` does not read INA219 directly.
+> Note: UPS / INA219 variables (`UPS_*`, `POWER_*`) are consumed by the **parked** `power-monitor` service and are **not wired in the current base-model stack**. They are retained below for when power-board monitoring is reintegrated (see `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later"). `telematics-edge` does not read INA219 directly.
 
 | Variable | Description | Example |
 | :--- | :--- | :--- |
 | `VEHICLE_ID` | Unique identifier for the truck | `TRK-905` |
 | `WEBHOOK_URL` | Endpoint for Motive Dashboard sync | `https://api.yourdomain.com/telematics` |
+| `EDGE_INGEST_KEY` | Preferred auth key sent as the `X-API-Key` header by `sync-service`. Falls back to `MOTIVE_API_KEY` if unset (transitional). | `eik_...` |
+| `MOTIVE_API_KEY` | Legacy/transitional auth key; used as the `X-API-Key` fallback until the fleet is cut over to `EDGE_INGEST_KEY`. | `mk_...` |
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
 | `UPS_I2C_ADDRESS` | I2C address for UPS INA219 monitor. | `0x43` |

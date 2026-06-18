@@ -8,11 +8,14 @@ See [FSI_ECOSYSTEM.md](./FSI_ECOSYSTEM.md) for the full app portfolio and how th
 
 Smart Trucks is a containerized edge telematics stack deployed on Raspberry Pi hardware (Pi Zero 2 W / Pi 3B) via Balena. It collects GPS, BLE temperature/humidity, and power management data from vehicles and syncs to the shared FSI PostgreSQL database consumed by `kdnye/motive-dashboard`.
 
-Four decoupled services run as Docker containers:
+Four decoupled services are active in the base-model stack:
 - **gps-multiplexer**: Reads GPS from hardware serial and exposes it over TCP (port 2947)
 - **telematics-edge**: Reads GPS via TCP + IMU via I2C; manages SQLite WAL and cloud sync
-- **ble-sensor**: Govee BLE temperature/humidity scanning
-- **power-monitor**: UPS HAT battery SOC monitoring via INA219 I2C
+- **ble-sensor**: Govee BLE temperature/humidity scanning (battery-saver disabled — full scan cadence, since there is no active `power_readings` writer)
+- **sync-service**: Drains the SQLite store-and-forward queues and POSTs to the cloud ingest endpoint
+
+**Parked (not active in the current base-model compose):**
+- **power-monitor**: UPS HAT / power-board battery SOC monitoring via I2C → `power_readings`. Removed from the active stack; see `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later". With it removed, `UPS_*`/`POWER_*` variables are not wired and BLE battery-saver is disabled.
 
 ## 2. Tech Stack
 
@@ -27,7 +30,7 @@ Four decoupled services run as Docker containers:
 
 ### Decoupled Services
 
-- Each container (telematics-edge, ble-sensor, power-monitor) is independent. Do not create cross-container function calls or shared mutable state.
+- Each container (gps-multiplexer, telematics-edge, ble-sensor, sync-service) is independent. Do not create cross-container function calls or shared mutable state.
 - Use Docker Compose environment variable contracts for inter-service configuration.
 - The `gps-multiplexer` container exposes the GPS device over TCP (`tcp://gps-multiplexer:2947`) so `telematics-edge` reads GPS without requiring direct serial access.
 
@@ -42,7 +45,7 @@ Four decoupled services run as Docker containers:
 - **GPS:** Primary device path configured via `GPS_SERIAL_DEVICE` (e.g. `/dev/serial0`); additional probe candidates in `GPS_SERIAL_CANDIDATES`. The `telematics-edge` container connects via `tcp://gps-multiplexer:2947`. Sample interval: `GPS_SAMPLE_INTERVAL_SECONDS` (default 5s). Baud rate: `GPS_BAUD_RATE` (default 9600). Parsed by `NMEAReader`.
 - **IMU (I2C):** Bus number via `IMU_I2C_BUS` (default 1). Expected I2C addresses via `IMU_EXPECTED_ADDRESSES`. Whether IMU must be present to start: `IMU_REQUIRED` (default `true`). Harsh-event thresholds are managed internally by `IMUReader` — there is no external threshold environment variable.
 - **BLE (`ble-sensor`):** Scan duration is `SCAN_DURATION_SECONDS` (default 20s). Interval between scan cycles is `POLL_INTERVAL` (default 60s). MAC anonymization: `ANONYMIZE_MAC` (default `false`).
-- **Power (INA219, `power-monitor`):** UPS configuration uses `UPS_BATTERY_CAPACITY_MAH` (default 4400), `UPS_MAX_EXPECTED_AMPS` (default 4.0), `UPS_GAIN_STRATEGY` (default `auto`), `UPS_BUS_VOLTAGE_RANGE_V` (default 32). These values are hardware-specific — do not change them without re-characterizing the UPS HAT.
+- **Power (parked):** The `power-monitor` service (INA219 / power board → `power_readings`) is **not active** in the current base-model stack, so its `UPS_*`/`POWER_*` variables are not wired. `telematics-edge/db.py::init_db()` still creates an empty `power_readings` table for forward compatibility, and readers fall back to full cadence when it has no rows. Restore details: `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later".
 
 ### Power-Aware Sleep
 
