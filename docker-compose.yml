@@ -38,40 +38,6 @@ services:
       # on motion). Larger = lower overnight draw, slower motion-wake latency.
       - IMU_PARKED_SAMPLE_INTERVAL_SECONDS=${IMU_PARKED_SAMPLE_INTERVAL_SECONDS:-1.0}
 
-  power-monitor:
-    build:
-      context: .
-      dockerfile: power-monitor/Dockerfile
-    privileged: true
-    restart: always
-    devices:
-      - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the UPS HAT
-    volumes:
-      - shared-sqlite:/data
-    cpuset: "3"
-    environment:
-      - UDEV=1
-      - VEHICLE_ID=${VEHICLE_ID}
-      - DB_PATH=/data/telematics.db
-      - TELEMATICS_DB_PATH=/data/telematics.db
-      - UPS_BATTERY_CAPACITY_MAH
-      - UPS_MAX_EXPECTED_AMPS
-      - UPS_GAIN_STRATEGY
-      - UPS_BUS_VOLTAGE_RANGE_V
-      # Power saving: sample fast (POWER_SAMPLE_INTERVAL_SECONDS) only near the
-      # shutdown thresholds or on charging-state changes; otherwise back off to
-      # the idle interval to cut I2C reads and SD-card writes. Brownout safety is
-      # preserved because the fast band covers the approach to the cliff.
-      - POWER_SAMPLE_INTERVAL_SECONDS=${POWER_SAMPLE_INTERVAL_SECONDS:-2}
-      - POWER_SAMPLE_INTERVAL_IDLE_SECONDS=${POWER_SAMPLE_INTERVAL_IDLE_SECONDS:-20}
-      - POWER_FAST_SAMPLE_SOC_MARGIN_PCT=${POWER_FAST_SAMPLE_SOC_MARGIN_PCT:-15}
-      - POWER_FAST_SAMPLE_VOLTAGE_MARGIN_V=${POWER_FAST_SAMPLE_VOLTAGE_MARGIN_V:-0.20}
-      - POWER_MONITOR_MODE=${POWER_MONITOR_MODE:-dummy}
-      - POWER_MONITOR_HARDWARE_REQUIRED=${POWER_MONITOR_HARDWARE_REQUIRED:-false}
-      # Set UPS=no (per-device balena variable) for hardware with no UPS HAT,
-      # e.g. solar/MPPT boards. power-monitor then idles instead of crash-looping.
-      - UPS=${UPS:-yes}
-
   ble-sensor:
     build:
       context: .
@@ -96,10 +62,9 @@ services:
       - POLL_INTERVAL=60
       - TELEMATICS_DB_PATH=/data/telematics.db
       - UPLOAD_BATCH_SIZE=${BLE_UPLOAD_BATCH_SIZE:-25}
-      # Power saving: stretch scan cadence + shorten scans when on battery (full
-      # cadence resumes when charging). Tradeoff: slower BLE key-beacon wake
-      # overnight. Set BLE_BATTERY_SAVER_ENABLED=false to disable.
-      - BLE_BATTERY_SAVER_ENABLED=${BLE_BATTERY_SAVER_ENABLED:-true}
+      # Battery saver disabled: power-monitor is removed in the base-model stack,
+      # so there is no power_readings source. ble-sensor runs at full scan cadence.
+      - BLE_BATTERY_SAVER_ENABLED=${BLE_BATTERY_SAVER_ENABLED:-false}
       - BLE_POLL_INTERVAL_DISCHARGING_SECONDS=${BLE_POLL_INTERVAL_DISCHARGING_SECONDS:-300}
       - BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS=${BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS:-900}
       - BLE_LOW_BATTERY_SOC_PCT=${BLE_LOW_BATTERY_SOC_PCT:-25}

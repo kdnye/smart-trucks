@@ -90,6 +90,7 @@ async def sync_cycle() -> None:
         "heartbeats": await asyncio.to_thread(_load_pending_rows, "heartbeats", SYNC_BATCH_SIZE),
         "gps_points": await asyncio.to_thread(_load_pending_rows, "gps_points", SYNC_BATCH_SIZE),
         "edge_health": await asyncio.to_thread(_load_pending_rows, "edge_health", SYNC_BATCH_SIZE),
+        "ble_scans": await asyncio.to_thread(_load_pending_rows, "ble_scans", SYNC_BATCH_SIZE),
     }
     all_rows: list[tuple[str, int, str, dict[str, Any]]] = []
     for table_name, rows in pending.items():
@@ -104,7 +105,7 @@ async def sync_cycle() -> None:
     events = [row[3] for row in all_rows]
     response = await asyncio.to_thread(_send_events, events)
 
-    ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": []}
+    ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": [], "ble_scans": []}
     for table_name, row_id, _, _ in all_rows:
         ids_by_table[table_name].append(row_id)
 
@@ -113,18 +114,21 @@ async def sync_cycle() -> None:
             asyncio.to_thread(_mark_rows_sent, "heartbeats", ids_by_table["heartbeats"]),
             asyncio.to_thread(_mark_rows_sent, "gps_points", ids_by_table["gps_points"]),
             asyncio.to_thread(_mark_rows_sent, "edge_health", ids_by_table["edge_health"]),
+            asyncio.to_thread(_mark_rows_sent, "ble_scans", ids_by_table["ble_scans"]),
         )
         logger.info(
-            "Synced events batch (heartbeats=%d gps_points=%d edge_health=%d).",
+            "Synced events batch (heartbeats=%d gps_points=%d edge_health=%d ble_scans=%d).",
             len(ids_by_table["heartbeats"]),
             len(ids_by_table["gps_points"]),
             len(ids_by_table["edge_health"]),
+            len(ids_by_table["ble_scans"]),
         )
     elif 400 <= response.status_code < 500:
         await asyncio.gather(
             asyncio.to_thread(_increment_attempts, "heartbeats", ids_by_table["heartbeats"]),
             asyncio.to_thread(_increment_attempts, "gps_points", ids_by_table["gps_points"]),
             asyncio.to_thread(_increment_attempts, "edge_health", ids_by_table["edge_health"]),
+            asyncio.to_thread(_increment_attempts, "ble_scans", ids_by_table["ble_scans"]),
         )
         logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
     else:

@@ -603,6 +603,35 @@ def _init_local_store(db_path: str) -> None:
         )
 
 
+def _init_shared_queue_store(db_path: str) -> None:
+    """Create the store-and-forward queue table for BLE scans in the shared DB.
+
+    ble-sensor enqueues each ``ble_sensor_scan`` payload here so sync-service can
+    upload it alongside heartbeats/gps_points/edge_health. ble-sensor may start
+    before telematics-edge, so it creates the table itself (idempotent).
+    """
+    with _sqlite3.connect(db_path, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ble_scans (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                captured_at_utc TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                sent_at_utc     TEXT,
+                attempt_count   INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ble_scans_pending
+            ON ble_scans(sent_at_utc, captured_at_utc);
+            """
+        )
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -710,6 +739,21 @@ def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
+        )
+
+
+def _enqueue_ble_scan(db_path: str, payload: dict[str, Any]) -> None:
+    """Queue a full ``ble_sensor_scan`` payload for upload by sync-service.
+
+    Writes to the shared telematics DB's ``ble_scans`` table using the same
+    store-and-forward columns the uploader expects (sent_at_utc / attempt_count).
+    """
+    captured_at_utc = str(payload.get("captured_at_utc") or _utc_now_iso())
+    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            "INSERT INTO ble_scans (captured_at_utc, payload_json) VALUES (?, ?)",
+            (captured_at_utc, json.dumps(payload)),
         )
 
 
@@ -1202,6 +1246,7 @@ async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
     _init_local_store(config.local_db_path)
+    _init_shared_queue_store(config.telematics_db_path)
     _sync_tracked_asset_registry(config)
 
     if config.anonymize_mac and not config.mac_hash_salt:
@@ -1285,12 +1330,13 @@ async def run() -> None:
                 raise
 
             _record_scan_observations(config.local_db_path, payload)
+            _enqueue_ble_scan(config.telematics_db_path, payload)
             _sync_tracked_asset_registry(config)
             _resolve_tracked_asset_positions(config)
             print(
-                f"Recorded BLE scan locally (sensor_count={payload['sensor_count']}) "
+                f"Recorded BLE scan (sensor_count={payload['sensor_count']}) "
                 f"for captured_at_utc={payload['captured_at_utc']}; "
-                "local_ble_write=disabled."
+                "queued ble_sensor_scan for upload."
             )
         except Exception as exc:
             print(f"Scan loop error: {exc}")
