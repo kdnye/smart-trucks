@@ -22,6 +22,10 @@ services:
       dockerfile: telematics-edge/Dockerfile
     privileged: true
     restart: always
+    # Wait for gps-multiplexer to be created so its service name is registered
+    # in the bridge-network DNS before we start dialing `tcp://gps-multiplexer:2947`.
+    depends_on:
+      - gps-multiplexer
     labels:
       io.balena.features.dbus: '1'
     devices:

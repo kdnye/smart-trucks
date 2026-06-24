@@ -68,8 +68,11 @@ balena push <fleet-name>
 Set the following variables in the **Balena Dashboard > Device Configuration** to enable hardware interfaces:
 * `RESIN_HOST_CONFIG_dtparam`: `i2c_arm=on,spi=on` (**no quotes**)
 * `RESIN_HOST_CONFIG_enable_uart`: `1`
+* `RESIN_HOST_CONFIG_dtoverlay`: `disable-bt` *(required on Pi Zero 2 W and Pi 3+)*
 
 > ⚠️ Set `RESIN_HOST_CONFIG_dtparam` exactly as `i2c_arm=on,spi=on` **without quotation marks** to avoid I2C bus failures in the `power-monitor` container.
+
+> ⚠️ **Pi Zero 2 W / Pi 3+ UART pitfall:** by default the full-featured PL011 UART (`/dev/ttyAMA0`) is owned by the Bluetooth firmware and `/dev/serial0` is symlinked to the **mini-UART** (`/dev/ttyS0`), whose clock varies with CPU frequency and is unstable for NMEA at 9600 baud. Setting `RESIN_HOST_CONFIG_dtoverlay=disable-bt` reassigns `serial0` to `ttyAMA0`. Without it, the gps-multiplexer either finds no usable device (no `enable_uart=1`) or reads corrupt sentences (`enable_uart=1` only). Both `enable_uart` and `dtoverlay=disable-bt` are required for stable GPS on these boards.
 
 ## Fleet Variables
 Use **Environment Variables** in Balena to manage unique truck settings without code changes:
@@ -173,23 +176,30 @@ The following patterns are expected during supervised updates and should not be 
 
 ### High-signal issues to act on
 
-1. **UART contention or unstable GPS serial stream**
-   * Signature: `Serial read failed: device reports readiness to read but returned no data` in `telematics-edge`.
-   * First checks:
-     * Ensure only one process owns `/dev/serial0`.
-     * Ensure `telematics-edge` has direct `/dev/serial0` mapping (no user-space serial fan-out).
-     * In BalenaCloud Fleet Configuration, add a custom udev rule to hide Pi UART from ModemManager:
+1. **`gps-multiplexer` reports `no usable GPS serial device`**
+   * Signature: `SETUP: no usable GPS serial device. Per-candidate probe: [/dev/serial0=missing, /dev/ttyAMA0=missing, /dev/ttyS0=missing, ...]` in `gps-multiplexer`, often paired with `TCP GPS connection to gps-multiplexer:2947 failed: [Errno -3] Temporary failure in name resolution` in `telematics-edge` (the TCP failure is downstream of the GPS not broadcasting).
+   * Most common cause on **Pi Zero 2 W / Pi 3+**: missing host UART config. Set in Balena Device or Fleet Configuration:
+     * `RESIN_HOST_CONFIG_enable_uart` = `1`
+     * `RESIN_HOST_CONFIG_dtoverlay` = `disable-bt`
+     * Reboot. After the reboot, `/dev/serial0` should point at `/dev/ttyAMA0` (the stable PL011 UART) and the multiplexer will log `GPS serial connected: port=/dev/serial0 baud=9600`.
+   * If the GPS is **USB** instead of GPIO: confirm it shows up on the host as `/dev/ttyACM0` or `/dev/ttyUSB0` (the defaults already include both). For other paths, set `GPS_SERIAL_CANDIDATES` in Balena to a comma-separated list — e.g. `GPS_SERIAL_CANDIDATES=/dev/ttyACM0,/dev/ttyUSB0,/dev/serial0`.
+   * Other useful checks:
+     * Ensure only one process owns `/dev/serial0` (the multiplexer opens it with `TIOCEXCL`).
+     * Verify GPS wiring and power stability — a blinking fix LED + voltage on the TX/RX pins proves the receiver is talking, but if the kernel never created the device the multiplexer can't read it.
+     * In BalenaCloud Fleet Configuration, hide Pi UART from ModemManager so it doesn't grab the port at boot:
        ```json
        {
          "99-ignore-serial": "SUBSYSTEM==\"tty\", KERNEL==\"serial0|ttyAMA0|ttyS0\", ENV{ID_MM_DEVICE_IGNORE}=\"1\""
        }
        ```
-     * Verify GPS wiring and power stability.
-     * Confirm `GPS_SERIAL_DEVICE` and `GPS_SERIAL_CANDIDATES` are set consistently.
+   * Serial candidate discovery is implemented in `gps-multiplexer/main.py::_parse_candidates` and `GPSBroadcaster.run_serial_reader`. The "Per-candidate probe" log lists exactly which paths were tried, which were missing, which weren't character devices, and which threw open errors.
+
+2. **UART contention or corrupt NMEA sentences**
+   * Signature: `Serial read failed: device reports readiness to read but returned no data` in `telematics-edge` or NMEA checksum errors in `gps-multiplexer`.
+   * First check: are you on the mini-UART (`/dev/ttyS0`)? Its clock varies with CPU frequency — on Pi Zero 2 W / Pi 3+ you must set `RESIN_HOST_CONFIG_dtoverlay=disable-bt` so `serial0 → ttyAMA0` (the stable PL011) instead.
    * `gps-multiplexer/start.sh` behavior:
      * Missing serial device (for example `/dev/serial0`) logs a warning and continues.
      * Missing Python app entrypoint (`/usr/src/app/main.py`) exits immediately.
-   * Serial candidate discovery is implemented in `gps-multiplexer/main.py` via `GPS_SERIAL_CANDIDATES`.
 
 2. **Missing optional pyserial dependency in power-monitor probe path**
    * Signature: `pyserial unavailable: No module named 'serial'` inside `power-monitor` hardware inventory output.

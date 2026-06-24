@@ -34,9 +34,16 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = read_int_env("GPS_TCP_PORT", 2947)
 DEFAULT_GPS_PORT = "/dev/serial0"
 DEFAULT_GPS_CANDIDATES = (
+    # Pi GPIO UART (preferred for BerryGPS-IMU and other HAT modules).
+    # On Pi Zero 2 W / Pi 3+ this requires `enable_uart=1` AND `dtoverlay=disable-bt`
+    # in the Balena host config, or `serial0` falls back to the unstable mini-UART.
     "/dev/serial0",
     "/dev/ttyAMA0",
     "/dev/ttyS0",
+    # USB GPS receivers (u-blox, GlobalSat, etc.). Enumerated by the kernel only
+    # when a USB GPS is plugged in; harmless to probe when absent.
+    "/dev/ttyACM0",
+    "/dev/ttyUSB0",
 )
 
 
@@ -120,12 +127,15 @@ class GPSBroadcaster:
 
         while not stop_event.is_set():
             serial_connected = False
+            probe_results: list[str] = []
 
             for port in GPS_PORT_CANDIDATES:
                 port_path = pathlib.Path(port)
                 if not port_path.exists():
+                    probe_results.append(f"{port}=missing")
                     continue
                 if not port_path.is_char_device():
+                    probe_results.append(f"{port}=not-a-char-device")
                     logger.warning("Skipping non-character GPS device candidate: %s", port)
                     continue
 
@@ -143,21 +153,26 @@ class GPSBroadcaster:
                                 self.broadcast_from_thread(line)
                         break
                 except serial.SerialException as exc:
+                    probe_results.append(f"{port}=open-error({exc})")
                     logger.warning("GPS serial error on %s: %s", port, exc)
                 except Exception as exc:  # pylint: disable=broad-except
+                    probe_results.append(f"{port}=unexpected-error({exc})")
                     logger.error("GPS serial unexpected error on %s: %s", port, exc)
 
             if stop_event.is_set():
                 break
             if not serial_connected:
                 logger.warning(
-                    "SETUP: no usable GPS serial device among candidates: %s. "
-                    "Action: confirm the GPS is wired and powered; if it's a USB receiver it "
-                    "enumerates as /dev/ttyACM0 or /dev/ttyUSB0 — add that path to the "
-                    "GPS_SERIAL_CANDIDATES variable (and the container's devices: mapping). "
-                    "If it's a UART HAT, ensure the serial port is enabled on the Pi "
-                    "(/dev/serial0). Heartbeats still upload, but without lat/lon until GPS is found.",
-                    ", ".join(GPS_PORT_CANDIDATES),
+                    "SETUP: no usable GPS serial device. Per-candidate probe: [%s]. "
+                    "If every candidate is `missing`, the Pi kernel has not exposed any "
+                    "serial device — for a GPIO/HAT GPS (BerryGPS-IMU etc.) set both "
+                    "RESIN_HOST_CONFIG_enable_uart=1 AND "
+                    "RESIN_HOST_CONFIG_dtoverlay=disable-bt in Balena Device "
+                    "Configuration and reboot (disable-bt is required on Pi Zero 2 W / "
+                    "Pi 3+ to free /dev/ttyAMA0 from Bluetooth). For a USB GPS, confirm "
+                    "the receiver is plugged in and check `ls /dev/tty*` on the host. "
+                    "Heartbeats still upload, but without lat/lon until GPS is found.",
+                    ", ".join(probe_results) or "no candidates configured",
                 )
 
             logger.warning("Reconnecting in %.1fs.", backoff)
