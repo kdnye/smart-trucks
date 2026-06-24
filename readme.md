@@ -80,8 +80,7 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | :--- | :--- | :--- |
 | `VEHICLE_ID` | Unique identifier for the truck | `TRK-905` |
 | `WEBHOOK_URL` | Endpoint for Motive Dashboard sync | `https://api.yourdomain.com/telematics` |
-| `EDGE_INGEST_KEY` | Preferred auth key sent as the `X-API-Key` header by `sync-service`. Falls back to `MOTIVE_API_KEY` if unset (transitional). | `eik_...` |
-| `MOTIVE_API_KEY` | Legacy/transitional auth key; used as the `X-API-Key` fallback until the fleet is cut over to `EDGE_INGEST_KEY`. | `mk_...` |
+| `EDGE_INGEST_KEY` | Auth key sent as the `X-API-Key` header by `sync-service`; must match the cloud ingest function's `EDGE_INGEST_KEY`. | `eik_...` |
 | `POLL_INTERVAL` | Seconds between cloud syncs | `300` |
 | `TEMP_THRESHOLD` | Critical temp alert trigger (Celsius) | `4.0` |
 | `UPS_I2C_ADDRESS` | I2C address for UPS INA219 monitor. | `0x43` |

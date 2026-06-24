@@ -59,9 +59,7 @@ The outbound payload assembled by `sync-service/main.py::_build_payload`:
 }
 ```
 
-Headers: `X-API-Key: $EDGE_INGEST_KEY` (falls back to `$MOTIVE_API_KEY` when
-`EDGE_INGEST_KEY` is unset — see § "Parked / to reintegrate later" for the full
-cutover plan). Endpoint: `WEBHOOK_URL`.
+Headers: `X-API-Key: $EDGE_INGEST_KEY`. Endpoint: `WEBHOOK_URL`.
 
 ## 2. Why the dashboard saw nothing
 
@@ -331,10 +329,3 @@ intentionally parked. Each lists where to restore it from.
    `/data/imu-truth-table.json`, then wire calibrated thresholds before promoting
    harsh events to a cloud event type.
 
-3. **`EDGE_INGEST_KEY` full cutover.** `sync-service` already sends
-   `X-API-Key: EDGE_INGEST_KEY` with a fallback to `MOTIVE_API_KEY`. Retire
-   `MOTIVE_API_KEY` only after Balena fleet variables and the cloud ingest side
-   are both set to the new name. **Restore pointer:** set `EDGE_INGEST_KEY` in
-   Balena + cloud, confirm traffic authenticates, then remove the
-   `MOTIVE_API_KEY` line from `docker-compose.yml` and the fallback in
-   `sync-service/main.py::_send_events`.

@@ -86,7 +86,7 @@ def _send_events(events: list[dict[str, Any]]) -> requests.Response:
         raise RuntimeError("WEBHOOK_URL is not set.")
 
     headers = {}
-    api_key = os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")
+    api_key = os.environ.get("EDGE_INGEST_KEY")
     if api_key:
         headers["X-API-Key"] = api_key
 
@@ -145,9 +145,9 @@ async def sync_cycle() -> None:
         if response.status_code in (401, 403):
             logger.error(
                 "SETUP: %s from the ingest endpoint — the API key this device sends does "
-                "NOT match the cloud ingest secret. Action: set EDGE_INGEST_KEY (or the "
-                "transitional MOTIVE_API_KEY) for this device in Balena to the same value "
-                "the ingest function expects. WEBHOOK_URL=%s",
+                "NOT match the cloud ingest secret. Action: set EDGE_INGEST_KEY for this "
+                "device in Balena to the same value the ingest function expects. "
+                "WEBHOOK_URL=%s",
                 response.status_code,
                 os.environ.get("WEBHOOK_URL", "<unset>"),
             )
@@ -164,11 +164,10 @@ def _validate_startup_config() -> None:
             "SETUP: WEBHOOK_URL is not set — nothing can be uploaded. "
             "Action: set WEBHOOK_URL (the cloud ingest URL) for this device in Balena."
         )
-    if not (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")):
+    if not os.environ.get("EDGE_INGEST_KEY"):
         logger.error(
-            "SETUP: no ingest key set (EDGE_INGEST_KEY / MOTIVE_API_KEY) — the cloud will "
-            "reject every upload with 401. Action: set EDGE_INGEST_KEY in Balena to the "
-            "cloud ingest secret."
+            "SETUP: EDGE_INGEST_KEY is not set — the cloud will reject every upload with "
+            "401. Action: set EDGE_INGEST_KEY in Balena to the cloud ingest secret."
         )
     if (os.environ.get("VEHICLE_ID") or "").strip() in ("", "UNKNOWN_TRUCK"):
         logger.warning(
@@ -185,7 +184,7 @@ async def run() -> None:
         DB_PATH,
         SYNC_BATCH_SIZE,
         "set" if os.environ.get("WEBHOOK_URL") else "UNSET",
-        "set" if (os.environ.get("EDGE_INGEST_KEY") or os.environ.get("MOTIVE_API_KEY")) else "UNSET",
+        "set" if os.environ.get("EDGE_INGEST_KEY") else "UNSET",
     )
     while True:
         try:
