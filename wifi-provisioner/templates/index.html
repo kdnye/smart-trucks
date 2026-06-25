@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Truck WiFi setup — {{VEHICLE_ID}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 28rem;
+         margin: 1rem auto; padding: 0 1rem; line-height: 1.4; }
+  h1 { font-size: 1.2rem; margin-bottom: 0.25rem; }
+  p.sub { color: #666; margin-top: 0; }
+  fieldset { border: 1px solid #ccc; border-radius: 6px; margin: 1rem 0;
+             padding: 0.75rem 1rem; }
+  legend { padding: 0 0.5rem; font-weight: 600; }
+  label { display: block; margin: 0.5rem 0 0.2rem; font-size: 0.9rem; }
+  input, select, button { font-size: 1rem; padding: 0.45rem 0.6rem;
+                          border-radius: 5px; border: 1px solid #888;
+                          box-sizing: border-box; width: 100%; }
+  button { background: #1e6fd9; color: white; border: none; cursor: pointer;
+           margin-top: 0.75rem; }
+  button:hover { background: #1858b0; }
+  ul { list-style: none; padding: 0; }
+  li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+       padding: 0.4rem 0; border-bottom: 1px solid #eee; }
+  li .ssid { flex: 1; font-weight: 600; }
+  li .prio { color: #666; font-size: 0.85rem; }
+  li form.inline { display: flex; gap: 0.4rem; width: 100%; }
+  li form.inline input { width: 6rem; }
+  li form.inline button { width: auto; margin-top: 0; background: #b03030; }
+  li.empty { color: #888; font-style: italic; }
+  .banner { padding: 0.6rem 0.8rem; border-radius: 5px; margin: 1rem 0; }
+  .banner.ok { background: #d6f0d6; color: #16531a; }
+  .banner.err { background: #f7d6d6; color: #6b1a1a; }
+  .hint { font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+  <h1>Smart Truck WiFi setup</h1>
+  <p class="sub">Vehicle <strong>{{VEHICLE_ID}}</strong></p>
+  {{BANNER}}
+
+  <fieldset>
+    <legend>Add a network</legend>
+    <form method="post" action="/api/networks">
+      <label for="ssid-select">Nearby networks</label>
+      <select id="ssid-select" onchange="document.getElementById('ssid').value = this.value">
+        <option value="">— pick one or type below —</option>
+        {{SCAN_OPTIONS}}
+      </select>
+
+      <label for="ssid">SSID</label>
+      <input id="ssid" name="ssid" required autocomplete="off">
+
+      <label for="psk">Password (leave blank for open networks)</label>
+      <input id="psk" name="psk" type="password" autocomplete="new-password">
+
+      <label for="priority">Priority (higher wins if multiple are in range)</label>
+      <input id="priority" name="priority" type="number" value="10" min="0" max="999">
+
+      <label for="pin">Setup PIN</label>
+      <input id="pin" name="pin" type="password" required>
+      <p class="hint">The PIN is logged at boot (visible in Balena device logs).</p>
+
+      <button type="submit">Save network</button>
+    </form>
+  </fieldset>
+
+  <fieldset>
+    <legend>Saved networks</legend>
+    <ul>{{KNOWN_ROWS}}</ul>
+    <p class="hint">After saving, this hotspot will drop in roughly 30–60 seconds while the truck tries to rejoin one of its saved networks.</p>
+  </fieldset>
+</body>
+</html>

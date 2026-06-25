@@ -97,3 +97,46 @@ Use this runbook to validate low-battery debounce behavior and confirm shutdown 
    * Interpretation guidance:
      * `throttled=0x0`: no undervoltage or throttling flags were observed.
      * Non-zero bitmasks indicate power quality issues (for example, undervoltage now or historically). Investigate battery, wiring, and regulator margins if these bits are set after the test.
+
+## Phase 6: Field WiFi Recovery (captive-portal hotspot)
+The `wifi-provisioner` container handles the case where a deployed truck loses
+its known WiFi (router replaced, PSK rotated, truck moved to a new yard) and
+nobody can `balena ssh` because the device has no internet.
+
+Behavior:
+1. The container probes connectivity every `WIFI_PROVISIONER_CHECK_INTERVAL_SECONDS`
+   (default 30s).
+2. After `WIFI_PROVISIONER_GRACE_SECONDS` (default 180s ≈ 3 minutes) of
+   continuous failure, it brings up a hotspot via NetworkManager:
+   - SSID: `WIFI_PROVISIONER_SETUP_SSID` (default `smart-truck-setup-<vehicle_id>`)
+   - Password: `WIFI_PROVISIONER_SETUP_PSK` (blank → open AP)
+   - Device IP on the AP: `10.42.0.1`
+3. Joining the SSID on a phone should pop the OS captive-portal sheet. Any URL
+   redirects to the setup page at `http://10.42.0.1/`.
+4. The page requires a PIN before any change is accepted. The PIN comes from
+   `WIFI_PROVISIONER_SETUP_PIN`, or is derived from `VEHICLE_ID` and printed in
+   the container's boot logs as:
+   ```
+   wifi-provisioner Setup hotspot SSID=... PIN=######
+   ```
+5. From the page you can add a new SSID/PSK, set a priority, or forget an
+   existing saved network. Saved entries are normal `nmcli` profiles
+   (`connection.autoconnect=yes`), so the device keeps a full list — not just
+   the most recent network — and NetworkManager picks the strongest reachable
+   one on boot.
+6. Every `WIFI_PROVISIONER_HOTSPOT_RETRY_INTERVAL_SECONDS` (default 120s) the
+   container drops the hotspot for `WIFI_PROVISIONER_HOTSPOT_RETRY_PROBE_SECONDS`
+   (default 45s) so NetworkManager can attempt the saved profiles. If
+   connectivity returns, the hotspot stays down; otherwise it re-raises and
+   waits for human action.
+
+Operator notes:
+- Set `WIFI_PROVISIONER_SETUP_PIN` at the fleet level so techs in the field
+  use a memorable shared secret instead of the hash-derived per-device PIN.
+- Set `WIFI_PROVISIONER_SETUP_PSK` to a fleet-wide WPA2 password if your
+  trucks ever park somewhere a passer-by could see the open SSID.
+- To pre-load several known networks before deployment, `balena ssh` into the
+  device and run `nmcli c add type wifi con-name "<ssid>" ifname wlan0 ssid
+  "<ssid>" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "<psk>"
+  connection.autoconnect yes connection.autoconnect-priority <n>` for each
+  network. The provisioner will see them on its next supervisor cycle.

@@ -132,6 +132,30 @@ services:
     environment:
       - SERVICE_NAME=smart-trucks
 
+  wifi-provisioner:
+    build:
+      context: .
+      dockerfile: wifi-provisioner/Dockerfile
+    # host networking is required so the container can bind :80 on the AP
+    # interface NM brings up, and reach the host dbus that NetworkManager owns.
+    network_mode: host
+    privileged: true
+    restart: always
+    labels:
+      io.balena.features.dbus: '1'
+      io.balena.features.supervisor-api: '1'
+    volumes:
+      - shared-sqlite:/data
+    environment:
+      - VEHICLE_ID=${VEHICLE_ID}
+      - WIFI_PROVISIONER_SETUP_SSID=${WIFI_PROVISIONER_SETUP_SSID:-}
+      - WIFI_PROVISIONER_SETUP_PSK=${WIFI_PROVISIONER_SETUP_PSK:-}
+      - WIFI_PROVISIONER_SETUP_PIN=${WIFI_PROVISIONER_SETUP_PIN:-}
+      - WIFI_PROVISIONER_GRACE_SECONDS=${WIFI_PROVISIONER_GRACE_SECONDS:-180}
+      - WIFI_PROVISIONER_CHECK_INTERVAL_SECONDS=${WIFI_PROVISIONER_CHECK_INTERVAL_SECONDS:-30}
+      - WIFI_PROVISIONER_HOTSPOT_RETRY_INTERVAL_SECONDS=${WIFI_PROVISIONER_HOTSPOT_RETRY_INTERVAL_SECONDS:-120}
+      - WIFI_PROVISIONER_HOTSPOT_RETRY_PROBE_SECONDS=${WIFI_PROVISIONER_HOTSPOT_RETRY_PROBE_SECONDS:-45}
+
 volumes:
   shared-sqlite:
   telematics_data:
