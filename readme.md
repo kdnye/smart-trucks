@@ -101,6 +101,13 @@ Use **Environment Variables** in Balena to manage unique truck settings without 
 | `IMU_I2C_BUS` | I2C bus used for IMU probing and telematics IMU reads. | `1` |
 | `IMU_EXPECTED_ADDRESSES` | Comma-separated IMU address candidates (hex) expected on `IMU_I2C_BUS`. | `0x6A` |
 | `IMU_REQUIRED` | Fail fast when no IMU is detected at startup (`true`/`false`). | `true` |
+| `WIFI_PROVISIONER_SETUP_SSID` | SSID of the captive-portal hotspot raised by `wifi-provisioner` when no saved network is reachable. Defaults to `smart-truck-setup-<vehicle_id>`. | `smart-truck-setup-trk-905` |
+| `WIFI_PROVISIONER_SETUP_PSK` | Optional WPA2 password for the setup hotspot. Leave blank for an open AP (recommended only in physically controlled yards). | `""` |
+| `WIFI_PROVISIONER_SETUP_PIN` | PIN required by the captive portal before it will save or delete a saved network. If unset, derived from `VEHICLE_ID` and logged on boot. | `137204` |
+| `WIFI_PROVISIONER_GRACE_SECONDS` | How long the truck stays offline before raising the setup hotspot. | `180` |
+| `WIFI_PROVISIONER_CHECK_INTERVAL_SECONDS` | Connectivity probe cadence (seconds). | `30` |
+| `WIFI_PROVISIONER_HOTSPOT_RETRY_INTERVAL_SECONDS` | While the hotspot is up, how often to drop it and let NetworkManager try saved profiles. | `120` |
+| `WIFI_PROVISIONER_HOTSPOT_RETRY_PROBE_SECONDS` | After a retry drop, how long to wait for a client connection before re-raising the hotspot. | `45` |
 
 > ⚠️ `UPS_SHUNT_OHMS` must match your UPS HAT hardware. A `0.1` vs `0.01` mismatch causes approximately **10x error** in INA219 current/power telemetry.
 
@@ -127,6 +134,27 @@ The `ble-sensor` container can run in a privacy-preserving mode by default:
 `ble-sensor` now stores each scan result (including `sensor_count=0` windows) to local SQLite before upload attempts. This preserves both inventory presence and absence history so dashboards can backfill accurately after a connectivity outage.
 
 > ⚠️ Legal/Privacy note: only collect BLE broadcasts where you have explicit permission and a lawful basis to process device identifiers.
+
+## Recovering a truck whose WiFi changed
+If a truck loses its known WiFi (new router, rotated PSK, swapped yard), the
+`wifi-provisioner` service raises a captive-portal hotspot after
+`WIFI_PROVISIONER_GRACE_SECONDS` (default 3 minutes) of being offline:
+
+1. On a phone, join the SSID `smart-truck-setup-<vehicle_id>` (or whatever you
+   set `WIFI_PROVISIONER_SETUP_SSID` to). With `WIFI_PROVISIONER_SETUP_PSK`
+   blank the AP is open; otherwise enter the PSK you configured.
+2. The phone's captive-portal sheet should pop open automatically. If it does
+   not, browse to `http://10.42.0.1/`.
+3. Enter the new SSID + password and the setup PIN. The PIN is logged on boot
+   (look for `Setup hotspot SSID=... PIN=...` in Balena device logs) or set
+   explicitly via `WIFI_PROVISIONER_SETUP_PIN`.
+4. After saving, the hotspot drops in ~30–60 seconds and the truck rejoins
+   using the new (or previously saved) network. Saved profiles persist across
+   reboots; NetworkManager picks the highest-priority one that is in range.
+
+The captive portal also lets you forget saved networks. All known networks are
+stored as NetworkManager connection profiles, not in an app-managed list — you
+can also add/remove them from Balena's `balena ssh` shell using `nmcli c`.
 
 ## Power Optimization (Battery / Solar)
 For solar/battery deployments, the services throttle their highest-cost work
