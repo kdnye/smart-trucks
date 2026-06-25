@@ -163,7 +163,7 @@ def test_supervisor_waits_grace_before_starting_hotspot(monkeypatch):
 
         monkeypatch.setattr(wp_main, "_start_hotspot", fake_start)
         monkeypatch.setattr(wp_main, "_async_is_network_connected", _always(False))
-        monkeypatch.setattr(wp_main, "_has_saved_client_profile", lambda: True)
+        monkeypatch.setattr(wp_main, "_has_saved_client_profile", _always(True))
 
         state = wp_main.State(last_up_monotonic=_now())
         with pytest.raises(asyncio.CancelledError):
@@ -186,7 +186,7 @@ def test_supervisor_skips_hotspot_when_online(monkeypatch):
 
         monkeypatch.setattr(wp_main, "_start_hotspot", fake_start)
         monkeypatch.setattr(wp_main, "_async_is_network_connected", _always(True))
-        monkeypatch.setattr(wp_main, "_has_saved_client_profile", lambda: True)
+        monkeypatch.setattr(wp_main, "_has_saved_client_profile", _always(True))
 
         state = wp_main.State(last_up_monotonic=_now())
         task = asyncio.create_task(wp_main.supervisor(cfg, state))
@@ -239,6 +239,33 @@ async def test_portal_add_accepts_good_pin_and_wakes_supervisor(monkeypatch, aio
     )
     assert resp.status == 200
     assert state.rejoin_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_portal_add_rejects_short_psk(monkeypatch, aiohttp_client):
+    cfg = _make_config(setup_pin="333333", dry_run=True)
+    state = wp_main.State(last_up_monotonic=_now())
+    monkeypatch.setattr(nm, "list_known_networks", lambda: [])
+    monkeypatch.setattr(nm, "scan_visible_networks", lambda: [])
+
+    app = wp_main.build_portal_app(cfg, state)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/api/networks",
+        data={"ssid": "yard-2", "psk": "short", "pin": "333333"},
+    )
+    assert resp.status == 400
+    assert state.rejoin_event.is_set() is False
+
+
+def test_start_hotspot_clears_stale_rejoin_event():
+    cfg = _make_config(dry_run=True)
+    state = wp_main.State(last_up_monotonic=_now())
+    state.rejoin_event.set()
+    asyncio.run(wp_main._start_hotspot(cfg, state))
+    assert state.rejoin_event.is_set() is False
+    assert state.hotspot_active is True
 
 
 @pytest.mark.asyncio

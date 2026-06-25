@@ -66,21 +66,6 @@ def _run(args: list[str], *, timeout: int = NMCLI_TIMEOUT_SECONDS) -> subprocess
     return result
 
 
-def _unescape(field: str) -> str:
-    # nmcli -t escapes ':' as '\:' and backslash as '\\'. Reverse it.
-    out = []
-    i = 0
-    while i < len(field):
-        ch = field[i]
-        if ch == "\\" and i + 1 < len(field):
-            out.append(field[i + 1])
-            i += 2
-        else:
-            out.append(ch)
-            i += 1
-    return "".join(out)
-
-
 def _split_terse(line: str) -> list[str]:
     fields: list[str] = []
     buf: list[str] = []

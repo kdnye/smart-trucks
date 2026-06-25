@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
+import hmac
 import logging
 import os
 import socket
@@ -173,7 +173,7 @@ async def supervisor(config: Config, state: State) -> None:
             continue
 
         if not state.hotspot_active:
-            if not _has_saved_client_profile():
+            if not await _has_saved_client_profile():
                 # No saved profile means the device was never provisioned. Still raise
                 # the hotspot so a tech can add the first one.
                 logger.info("No saved client WiFi — raising setup hotspot for first-time provisioning.")
@@ -219,15 +219,19 @@ async def _sleep_or_wake(seconds: int, state: State) -> bool:
     return True
 
 
-def _has_saved_client_profile() -> bool:
+async def _has_saved_client_profile() -> bool:
     try:
-        return len(nm.list_known_networks()) > 0
+        networks = await asyncio.to_thread(nm.list_known_networks)
     except nm.NmcliError as exc:
         logger.warning("Could not list saved networks: %s", exc)
         return False
+    return len(networks) > 0
 
 
 async def _start_hotspot(config: Config, state: State) -> None:
+    # Clear any portal-triggered wake event so the next _sleep_or_wake doesn't
+    # immediately drop the freshly-raised hotspot.
+    state.rejoin_event.clear()
     if config.dry_run:
         logger.info("[dry-run] would start hotspot %s", config.setup_ssid)
         state.hotspot_active = True
@@ -256,16 +260,22 @@ async def _stop_hotspot(state: State) -> None:
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "index.html"
 
+try:
+    PORTAL_TEMPLATE = TEMPLATE_PATH.read_text(encoding="utf-8")
+except OSError as exc:
+    logger.error("Failed to load portal template at %s: %s", TEMPLATE_PATH, exc)
+    PORTAL_TEMPLATE = ""
+
 
 async def _render_portal(config: Config, state: State, *, message: str | None = None, error: str | None = None) -> str:
-    template = TEMPLATE_PATH.read_text(encoding="utf-8")
+    template = PORTAL_TEMPLATE
     try:
-        known = nm.list_known_networks()
+        known = await asyncio.to_thread(nm.list_known_networks)
     except nm.NmcliError as exc:
         logger.warning("list_known_networks failed: %s", exc)
         known = []
     try:
-        scan = nm.scan_visible_networks()
+        scan = await asyncio.to_thread(nm.scan_visible_networks)
     except nm.NmcliError as exc:
         logger.warning("scan failed: %s", exc)
         scan = []
@@ -323,15 +333,7 @@ async def _captive_redirect(request: web.Request) -> web.Response:
 def _check_pin(config: Config, supplied: str | None) -> bool:
     if not supplied:
         return False
-    # Constant-time compare to avoid timing leaks on a low-entropy PIN.
-    a = supplied.encode("utf-8")
-    b = config.setup_pin.encode("utf-8")
-    if len(a) != len(b):
-        return False
-    result = 0
-    for x, y in zip(a, b):
-        result |= x ^ y
-    return result == 0
+    return hmac.compare_digest(supplied.encode("utf-8"), config.setup_pin.encode("utf-8"))
 
 
 def build_portal_app(config: Config, state: State) -> web.Application:
@@ -359,6 +361,11 @@ def build_portal_app(config: Config, state: State) -> web.Application:
             return web.Response(text=body, content_type="text/html", status=401)
         if not ssid:
             body = await _render_portal(config, state, error="SSID is required.")
+            return web.Response(text=body, content_type="text/html", status=400)
+        if psk is not None and not (8 <= len(psk) <= 63):
+            body = await _render_portal(
+                config, state, error="WPA password must be 8 to 63 characters."
+            )
             return web.Response(text=body, content_type="text/html", status=400)
 
         if config.dry_run:
@@ -446,6 +453,7 @@ async def run() -> None:
         logger.info("Captive portal listening on :%s", config.portal_port)
     except OSError as exc:
         logger.error("Failed to bind portal on :%s — %s", config.portal_port, exc)
+        raise
 
     await supervisor(config, state)
 
