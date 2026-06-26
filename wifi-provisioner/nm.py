@@ -190,10 +190,68 @@ def add_network(ssid: str, psk: str | None, *, priority: int = 0) -> None:
         "yes",
         "connection.autoconnect-priority",
         str(priority),
+        # 0 = infinite. NM's default is 4: after the truck drives out of range
+        # and burns 4 retries, NM permanently blocks the profile from
+        # auto-activating until a reboot — so it never reconnects when the same
+        # SSID reappears at a different truck/warehouse AP. Infinite keeps it
+        # trying so roaming across same-SSID access points just works.
+        "connection.autoconnect-retries",
+        "0",
     ]
     if psk:
         args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
     _run(args)
+
+
+def set_autoconnect_retries_infinite() -> None:
+    """Set connection.autoconnect-retries=0 on every saved client profile.
+
+    New profiles get this in add_network; this migrates profiles saved before
+    the setting existed so already-deployed trucks stop permanently blocking a
+    network after a few out-of-range failures.
+    """
+    try:
+        networks = list_known_networks()
+    except NmcliError as exc:
+        logger.warning("Could not list networks to normalise retries: %s", exc)
+        return
+    for net in networks:
+        try:
+            _run([
+                "connection", "modify", net.name,
+                "connection.autoconnect-retries", "0",
+            ])
+        except NmcliError as exc:
+            logger.debug("Could not set retries on %s: %s", net.name, exc)
+
+
+def reconnect_saved_networks() -> bool:
+    """Rescan, then bring up the strongest-priority saved profile whose SSID is
+    visible right now. Returns True if one activated.
+
+    Forces a reassociation to a known SSID after the device roams to a
+    different AP, instead of waiting on NM's autoconnect (which may be in a
+    backoff or — on older profiles — permanently blocked). Never raises: an
+    out-of-range or otherwise unbringable profile is skipped.
+    """
+    visible = {s.ssid for s in scan_visible_networks()}  # scan_visible_networks rescans
+    if not visible:
+        return False
+    try:
+        known = list_known_networks()
+    except NmcliError as exc:
+        logger.warning("reconnect: could not list saved networks: %s", exc)
+        return False
+    for net in sorted(known, key=lambda n: n.priority, reverse=True):
+        if net.ssid not in visible:
+            continue
+        try:
+            _run(["connection", "up", net.name])
+            logger.info("reconnect: brought up saved network %s", net.name)
+            return True
+        except NmcliError as exc:
+            logger.debug("reconnect: %s visible but up failed: %s", net.name, exc)
+    return False
 
 
 def delete_network(name: str) -> None:
