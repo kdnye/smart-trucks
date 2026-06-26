@@ -186,12 +186,22 @@ async def supervisor(config: Config, state: State) -> None:
                     "WiFi offline for %ds — trying saved networks before hotspot.",
                     int(offline_for),
                 )
-                if await asyncio.to_thread(nm.reconnect_saved_networks) and \
-                        await _async_is_network_connected():
-                    logger.info("Reconnected to a saved network — hotspot not needed.")
-                    state.last_up_monotonic = time.monotonic()
-                    await _sleep_or_wake(config.check_interval_seconds, state)
-                    continue
+                if await asyncio.to_thread(nm.reconnect_saved_networks):
+                    # nmcli returned that the profile activated, but DHCP and
+                    # routing can take a few seconds to settle. Poll briefly
+                    # instead of declaring failure on the first probe — otherwise
+                    # we'd tear down a perfectly good link and raise the hotspot.
+                    reconnected = False
+                    for _ in range(5):
+                        if await _async_is_network_connected():
+                            reconnected = True
+                            break
+                        await asyncio.sleep(1)
+                    if reconnected:
+                        logger.info("Reconnected to a saved network — hotspot not needed.")
+                        state.last_up_monotonic = time.monotonic()
+                        await _sleep_or_wake(config.check_interval_seconds, state)
+                        continue
                 logger.warning(
                     "Saved networks unreachable — raising setup hotspot %s.",
                     config.setup_ssid,

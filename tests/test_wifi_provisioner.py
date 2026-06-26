@@ -116,9 +116,10 @@ def test_add_network_sets_infinite_autoconnect_retries(monkeypatch):
     assert add_args[retries_idx + 1] == "0"
 
 
-def test_set_autoconnect_retries_infinite_modifies_each_profile(monkeypatch):
-    """Migration helper must run `connection modify ... autoconnect-retries 0`
-    once per saved client profile (skipping the hotspot/ethernet)."""
+def test_set_autoconnect_retries_infinite_skips_already_migrated(monkeypatch):
+    """Migration helper modifies only profiles whose autoconnect-retries isn't
+    already 0 — re-applying the same value every boot would needlessly wear the
+    Pi's SD card."""
     monkeypatch.setattr(
         nm,
         "list_known_networks",
@@ -128,16 +129,22 @@ def test_set_autoconnect_retries_infinite_modifies_each_profile(monkeypatch):
         ],
     )
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        nm,
-        "_run",
-        lambda args, **_kw: calls.append(list(args)) or type("R", (), {"stdout": ""})(),
-    )
+
+    def fake_run(args, **_kw):
+        calls.append(list(args))
+        # Per-profile detail read of the current retries value.
+        if args[:2] == ["-t", "-f"] and args[-3:-1] == ["connection", "show"]:
+            name = args[-1]
+            value = "0" if name == "yard" else "4"  # yard already migrated
+            return type("R", (), {"stdout": f"connection.autoconnect-retries:{value}\n"})()
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(nm, "_run", fake_run)
     nm.set_autoconnect_retries_infinite()
     modified = [c for c in calls if c[:2] == ["connection", "modify"]]
-    assert {c[2] for c in modified} == {"home", "yard"}
-    for c in modified:
-        assert c[-2:] == ["connection.autoconnect-retries", "0"]
+    # Only 'home' needed migrating; 'yard' was already 0 and was skipped.
+    assert {c[2] for c in modified} == {"home"}
+    assert modified[0][-2:] == ["connection.autoconnect-retries", "0"]
 
 
 def test_set_autoconnect_retries_infinite_swallows_list_error(monkeypatch):

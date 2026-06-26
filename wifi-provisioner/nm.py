@@ -203,12 +203,39 @@ def add_network(ssid: str, psk: str | None, *, priority: int = 0) -> None:
     _run(args)
 
 
+def _autoconnect_retries(name: str) -> str | None:
+    """Read the stored connection.autoconnect-retries for a single profile.
+
+    Uses `connection show <name>` (the detail view) because the dotted property
+    name is only addressable there — the multi-connection list view doesn't
+    accept it as a field. Returns the value as a string, or None if it can't be
+    read (caller then errs toward writing the setting).
+    """
+    try:
+        result = _run([
+            "-t", "-f", "connection.autoconnect-retries",
+            "connection", "show", name,
+        ])
+    except NmcliError as exc:
+        logger.debug("Could not read retries on %s: %s", name, exc)
+        return None
+    line = result.stdout.strip()
+    if not line:
+        return None
+    parts = _split_terse(line)  # "connection.autoconnect-retries:0" -> [field, value]
+    return parts[-1] if parts else None
+
+
 def set_autoconnect_retries_infinite() -> None:
     """Set connection.autoconnect-retries=0 on every saved client profile.
 
     New profiles get this in add_network; this migrates profiles saved before
     the setting existed so already-deployed trucks stop permanently blocking a
     network after a few out-of-range failures.
+
+    Profiles already at 0 are skipped — `nmcli connection modify` rewrites the
+    profile file every time, so re-applying the same value on every boot would
+    needlessly wear the Pi's SD card.
     """
     try:
         networks = list_known_networks()
@@ -216,6 +243,8 @@ def set_autoconnect_retries_infinite() -> None:
         logger.warning("Could not list networks to normalise retries: %s", exc)
         return
     for net in networks:
+        if _autoconnect_retries(net.name) == "0":
+            continue
         try:
             _run([
                 "connection", "modify", net.name,
@@ -243,6 +272,10 @@ def reconnect_saved_networks() -> bool:
         logger.warning("reconnect: could not list saved networks: %s", exc)
         return False
     for net in sorted(known, key=lambda n: n.priority, reverse=True):
+        if not net.autoconnect:
+            # An operator explicitly disabled autoconnect on this profile —
+            # don't force it up behind their back during background recovery.
+            continue
         if net.ssid not in visible:
             continue
         try:
