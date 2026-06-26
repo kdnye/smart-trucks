@@ -190,10 +190,101 @@ def add_network(ssid: str, psk: str | None, *, priority: int = 0) -> None:
         "yes",
         "connection.autoconnect-priority",
         str(priority),
+        # 0 = infinite. NM's default is 4: after the truck drives out of range
+        # and burns 4 retries, NM permanently blocks the profile from
+        # auto-activating until a reboot — so it never reconnects when the same
+        # SSID reappears at a different truck/warehouse AP. Infinite keeps it
+        # trying so roaming across same-SSID access points just works.
+        "connection.autoconnect-retries",
+        "0",
     ]
     if psk:
         args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk]
     _run(args)
+
+
+def _autoconnect_retries(name: str) -> str | None:
+    """Read the stored connection.autoconnect-retries for a single profile.
+
+    Uses `connection show <name>` (the detail view) because the dotted property
+    name is only addressable there — the multi-connection list view doesn't
+    accept it as a field. Returns the value as a string, or None if it can't be
+    read (caller then errs toward writing the setting).
+    """
+    try:
+        result = _run([
+            "-t", "-f", "connection.autoconnect-retries",
+            "connection", "show", name,
+        ])
+    except NmcliError as exc:
+        logger.debug("Could not read retries on %s: %s", name, exc)
+        return None
+    line = result.stdout.strip()
+    if not line:
+        return None
+    parts = _split_terse(line)  # "connection.autoconnect-retries:0" -> [field, value]
+    return parts[-1] if parts else None
+
+
+def set_autoconnect_retries_infinite() -> None:
+    """Set connection.autoconnect-retries=0 on every saved client profile.
+
+    New profiles get this in add_network; this migrates profiles saved before
+    the setting existed so already-deployed trucks stop permanently blocking a
+    network after a few out-of-range failures.
+
+    Profiles already at 0 are skipped — `nmcli connection modify` rewrites the
+    profile file every time, so re-applying the same value on every boot would
+    needlessly wear the Pi's SD card.
+    """
+    try:
+        networks = list_known_networks()
+    except NmcliError as exc:
+        logger.warning("Could not list networks to normalise retries: %s", exc)
+        return
+    for net in networks:
+        if _autoconnect_retries(net.name) == "0":
+            continue
+        try:
+            _run([
+                "connection", "modify", net.name,
+                "connection.autoconnect-retries", "0",
+            ])
+        except NmcliError as exc:
+            logger.debug("Could not set retries on %s: %s", net.name, exc)
+
+
+def reconnect_saved_networks() -> bool:
+    """Rescan, then bring up the strongest-priority saved profile whose SSID is
+    visible right now. Returns True if one activated.
+
+    Forces a reassociation to a known SSID after the device roams to a
+    different AP, instead of waiting on NM's autoconnect (which may be in a
+    backoff or — on older profiles — permanently blocked). Never raises: an
+    out-of-range or otherwise unbringable profile is skipped.
+    """
+    visible = {s.ssid for s in scan_visible_networks()}  # scan_visible_networks rescans
+    if not visible:
+        return False
+    try:
+        known = list_known_networks()
+    except NmcliError as exc:
+        logger.warning("reconnect: could not list saved networks: %s", exc)
+        return False
+    for net in sorted(known, key=lambda n: n.priority, reverse=True):
+        if not net.autoconnect:
+            # An operator explicitly disabled autoconnect on this profile —
+            # don't force it up behind their back during background recovery.
+            continue
+        if net.ssid not in visible:
+            continue
+        try:
+            _run(["connection", "up", net.name])
+            logger.info("reconnect: brought up saved network %s", net.name)
+            return True
+        except NmcliError as exc:
+            logger.debug("reconnect: %s visible but up failed: %s", net.name, exc)
+    return False
 
 
 def delete_network(name: str) -> None:

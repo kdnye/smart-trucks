@@ -101,6 +101,140 @@ def test_add_network_omits_psk_for_open(monkeypatch):
     assert "wifi-sec.psk" not in add_args
 
 
+def test_add_network_sets_infinite_autoconnect_retries(monkeypatch):
+    """New profiles must carry autoconnect-retries=0 so NM never permanently
+    blocks the SSID after the truck drives out of range a few times."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        nm,
+        "_run",
+        lambda args, **_kw: calls.append(list(args)) or type("R", (), {"stdout": ""})(),
+    )
+    nm.add_network("yard-back", "hunter22", priority=15)
+    add_args = calls[-1]
+    retries_idx = add_args.index("connection.autoconnect-retries")
+    assert add_args[retries_idx + 1] == "0"
+
+
+def test_set_autoconnect_retries_infinite_skips_already_migrated(monkeypatch):
+    """Migration helper modifies only profiles whose autoconnect-retries isn't
+    already 0 — re-applying the same value every boot would needlessly wear the
+    Pi's SD card."""
+    monkeypatch.setattr(
+        nm,
+        "list_known_networks",
+        lambda: [
+            nm.KnownNetwork(name="home", ssid="home", autoconnect=True, priority=10),
+            nm.KnownNetwork(name="yard", ssid="yard", autoconnect=True, priority=3),
+        ],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kw):
+        calls.append(list(args))
+        # Per-profile detail read of the current retries value.
+        if args[:2] == ["-t", "-f"] and args[-3:-1] == ["connection", "show"]:
+            name = args[-1]
+            value = "0" if name == "yard" else "4"  # yard already migrated
+            return type("R", (), {"stdout": f"connection.autoconnect-retries:{value}\n"})()
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(nm, "_run", fake_run)
+    nm.set_autoconnect_retries_infinite()
+    modified = [c for c in calls if c[:2] == ["connection", "modify"]]
+    # Only 'home' needed migrating; 'yard' was already 0 and was skipped.
+    assert {c[2] for c in modified} == {"home"}
+    assert modified[0][-2:] == ["connection.autoconnect-retries", "0"]
+
+
+def test_set_autoconnect_retries_infinite_swallows_list_error(monkeypatch):
+    """A failure to enumerate networks must not raise — it's a best-effort
+    startup migration."""
+    def boom():
+        raise nm.NmcliError("nope")
+
+    monkeypatch.setattr(nm, "list_known_networks", boom)
+    # Should simply return without touching _run.
+    nm.set_autoconnect_retries_infinite()
+
+
+def test_reconnect_saved_networks_brings_up_strongest_visible(monkeypatch):
+    """Of the saved profiles whose SSID is visible, the highest-priority one is
+    activated and the function returns True."""
+    monkeypatch.setattr(
+        nm,
+        "scan_visible_networks",
+        lambda: [
+            nm.ScanResult(ssid="yard", signal=80, security="WPA2"),
+            nm.ScanResult(ssid="home", signal=40, security="WPA2"),
+        ],
+    )
+    monkeypatch.setattr(
+        nm,
+        "list_known_networks",
+        lambda: [
+            nm.KnownNetwork(name="home", ssid="home", autoconnect=True, priority=1),
+            nm.KnownNetwork(name="yard", ssid="yard", autoconnect=True, priority=9),
+            nm.KnownNetwork(name="depot", ssid="depot", autoconnect=True, priority=99),
+        ],
+    )
+    ups: list[str] = []
+
+    def fake_run(args, **_kw):
+        if args[:2] == ["connection", "up"]:
+            ups.append(args[2])
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(nm, "_run", fake_run)
+    assert nm.reconnect_saved_networks() is True
+    # depot has highest priority but isn't visible; yard is the strongest visible.
+    assert ups == ["yard"]
+
+
+def test_reconnect_saved_networks_false_when_none_visible(monkeypatch):
+    monkeypatch.setattr(nm, "scan_visible_networks", lambda: [])
+    monkeypatch.setattr(
+        nm,
+        "list_known_networks",
+        lambda: [nm.KnownNetwork(name="home", ssid="home", autoconnect=True, priority=1)],
+    )
+    monkeypatch.setattr(nm, "_run", lambda *a, **kw: type("R", (), {"stdout": ""})())
+    assert nm.reconnect_saved_networks() is False
+
+
+def test_reconnect_saved_networks_skips_unbringable_then_tries_next(monkeypatch):
+    """If the strongest visible profile fails to come up, fall through to the
+    next visible candidate rather than raising."""
+    monkeypatch.setattr(
+        nm,
+        "scan_visible_networks",
+        lambda: [
+            nm.ScanResult(ssid="yard", signal=80, security="WPA2"),
+            nm.ScanResult(ssid="home", signal=40, security="WPA2"),
+        ],
+    )
+    monkeypatch.setattr(
+        nm,
+        "list_known_networks",
+        lambda: [
+            nm.KnownNetwork(name="yard", ssid="yard", autoconnect=True, priority=9),
+            nm.KnownNetwork(name="home", ssid="home", autoconnect=True, priority=1),
+        ],
+    )
+    ups: list[str] = []
+
+    def fake_run(args, **_kw):
+        if args[:2] == ["connection", "up"]:
+            ups.append(args[2])
+            if args[2] == "yard":
+                raise nm.NmcliError("activation failed")
+        return type("R", (), {"stdout": ""})()
+
+    monkeypatch.setattr(nm, "_run", fake_run)
+    assert nm.reconnect_saved_networks() is True
+    assert ups == ["yard", "home"]
+
+
 def test_delete_network_refuses_hotspot_profile(monkeypatch):
     monkeypatch.setattr(nm, "_run", lambda *a, **kw: type("R", (), {"stdout": ""})())
     with pytest.raises(ValueError):

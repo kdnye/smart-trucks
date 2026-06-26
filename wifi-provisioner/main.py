@@ -178,9 +178,32 @@ async def supervisor(config: Config, state: State) -> None:
                 # the hotspot so a tech can add the first one.
                 logger.info("No saved client WiFi — raising setup hotspot for first-time provisioning.")
             else:
-                logger.warning(
-                    "WiFi offline for %ds — raising setup hotspot %s.",
+                # The truck may have just parked at a different AP broadcasting a
+                # saved SSID. Actively rescan + reassociate before falling back to
+                # the provisioning hotspot — NM's own autoconnect can be in
+                # backoff or (on older profiles) permanently blocked.
+                logger.info(
+                    "WiFi offline for %ds — trying saved networks before hotspot.",
                     int(offline_for),
+                )
+                if await asyncio.to_thread(nm.reconnect_saved_networks):
+                    # nmcli returned that the profile activated, but DHCP and
+                    # routing can take a few seconds to settle. Poll briefly
+                    # instead of declaring failure on the first probe — otherwise
+                    # we'd tear down a perfectly good link and raise the hotspot.
+                    reconnected = False
+                    for _ in range(5):
+                        if await _async_is_network_connected():
+                            reconnected = True
+                            break
+                        await asyncio.sleep(1)
+                    if reconnected:
+                        logger.info("Reconnected to a saved network — hotspot not needed.")
+                        state.last_up_monotonic = time.monotonic()
+                        await _sleep_or_wake(config.check_interval_seconds, state)
+                        continue
+                logger.warning(
+                    "Saved networks unreachable — raising setup hotspot %s.",
                     config.setup_ssid,
                 )
             await _start_hotspot(config, state)
@@ -192,6 +215,10 @@ async def supervisor(config: Config, state: State) -> None:
         else:
             logger.info("Periodic rejoin attempt — dropping hotspot to test saved profiles.")
         await _stop_hotspot(state)
+
+        # Actively nudge a reassociation to a saved network rather than only
+        # waiting on NM autoconnect (which may be blocked after repeated failures).
+        await asyncio.to_thread(nm.reconnect_saved_networks)
 
         # Give NM a moment to reconnect, then probe.
         rejoined = False
@@ -442,6 +469,16 @@ async def run() -> None:
         )
         # Keep the process alive so Balena doesn't crash-loop and so the portal
         # can still report health.
+
+    # Migrate already-saved profiles to infinite autoconnect retries so trucks
+    # provisioned before this change stop permanently blocking a network after
+    # a few out-of-range failures (the core roaming fix).
+    if nm.nmcli_available() and not config.dry_run:
+        try:
+            await asyncio.to_thread(nm.set_autoconnect_retries_infinite)
+        except Exception as exc:  # never let startup hygiene crash the service
+            logger.warning("Could not normalise autoconnect-retries: %s", exc)
+
     state = State(last_up_monotonic=time.monotonic())
 
     app = build_portal_app(config, state)
