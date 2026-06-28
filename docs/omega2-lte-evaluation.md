@@ -57,7 +57,7 @@ pass-through and OTA updates).
 |---|---|---|
 | **Bluetooth / BLE scan** | **None.** Wi-Fi 2.4 GHz only; no BT on Omega2S+ | ❌ **Blocker** |
 | LTE backhaul | LTE Cat 4 (150/50 Mbps), Nano-SIM, Linux-managed | ✅ **Major win** |
-| GNSS | Multi-constellation (GPS/GLONASS/BeiDou/Galileo/QZSS), U.FL antenna | ✅ Win (but not NMEA-on-UART; modem-managed) |
+| GNSS | Multi-constellation (GPS/GLONASS/BeiDou/Galileo/QZSS), U.FL antenna | ✅ Win (NMEA-over-USB-serial; requires AT init) |
 | I2C (IMU, INA219) | Yes — I2C, SPI, UART, GPIO exposed | ✅ Electrically OK |
 | Storage for SQLite queue | 32 MB flash; microSD slot for expansion | ⚠️ microSD **required** |
 | RAM for our workload | **128 MB** | ⚠️ Very tight |
@@ -90,10 +90,12 @@ pass-through and OTA updates).
 4. **Toolchain friction.** Our wheels (`bleak`, `uvloop`, `pynmea2`, `smbus2`, `pg8000`, etc.)
    are glibc/ARM; OpenWRT is musl/MIPS. Expect OpenWRT package builds or cross-compilation, and
    re-validation of every dependency.
-5. **GNSS is modem-managed, not NMEA-on-UART.** Our `gps-multiplexer` is built around reading
-   NMEA from a serial port and rebroadcasting on TCP 2947. The Omega2's GNSS comes through the
-   Quectel modem via a command-line/AT-style interface, so the GPS reader needs rewriting, not
-   re-pointing.
+5. **GNSS is modem-managed, but still exposes NMEA-over-USB-serial.** It's not a hardware UART,
+   but the Quectel modem streams standard NMEA on a virtual USB serial port (typically
+   `/dev/ttyUSB1`) once GNSS is enabled via AT commands (e.g. `AT+QGPS=1` on the AT port). Our
+   `gps-multiplexer` already probes `/dev/ttyUSB0`/`/dev/ttyACM0` candidates and rebroadcasts on
+   TCP 2947, so it can read this stream by re-pointing at the virtual port — no rewrite, just a
+   one-time boot init step to turn GNSS on. (A minor integration item, not a blocker.)
 
 ---
 
