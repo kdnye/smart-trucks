@@ -28,6 +28,10 @@ services:
       - gps-multiplexer
     labels:
       io.balena.features.dbus: '1'
+      # Sentry Mode needs to stop/start ble-sensor + sync-service via the local
+      # Balena Supervisor API. This label injects BALENA_SUPERVISOR_ADDRESS /
+      # BALENA_SUPERVISOR_API_KEY / BALENA_APP_ID into the container.
+      io.balena.features.supervisor-api: '1'
     devices:
       - "/dev/i2c-1:/dev/i2c-1"     # Grants access to the IMU
     volumes:
@@ -63,6 +67,17 @@ services:
       - GPS_STATIONARY_HOLD_SECONDS=${GPS_STATIONARY_HOLD_SECONDS:-8.0}
       - GPS_MAX_HDOP=${GPS_MAX_HDOP:-0.0}
       - GPS_TRACK_KEEPALIVE_SECONDS=${GPS_TRACK_KEEPALIVE_SECONDS:-0.0}
+      # Sentry Mode (software sleep). When enabled, after the truck is idle for
+      # SENTRY_IDLE_TIMEOUT_SECONDS the heavy containers in SENTRY_PAUSE_SERVICES
+      # are stopped via the Balena Supervisor API to cut power, and restarted on
+      # motion/charging/WiFi. Opt-in: default off. See docs/power-optimization.md.
+      #   SENTRY_PAUSE_SERVICES: comma list; set to "ble-sensor" to keep cloud
+      #                          sync alive (visibility) instead of max savings.
+      - SENTRY_MODE_ENABLED=${SENTRY_MODE_ENABLED:-false}
+      - SENTRY_IDLE_TIMEOUT_SECONDS=${SENTRY_IDLE_TIMEOUT_SECONDS:-300}
+      - SENTRY_WAKE_INTERVAL_SECONDS=${SENTRY_WAKE_INTERVAL_SECONDS:-10}
+      - SENTRY_SYNC_FLUSH_GRACE_SECONDS=${SENTRY_SYNC_FLUSH_GRACE_SECONDS:-90}
+      - SENTRY_PAUSE_SERVICES=${SENTRY_PAUSE_SERVICES:-ble-sensor,sync-service}
 
   ble-sensor:
     build:
