@@ -3,22 +3,44 @@ import json
 import logging
 import os
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 import requests
 
-from shared.env import read_int_env
+from shared.env import read_bool_env, read_float_env, read_int_env
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 SYNC_INTERVAL_SECONDS = read_int_env("SYNC_INTERVAL_SECONDS", 60)
-SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 50, minimum=1)
-HTTP_TIMEOUT_SECONDS = read_int_env("HTTP_TIMEOUT_SECONDS", 15)
+SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 200, minimum=1)
+# Delay between back-to-back drain batches while a backlog is clearing. Small so
+# a multi-hour offline backlog drains in minutes, not hours, but non-zero so we
+# don't busy-spin the CPU or hammer the ingest endpoint.
+SYNC_DRAIN_DELAY_SECONDS = read_float_env("SYNC_DRAIN_DELAY_SECONDS", 0.5, minimum=0.0)
+HTTP_TIMEOUT_SECONDS = read_int_env("HTTP_TIMEOUT_SECONDS", 30)
+# On reconnect after an outage, push the newest position first so the dashboard
+# shows the truck "online and here" immediately, before the historical backfill
+# streams in chronologically behind it.
+PRIORITY_BEACON_ENABLED = read_bool_env("SYNC_PRIORITY_BEACON_ENABLED", True)
+
+# Tables drained, in the order their rows are loaded. The combined batch is
+# re-sorted by captured_at so the cloud ingests chronologically regardless.
+SYNC_TABLES = ("heartbeats", "gps_points", "edge_health", "ble_scans")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s [sync-service] %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SyncOutcome:
+    """Result of one drain cycle, used to decide whether to keep draining."""
+
+    ok: bool          # send succeeded (or nothing to send)
+    sent: int         # rows marked sent this cycle
+    more_pending: bool  # a table was saturated, so more rows likely remain
 
 
 def _load_pending_rows(table: str, limit: int) -> list[tuple[int, str, dict[str, Any]]]:
@@ -35,6 +57,25 @@ def _load_pending_rows(table: str, limit: int) -> list[tuple[int, str, dict[str,
             (limit,),
         ).fetchall()
         return [(int(r[0]), str(r[1]), json.loads(str(r[2]))) for r in rows]
+    finally:
+        conn.close()
+
+
+def _load_latest_payloads(table: str, limit: int = 1) -> list[dict[str, Any]]:
+    """Return the newest unsent payloads for a table (for the priority beacon)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT payload_json
+            FROM {table}
+            WHERE sent_at_utc IS NULL
+            ORDER BY captured_at_utc DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [json.loads(str(r[0])) for r in rows]
     finally:
         conn.close()
 
@@ -98,13 +139,38 @@ def _send_events(events: list[dict[str, Any]]) -> requests.Response:
     )
 
 
-async def sync_cycle() -> None:
+async def _send_priority_beacon() -> None:
+    """Best-effort: ship the newest position/health so the map updates instantly.
+
+    The rows are NOT marked sent — they stay queued and are delivered again in
+    chronological order during the normal drain. The cloud ingest dedups
+    heartbeats on (pi_id, captured_at_utc), so the replay is harmless.
+    """
+    try:
+        beacon = await asyncio.to_thread(_load_latest_payloads, "heartbeats", 1)
+        beacon += await asyncio.to_thread(_load_latest_payloads, "edge_health", 1)
+        if not beacon:
+            return
+        response = await asyncio.to_thread(_send_events, beacon)
+        if 200 <= response.status_code < 300:
+            logger.info("Priority beacon delivered current state ahead of %d-row backfill.", len(beacon))
+        else:
+            logger.warning("Priority beacon got HTTP %s; backfill will catch up.", response.status_code)
+    except Exception as exc:  # pylint: disable=broad-except
+        # Best-effort only: a DB lock, malformed payload, or transport error here
+        # must never crash the sync loop (it's called outside run()'s try/except).
+        logger.warning("Priority beacon send failed (%s); backfill will catch up.", exc)
+
+
+async def sync_cycle() -> SyncOutcome:
     pending = {
-        "heartbeats": await asyncio.to_thread(_load_pending_rows, "heartbeats", SYNC_BATCH_SIZE),
-        "gps_points": await asyncio.to_thread(_load_pending_rows, "gps_points", SYNC_BATCH_SIZE),
-        "edge_health": await asyncio.to_thread(_load_pending_rows, "edge_health", SYNC_BATCH_SIZE),
-        "ble_scans": await asyncio.to_thread(_load_pending_rows, "ble_scans", SYNC_BATCH_SIZE),
+        table: await asyncio.to_thread(_load_pending_rows, table, SYNC_BATCH_SIZE)
+        for table in SYNC_TABLES
     }
+    # A saturated table almost certainly has more rows waiting — signal the
+    # caller to drain again immediately instead of sleeping the full interval.
+    more_pending = any(len(rows) >= SYNC_BATCH_SIZE for rows in pending.values())
+
     all_rows: list[tuple[str, int, str, dict[str, Any]]] = []
     for table_name, rows in pending.items():
         for row_id, captured_at_utc, payload in rows:
@@ -113,11 +179,11 @@ async def sync_cycle() -> None:
     all_rows.sort(key=lambda item: (item[2], item[1]))
     if not all_rows:
         logger.debug("No pending rows found; skipping cycle.")
-        return
+        return SyncOutcome(ok=True, sent=0, more_pending=False)
 
     events = [row[3] for row in all_rows]
 
-    ids_by_table: dict[str, list[int]] = {"heartbeats": [], "gps_points": [], "edge_health": [], "ble_scans": []}
+    ids_by_table: dict[str, list[int]] = {table: [] for table in SYNC_TABLES}
     for table_name, row_id, _, _ in all_rows:
         ids_by_table[table_name].append(row_id)
 
@@ -129,7 +195,7 @@ async def sync_cycle() -> None:
         # but bump attempt_count for backoff/observability visibility.
         await _apply_all(_increment_attempts, ids_by_table)
         logger.warning("Network error sending events: %s. Rows remain pending for retry.", exc)
-        return
+        return SyncOutcome(ok=False, sent=0, more_pending=more_pending)
 
     if 200 <= response.status_code < 300:
         await _apply_all(_mark_rows_sent, ids_by_table)
@@ -140,6 +206,7 @@ async def sync_cycle() -> None:
             len(ids_by_table["edge_health"]),
             len(ids_by_table["ble_scans"]),
         )
+        return SyncOutcome(ok=True, sent=len(events), more_pending=more_pending)
     elif 400 <= response.status_code < 500:
         await _apply_all(_increment_attempts, ids_by_table)
         if response.status_code in (401, 403):
@@ -153,8 +220,10 @@ async def sync_cycle() -> None:
             )
         else:
             logger.warning("4xx response (%s): incremented attempts and dropping retry.", response.status_code)
+        return SyncOutcome(ok=False, sent=0, more_pending=more_pending)
     else:
         logger.warning("5xx/non-2xx response (%s): leaving rows pending for retry.", response.status_code)
+        return SyncOutcome(ok=False, sent=0, more_pending=more_pending)
 
 
 def _validate_startup_config() -> None:
@@ -179,18 +248,39 @@ def _validate_startup_config() -> None:
 async def run() -> None:
     _validate_startup_config()
     logger.info(
-        "Starting sync-service loop: interval=%ss db=%s batch_size=%s webhook_url=%s key=%s",
+        "Starting sync-service loop: interval=%ss drain_delay=%ss db=%s batch_size=%s "
+        "priority_beacon=%s webhook_url=%s key=%s",
         SYNC_INTERVAL_SECONDS,
+        SYNC_DRAIN_DELAY_SECONDS,
         DB_PATH,
         SYNC_BATCH_SIZE,
+        PRIORITY_BEACON_ENABLED,
         "set" if os.environ.get("WEBHOOK_URL") else "UNSET",
         "set" if os.environ.get("EDGE_INGEST_KEY") else "UNSET",
     )
+    # Latch so the "online and here" beacon fires once per backlog, not every
+    # batch while a long backfill drains.
+    beacon_sent = False
     while True:
         try:
-            await sync_cycle()
+            outcome = await sync_cycle()
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("Sync cycle failed: %s", exc)
+            beacon_sent = False
+            await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+            continue
+
+        if outcome.ok and outcome.more_pending:
+            # Backlog is clearing: announce the current position once, then keep
+            # draining back-to-back instead of sleeping the full interval.
+            if PRIORITY_BEACON_ENABLED and not beacon_sent:
+                await _send_priority_beacon()
+                beacon_sent = True
+            await asyncio.sleep(SYNC_DRAIN_DELAY_SECONDS)
+            continue
+
+        # Queue drained, or an error/backoff cycle — idle until the next tick.
+        beacon_sent = False
         await asyncio.sleep(SYNC_INTERVAL_SECONDS)
 
 
