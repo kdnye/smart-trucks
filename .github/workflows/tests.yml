@@ -16,14 +16,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # pytest-aiohttp provides the aiohttp_client fixture used by the
-          # wifi-provisioner portal tests (and pulls in pytest-asyncio).
-          pip install pytest pytest-aiohttp
-          # Service runtime deps the tests import (telematics-edge, sync-service,
-          # ble-sensor, wifi-provisioner).
+          # Service runtime deps the tests import. telematics-edge pins
+          # aiohttp==3.9.3, so install these first to fix that version.
           pip install -r telematics-edge/requirements.txt \
                       -r sync-service/requirements.txt \
                       -r ble-sensor/requirements.txt \
                       -r wifi-provisioner/requirements.txt
+          # pytest-aiohttp<1.1 provides the aiohttp_client fixture (wifi-provisioner
+          # portal tests) and is the line compatible with aiohttp 3.9.3; 1.1+
+          # requires aiohttp>=3.11 and breaks plugin import against the pin.
+          pip install pytest "pytest-aiohttp<1.1"
       - name: Run tests
         run: python -m pytest tests/ -q
