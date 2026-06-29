@@ -216,9 +216,24 @@ worker's `_heartbeat_view` and `_collect_ble_detections` exactly.
     "gps_total": 14502,
     "heartbeats_total": 1733
   },
-  "wifi_connected": true
+  "wifi_connected": true,
+  "sentry_mode": {
+    "active": false,
+    "since_utc": null,
+    "paused_services": ["ble-sensor", "sync-service"]
+  }
 }
 ```
+
+`sentry_mode` reports the device's software-sleep state (see
+`docs/power-optimization.md`). It is present on **every** heartbeat: `active` is
+`false` while awake and `true` on the announcement heartbeat emitted just before
+the device suspends its heavy containers and goes silent. The cloud
+heartbeat-worker projects `sentry_mode.active` into
+`fleet_status_monitor.pi_sentry_mode_active` (and `since_utc` into
+`pi_sentry_since`) so the dashboard can show a sleeping truck as **Sleeping**
+rather than offline. Consumers that don't know the field ignore it; a heartbeat
+that omits it leaves the prior dashboard value untouched (`COALESCE`).
 
 `edge_health` events ride the same wire under `event_type=edge_health` and
 keep the existing column-projecting shape consumed by

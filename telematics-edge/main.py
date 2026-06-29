@@ -29,6 +29,8 @@ from db import (
 from gps_filter import GpsFilterConfig, GpsTrackFilter
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 from nmea_reader import GpsReading, NMEAReader
+from sentry import BalenaSupervisor, SentryController, parse_service_list, should_suspend
+from shared.env import read_bool_env, read_int_env, read_str_env
 from shared.env import sanitize_env_value as _sanitize_env_value
 from shared.hardware_probe import (
     build_hardware_inventory,
@@ -63,6 +65,12 @@ class Config:
     network_watchdog_max_failures: int = 3
     network_watchdog_recovery_pause_seconds: int = 30
     network_watchdog_connection_name: str | None = None
+    # Sentry Mode (software sleep): stop heavy containers while idle to save power.
+    sentry_mode_enabled: bool = False
+    sentry_idle_timeout_seconds: int = 300
+    sentry_wake_interval_seconds: int = 10
+    sentry_sync_flush_grace_seconds: int = 90
+    sentry_pause_services: tuple[str, ...] = ("ble-sensor", "sync-service")
 
 
 def _read_str_env(name: str, default: str | None = None) -> str | None:
@@ -141,6 +149,13 @@ def load_config() -> Config:
         imu_required=parse_bool_env("IMU_REQUIRED", True),
         warehouse_latitude=warehouse_latitude,
         warehouse_longitude=warehouse_longitude,
+        sentry_mode_enabled=read_bool_env("SENTRY_MODE_ENABLED", False),
+        sentry_idle_timeout_seconds=read_int_env("SENTRY_IDLE_TIMEOUT_SECONDS", 300, minimum=60),
+        sentry_wake_interval_seconds=read_int_env("SENTRY_WAKE_INTERVAL_SECONDS", 10, minimum=2),
+        sentry_sync_flush_grace_seconds=read_int_env("SENTRY_SYNC_FLUSH_GRACE_SECONDS", 90, minimum=0),
+        sentry_pause_services=parse_service_list(
+            read_str_env("SENTRY_PAUSE_SERVICES", "ble-sensor,sync-service")
+        ),
     )
 
 
@@ -162,6 +177,11 @@ class RuntimeState:
     parked_mode: bool = False
     park_wake_event: asyncio.Event = field(default_factory=asyncio.Event)
     last_motion_monotonic: float = 0.0
+    # Sentry Mode state (software sleep). sentry_active is announced in every
+    # heartbeat so the dashboard can tell a sleeping truck from a dead one.
+    sentry_active: bool = False
+    sentry_since_utc: str | None = None
+    sentry_idle_since_monotonic: float = 0.0
 
 
 class ImuMonitor:
@@ -513,11 +533,26 @@ ACTIVE_AFTER_MOTION_SECONDS = 300.0
 _MOVING_SPEED_KMH = 5.0
 
 
+def _power_payload(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the INA219 metrics dict from a ``get_latest_power_snapshot()`` result.
+
+    The snapshot is shaped ``{"occurred_at": ..., "payload": {...}}`` — fields
+    like ``is_charging`` and ``state_of_charge_pct_estimate`` live inside
+    ``payload`` (see ``db.py::get_latest_power_snapshot``), so reading them off
+    the top-level dict always yields ``None``.
+    """
+    if not snapshot:
+        return {}
+    payload = snapshot.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
 def _adaptive_parked_sleep_seconds(power: dict[str, Any] | None) -> float:
     """Return parked sleep duration scaled by battery SOC to preserve charge."""
-    if not power or bool(power.get("is_charging")):
+    payload = _power_payload(power)
+    if not payload or bool(payload.get("is_charging")):
         return PARKED_SLEEP_SECONDS
-    soc = float(power.get("state_of_charge_pct_estimate", 100.0))
+    soc = float(payload.get("state_of_charge_pct_estimate", 100.0))
     if soc < 10.0:
         return 300.0
     if soc < 25.0:
@@ -551,7 +586,7 @@ async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
         return
 
     power = await get_latest_power_snapshot(config.vehicle_id)
-    if power and bool(power.get("is_charging")):
+    if bool(_power_payload(power).get("is_charging")):
         logger.info("Parked scan: charging detected (solar/USB) — waking to sync queued data.")
         state.parked_mode = False
         state.park_wake_event.set()
@@ -686,55 +721,76 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
         await asyncio.sleep(sample_interval)
 
 
+async def _build_heartbeat_payload(
+    config: Config, state: RuntimeState, imu: ImuMonitor | None
+) -> tuple[str, dict[str, Any]]:
+    """Assemble one ``edge_telematics_heartbeat`` payload.
+
+    Shared by the periodic ``heartbeat_builder_worker`` and the Sentry Mode sleep
+    announcement so both carry identical GPS/power/sentry fields. Returns
+    ``(captured_at_utc, payload)``.
+    """
+    captured_at = utc_now_iso()
+    gps_payload = build_location_payload(get_latest_gps(config, state))
+    state.wifi_connected = is_network_connected()
+    db_stats = await get_db_stats()
+    if config.device_role == "warehouse":
+        power_metrics = {
+            "status": "skipped",
+            "reason": "device_role_warehouse",
+            "source": "disabled_for_role",
+            "snapshot_found": False,
+            "snapshot_stale": False,
+            "snapshot_age_sec": None,
+            "snapshot_captured_at_utc": None,
+        }
+        state.power_monitor_ok = True
+    else:
+        latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
+        power_metrics, state.power_monitor_ok = build_power_metrics_payload(
+            latest_power_snapshot,
+            max_snapshot_age_seconds=config.power_snapshot_max_age_seconds,
+        )
+
+    payload = {
+        "event_type": "edge_telematics_heartbeat",
+        "vehicle_id": config.vehicle_id,
+        "captured_at_utc": captured_at,
+        "idempotency_key": (
+            f"{config.vehicle_id}:edge_telematics_heartbeat:{captured_at}:{state.local_sequence:08d}"
+        ),
+        "process_uptime_sec": int(time.monotonic() - state.start_monotonic),
+        # Keep GPS in multiple locations to maximize compatibility while
+        # clients migrate to location/location_status.
+        "location": gps_payload,
+        "gps": gps_payload,
+        "location_status": {
+            "fix_status": gps_payload.get("fix_status", "searching"),
+            "last_fix_age_sec": age_seconds(state.last_gps_fix_utc) if config.device_role != "warehouse" else 0,
+        },
+        "power_metrics": power_metrics,
+        "imu_metrics": imu.read() if imu is not None else {"status": "skipped", "reason": "device_role_warehouse"},
+        "queue": db_stats,
+        "wifi_connected": state.wifi_connected,
+        # Sentry Mode (software sleep) state. Present on every heartbeat so the
+        # dashboard tells a sleeping truck (active=true, then silence) apart from
+        # a dead one. See sentry.py / sentry_mode_worker.
+        "sentry_mode": {
+            "active": state.sentry_active,
+            "since_utc": state.sentry_since_utc,
+            "paused_services": list(config.sentry_pause_services),
+        },
+    }
+    return captured_at, payload
+
+
 async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:
     while True:
         if state.parked_mode:
             await asyncio.sleep(10)
             continue
 
-        captured_at = utc_now_iso()
-        gps_payload = build_location_payload(get_latest_gps(config, state))
-        state.wifi_connected = is_network_connected()
-        db_stats = await get_db_stats()
-        if config.device_role == "warehouse":
-            power_metrics = {
-                "status": "skipped",
-                "reason": "device_role_warehouse",
-                "source": "disabled_for_role",
-                "snapshot_found": False,
-                "snapshot_stale": False,
-                "snapshot_age_sec": None,
-                "snapshot_captured_at_utc": None,
-            }
-            state.power_monitor_ok = True
-        else:
-            latest_power_snapshot = await get_latest_power_snapshot(config.vehicle_id)
-            power_metrics, state.power_monitor_ok = build_power_metrics_payload(
-                latest_power_snapshot,
-                max_snapshot_age_seconds=config.power_snapshot_max_age_seconds,
-            )
-
-        heartbeat_payload = {
-            "event_type": "edge_telematics_heartbeat",
-            "vehicle_id": config.vehicle_id,
-            "captured_at_utc": captured_at,
-            "idempotency_key": (
-                f"{config.vehicle_id}:edge_telematics_heartbeat:{captured_at}:{state.local_sequence:08d}"
-            ),
-            "process_uptime_sec": int(time.monotonic() - state.start_monotonic),
-            # Keep GPS in multiple locations to maximize compatibility while
-            # clients migrate to location/location_status.
-            "location": gps_payload,
-            "gps": gps_payload,
-            "location_status": {
-                "fix_status": gps_payload.get("fix_status", "searching"),
-                "last_fix_age_sec": age_seconds(state.last_gps_fix_utc) if config.device_role != "warehouse" else 0,
-            },
-            "power_metrics": power_metrics,
-            "imu_metrics": imu.read() if imu is not None else {"status": "skipped", "reason": "device_role_warehouse"},
-            "queue": db_stats,
-            "wifi_connected": state.wifi_connected,
-        }
+        captured_at, heartbeat_payload = await _build_heartbeat_payload(config, state, imu)
         await insert_heartbeat(
             vehicle_id=config.vehicle_id,
             heartbeat_type="heartbeat",
@@ -743,6 +799,109 @@ async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: Imu
         )
 
         await asyncio.sleep(config.heartbeat_interval_seconds)
+
+
+async def _emit_sentry_heartbeat(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:
+    """Write one heartbeat carrying the current Sentry Mode state.
+
+    Emitted at the sleep transition so the last row sync-service ships before it
+    is stopped announces ``sentry_mode.active=true`` — the dashboard then shows
+    the truck as Sleeping rather than offline once it goes silent.
+    """
+    captured_at, payload = await _build_heartbeat_payload(config, state, imu)
+    payload["source"] = "sentry_transition"
+    await insert_heartbeat(
+        vehicle_id=config.vehicle_id,
+        heartbeat_type="heartbeat",
+        captured_at_utc=captured_at,
+        payload=payload,
+    )
+
+
+async def _enter_sentry(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> bool:
+    """Announce the sleep, throttle workers, and let sync flush before the stop.
+
+    Returns False if motion is detected during the flush grace — the entry is
+    aborted and nothing has been stopped yet.
+    """
+    state.sentry_active = True
+    state.sentry_since_utc = utc_now_iso()
+    logger.info("Sentry Mode: entering sleep — announcing to cloud before suspending containers.")
+    await _emit_sentry_heartbeat(config, state, imu)
+    # Throttle the periodic heartbeat/GPS workers (reuse the parked-mode machine).
+    state.parked_mode = True
+    # Give sync-service a window to ship the announcement before it is stopped.
+    deadline = time.monotonic() + config.sentry_sync_flush_grace_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if _truck_is_active(state):
+            logger.info("Sentry Mode: motion during flush grace — aborting entry.")
+            state.sentry_active = False
+            state.sentry_since_utc = None
+            state.parked_mode = False
+            state.park_wake_event.set()
+            return False
+        await asyncio.sleep(min(float(config.sentry_wake_interval_seconds), remaining))
+
+
+async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:
+    """Idle-driven software sleep: stop the heavy containers while the truck is
+    parked, restart them on motion / charging / WiFi. Opt-in via
+    ``SENTRY_MODE_ENABLED`` (default off).
+
+    A single private ``prev_paused`` shadow (in ``SentryController``) owns the
+    stop/start edge so the four other workers that toggle ``parked_mode`` cannot
+    cause double stop/start calls.
+    """
+    if not config.sentry_mode_enabled:
+        logger.info("Sentry Mode disabled by configuration.")
+        return
+
+    supervisor = BalenaSupervisor()
+    controller = SentryController(supervisor, config.sentry_pause_services)
+    logger.info(
+        "Sentry Mode enabled: idle_timeout=%ss wake_interval=%ss flush_grace=%ss pause=%s",
+        config.sentry_idle_timeout_seconds,
+        config.sentry_wake_interval_seconds,
+        config.sentry_sync_flush_grace_seconds,
+        ",".join(config.sentry_pause_services) or "(none)",
+    )
+    # Recover containers a crash/OTA may have left stopped mid-sleep (idempotent).
+    await controller.boot_safety_start()
+    state.sentry_idle_since_monotonic = time.monotonic()
+
+    while True:
+        if _truck_is_active(state):
+            state.sentry_idle_since_monotonic = time.monotonic()
+
+        power = await get_latest_power_snapshot(config.vehicle_id)
+        is_charging = bool(_power_payload(power).get("is_charging"))
+        idle_seconds = time.monotonic() - state.sentry_idle_since_monotonic
+        desired = should_suspend(
+            enabled=config.sentry_mode_enabled,
+            truck_active=_truck_is_active(state),
+            is_charging=is_charging,
+            idle_seconds=idle_seconds,
+            idle_timeout=config.sentry_idle_timeout_seconds,
+        )
+
+        if desired and not state.sentry_active:
+            if not await _enter_sentry(config, state, imu):
+                # Aborted by motion during the flush grace; re-evaluate next cycle.
+                await asyncio.sleep(config.sentry_wake_interval_seconds)
+                continue
+        elif not desired and state.sentry_active:
+            logger.info("Sentry Mode: wake — restarting suspended containers.")
+            state.sentry_active = False
+            state.sentry_since_utc = None
+            if state.parked_mode:
+                state.parked_mode = False
+                state.park_wake_event.set()
+
+        await controller.apply(desired)
+        await asyncio.sleep(config.sentry_wake_interval_seconds)
 
 
 
@@ -891,6 +1050,7 @@ async def run() -> None:
                 asyncio.create_task(gps_reader_worker(config, state)),
                 asyncio.create_task(gps_collector_worker(config, state)),
                 asyncio.create_task(parked_scan_worker(config, state)),
+                asyncio.create_task(sentry_mode_worker(config, state, imu)),
             ]
         )
     await asyncio.gather(*tasks)

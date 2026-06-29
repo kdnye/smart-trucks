@@ -23,6 +23,41 @@ parked interval.
 | :--- | :--- | :--- |
 | `IMU_PARKED_SAMPLE_INTERVAL_SECONDS` | Accelerometer poll interval while parked. Larger = lower draw, slower motion-wake latency. | `1.0` |
 
+### `telematics-edge` — Sentry Mode (software sleep)
+The Pi Zero 2 W has no true hardware deep-sleep. Sentry Mode is the software
+equivalent: when the truck has been idle (no IMU motion, GPS below the moving
+threshold) for `SENTRY_IDLE_TIMEOUT_SECONDS`, `telematics-edge` acts as a master
+"sentry" and **stops the heavy containers** in `SENTRY_PAUSE_SERVICES` via the
+local Balena Supervisor API. Stopping `ble-sensor` removes the dominant radio +
+CPU-polling load instantly; stopping `sync-service` lets the CPU reach deep idle
+between checks. The worker then polls on a short cadence and, on the first IMU
+harsh event / charging / WiFi return, **restarts** the containers within
+`SENTRY_WAKE_INTERVAL_SECONDS`.
+
+Before stopping `sync-service`, the device emits one heartbeat marked
+`sentry_mode.active=true` and waits `SENTRY_SYNC_FLUSH_GRACE_SECONDS` so that
+"going to sleep" announcement reaches the cloud — the dashboard then shows the
+truck as **Sleeping** rather than offline while it is silent. Breadcrumbs logged
+during sleep flush on wake.
+
+Enabling requires the `io.balena.features.supervisor-api: '1'` label on the
+`telematics-edge` service (already in `docker-compose.yml`); without it the
+worker logs a warning and no-ops.
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `SENTRY_MODE_ENABLED` | Master switch (opt-in). | `false` |
+| `SENTRY_IDLE_TIMEOUT_SECONDS` | Idle duration before sleeping. Recommended 300–600 (5–10 min). | `300` |
+| `SENTRY_WAKE_INTERVAL_SECONDS` | Poll cadence while watching for motion; also the restart latency on wake. | `10` |
+| `SENTRY_SYNC_FLUSH_GRACE_SECONDS` | Window for `sync-service` to ship the sleep announcement before it is stopped. | `90` |
+| `SENTRY_PAUSE_SERVICES` | Comma list of services to stop. Set to `ble-sensor` to keep cloud sync alive (visibility) instead of max savings. | `ble-sensor,sync-service` |
+
+> ⚠️ Tradeoff: with the default pause-set, a sleeping truck stops uploading
+> until it wakes, so the dashboard sees it as Sleeping (last-known position +
+> battery) rather than live. Set `SENTRY_PAUSE_SERVICES=ble-sensor` to keep
+> `sync-service` running if continuous visibility matters more than the last bit
+> of overnight draw.
+
 ### `ble-sensor` — scan throttling on battery
 BLE active scanning is the largest radio consumer. On battery the scan cadence
 is stretched (further when the battery is low) and the scan window is shortened.
