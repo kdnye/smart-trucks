@@ -533,11 +533,26 @@ ACTIVE_AFTER_MOTION_SECONDS = 300.0
 _MOVING_SPEED_KMH = 5.0
 
 
+def _power_payload(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the INA219 metrics dict from a ``get_latest_power_snapshot()`` result.
+
+    The snapshot is shaped ``{"occurred_at": ..., "payload": {...}}`` — fields
+    like ``is_charging`` and ``state_of_charge_pct_estimate`` live inside
+    ``payload`` (see ``db.py::get_latest_power_snapshot``), so reading them off
+    the top-level dict always yields ``None``.
+    """
+    if not snapshot:
+        return {}
+    payload = snapshot.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
 def _adaptive_parked_sleep_seconds(power: dict[str, Any] | None) -> float:
     """Return parked sleep duration scaled by battery SOC to preserve charge."""
-    if not power or bool(power.get("is_charging")):
+    payload = _power_payload(power)
+    if not payload or bool(payload.get("is_charging")):
         return PARKED_SLEEP_SECONDS
-    soc = float(power.get("state_of_charge_pct_estimate", 100.0))
+    soc = float(payload.get("state_of_charge_pct_estimate", 100.0))
     if soc < 10.0:
         return 300.0
     if soc < 25.0:
@@ -571,7 +586,7 @@ async def _parked_scan_cycle(config: Config, state: RuntimeState) -> None:
         return
 
     power = await get_latest_power_snapshot(config.vehicle_id)
-    if power and bool(power.get("is_charging")):
+    if bool(_power_payload(power).get("is_charging")):
         logger.info("Parked scan: charging detected (solar/USB) — waking to sync queued data.")
         state.parked_mode = False
         state.park_wake_event.set()
@@ -862,7 +877,7 @@ async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonito
             state.sentry_idle_since_monotonic = time.monotonic()
 
         power = await get_latest_power_snapshot(config.vehicle_id)
-        is_charging = bool(power and power.get("is_charging"))
+        is_charging = bool(_power_payload(power).get("is_charging"))
         idle_seconds = time.monotonic() - state.sentry_idle_since_monotonic
         desired = should_suspend(
             enabled=config.sentry_mode_enabled,

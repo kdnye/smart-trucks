@@ -119,24 +119,32 @@ class BalenaSupervisor:
             raise ValueError(f"target must be one of {_VALID_TARGETS}; got {target!r}")
         if not self._enabled:
             return False
+        import aiohttp  # lazy: keeps module import light for unit tests / dev
+
+        # Reuse one session across the (typically 2) service calls in a single
+        # transition so the connection pool isn't rebuilt per request.
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
         ok = True
-        for name in names:
-            if not await self._post(target, name):
-                ok = False
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for name in names:
+                if not await self._post(target, name, session=session):
+                    ok = False
         return ok
 
-    async def _post(self, action: str, name: str) -> bool:
+    async def _post(self, action: str, name: str, session=None) -> bool:
+        """POST one start/stop-service call. Reuses ``session`` when supplied,
+        otherwise opens a short-lived one (for standalone start/stop calls)."""
         if not self._enabled:
             return False
         import aiohttp  # lazy: keeps module import light for unit tests / dev
 
         url = f"{self._address}/v2/applications/{self._app_id}/{action}-service"
-        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        async def _send(sess) -> bool:
+            try:
                 # Auth is the ?apikey= query param (NOT a Bearer header), and the
                 # body field is serviceName (the compose key, not imageName).
-                async with session.post(
+                async with sess.post(
                     url,
                     params={"apikey": self._api_key},
                     json={"serviceName": name},
@@ -153,11 +161,17 @@ class BalenaSupervisor:
                         body[:200].strip(),
                     )
                     return False
-        except Exception as exc:  # aiohttp.ClientError / asyncio.TimeoutError / etc.
-            logger.warning(
-                "Supervisor %s-service error: service=%s error=%s", action, name, exc
-            )
-            return False
+            except Exception as exc:  # aiohttp.ClientError / asyncio.TimeoutError / etc.
+                logger.warning(
+                    "Supervisor %s-service error: service=%s error=%s", action, name, exc
+                )
+                return False
+
+        if session is not None:
+            return await _send(session)
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as new_session:
+            return await _send(new_session)
 
 
 class SentryController:
