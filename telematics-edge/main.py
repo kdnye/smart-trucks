@@ -46,6 +46,7 @@ class Config:
     vehicle_id: str
     device_role: str
     gps_sample_interval_seconds: int
+    gps_moving_sample_interval_seconds: float
     heartbeat_interval_seconds: int
     gps_serial_candidates: tuple[str, ...]
     gps_probe_all_candidates: bool
@@ -114,7 +115,12 @@ def load_config() -> Config:
     return Config(
         vehicle_id=_read_str_env("VEHICLE_ID", "UNKNOWN_TRUCK") or "UNKNOWN_TRUCK",
         device_role=device_role,
+        # Stationary/throttled sample interval; the moving interval (below) is used
+        # while the GPS track filter reports the vehicle as moving.
         gps_sample_interval_seconds=max(1, int(_read_str_env("GPS_SAMPLE_INTERVAL_SECONDS", "5") or "5")),
+        gps_moving_sample_interval_seconds=max(
+            0.2, float(_read_str_env("GPS_MOVING_SAMPLE_INTERVAL_SECONDS", "1.0") or "1.0")
+        ),
         heartbeat_interval_seconds=max(10, int(_read_str_env("HEARTBEAT_INTERVAL_SECONDS", "60") or "60")),
         gps_serial_candidates=serial_devices,
         gps_probe_all_candidates=probe_all_candidates,
@@ -598,6 +604,10 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
     Emitted points are stored in the local store-and-forward queue and shipped
     by sync-service, so the full track — including any offline stretch — is
     retained at sample resolution and backfilled on reconnect.
+
+    While the filter reports the vehicle as moving we sample at
+    ``gps_moving_sample_interval_seconds`` (≈1 Hz) for a dense track; while parked
+    we throttle back to ``gps_sample_interval_seconds`` to save power and storage.
     """
     track_filter = GpsTrackFilter(GpsFilterConfig.from_env())
     # Freshness token: the reader stamps state.last_gps_fix_utc on every new fix.
@@ -611,60 +621,69 @@ async def gps_collector_worker(config: Config, state: RuntimeState) -> None:
             await asyncio.sleep(5)
             continue
 
-        raw = state.latest_valid_gps
-        fix_token = state.last_gps_fix_utc
-        if (
-            raw
-            and raw.get("fix_status") == "locked"
-            and fix_token is not None
-            and fix_token != last_processed_fix_utc
-        ):
-            last_processed_fix_utc = fix_token
-            captured_at = utc_now_iso()
-            result = track_filter.process(
-                latitude=raw["latitude"],
-                longitude=raw["longitude"],
-                speed_kmh=raw.get("speed_kmh"),
-                hdop=raw.get("hdop"),
-                now_monotonic=time.monotonic(),
-            )
-
-            # Publish the drift-suppressed position for heartbeats / live map.
-            state.stabilized_gps = {
-                **raw,
-                "latitude": result.latitude,
-                "longitude": result.longitude,
-                "speed_kmh": result.speed_kmh,
-            }
-            state.last_locked_gps_point_utc = captured_at
-            state.gps_reader_ok = True
-
-            if result.emit:
-                state.local_sequence += 1
-                location = build_location_payload(state.stabilized_gps)
-                await insert_gps_point(
-                    vehicle_id=config.vehicle_id,
-                    captured_at_utc=captured_at,
-                    lat=result.latitude,
-                    lon=result.longitude,
-                    speed_kmh=result.speed_kmh,
-                    fix_status="locked",
-                    source_device=raw.get("device"),
-                    trip_id=None,
-                    local_sequence=state.local_sequence,
-                    payload=build_gps_track_event(
-                        config,
-                        captured_at_utc=captured_at,
-                        local_sequence=state.local_sequence,
-                        location=location,
-                        pinned=result.pinned,
-                    ),
+        # Default to the throttled cadence; a moving fix bumps us to ~1 Hz below.
+        sample_interval = config.gps_sample_interval_seconds
+        try:
+            raw = state.latest_valid_gps
+            fix_token = state.last_gps_fix_utc
+            if (
+                raw
+                and raw.get("fix_status") == "locked"
+                and fix_token is not None
+                and fix_token != last_processed_fix_utc
+            ):
+                last_processed_fix_utc = fix_token
+                captured_at = utc_now_iso()
+                result = track_filter.process(
+                    latitude=raw["latitude"],
+                    longitude=raw["longitude"],
+                    speed_kmh=raw.get("speed_kmh"),
+                    hdop=raw.get("hdop"),
+                    now_monotonic=time.monotonic(),
                 )
-        else:
-            stale_for = age_seconds(state.last_gps_fix_utc)
-            state.gps_reader_ok = stale_for is None or stale_for <= 300
+                if result.moving:
+                    sample_interval = config.gps_moving_sample_interval_seconds
 
-        await asyncio.sleep(config.gps_sample_interval_seconds)
+                # Publish the drift-suppressed position for heartbeats / live map.
+                state.stabilized_gps = {
+                    **raw,
+                    "latitude": result.latitude,
+                    "longitude": result.longitude,
+                    "speed_kmh": result.speed_kmh,
+                }
+                state.last_locked_gps_point_utc = captured_at
+                state.gps_reader_ok = True
+
+                if result.emit:
+                    state.local_sequence += 1
+                    location = build_location_payload(state.stabilized_gps)
+                    await insert_gps_point(
+                        vehicle_id=config.vehicle_id,
+                        captured_at_utc=captured_at,
+                        lat=result.latitude,
+                        lon=result.longitude,
+                        speed_kmh=result.speed_kmh,
+                        fix_status="locked",
+                        source_device=raw.get("device"),
+                        trip_id=None,
+                        local_sequence=state.local_sequence,
+                        payload=build_gps_track_event(
+                            config,
+                            captured_at_utc=captured_at,
+                            local_sequence=state.local_sequence,
+                            location=location,
+                            pinned=result.pinned,
+                        ),
+                    )
+            else:
+                stale_for = age_seconds(state.last_gps_fix_utc)
+                state.gps_reader_ok = stale_for is None or stale_for <= 300
+        except Exception as exc:  # pylint: disable=broad-except
+            # Never let a single bad fix kill the worker — that would freeze
+            # state.stabilized_gps (which get_latest_gps prefers) at a stale value.
+            logger.error("gps_collector_worker cycle failed: %s", exc)
+
+        await asyncio.sleep(sample_interval)
 
 
 async def heartbeat_builder_worker(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:

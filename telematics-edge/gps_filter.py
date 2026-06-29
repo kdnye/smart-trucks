@@ -10,21 +10,22 @@ worse on this fleet:
 * heartbeats were the *only* GPS source (one fix per ``HEARTBEAT_INTERVAL``), so
   a moving truck's track was also far too coarse.
 
-``GpsTrackFilter`` solves both at the source:
+``GpsTrackFilter`` is a small two-state machine (STATIONARY / MOVING) that solves
+both at the source:
 
-* **Coordinate pinning** — while the vehicle is stationary (low speed and within
-  a drift radius of an established anchor) the *anchor* coordinate is reported
-  instead of the drifting raw fix, and no new track point is emitted. The
-  starburst collapses to a single point.
-* **Distance-or-time deadband** — while moving, a point is emitted whenever the
-  vehicle has travelled a meaningful distance, giving a dense, even track. An
-  optional keep-alive emits a single pinned point on a slow cadence so a long
-  dwell is still visible.
-* **HDOP gating** — fixes with a poor horizontal dilution of precision (the main
-  driver of stationary drift) never move the anchor.
+* **STATIONARY** — the reported position is *pinned* to the anchor (where the
+  vehicle stopped) and no track point is emitted, so the starburst collapses to
+  a single point. A truck only leaves this state when GPS speed says it's moving
+  **and** it has physically displaced beyond the drift radius — so pure GPS
+  *speed noise* while parked can't kick off a flood of drifted points.
+* **MOVING** — every fix is emitted, giving a dense track (the collector samples
+  ~1 Hz while moving). The truck returns to STATIONARY when speed drops below the
+  threshold, or when it stops making real progress for ``stationary_hold_seconds``
+  (covers speed noise that persists after the vehicle has actually stopped).
 
-The class is intentionally pure (no I/O, monotonic clock injected) so the
-behaviour can be unit tested deterministically.
+The class is pure (no I/O, monotonic clock injected) so the behaviour can be
+unit tested deterministically. The collector reads ``GpsFilterResult.moving`` to
+sample fast while moving and slow while parked.
 """
 
 import math
@@ -33,6 +34,9 @@ from dataclasses import dataclass
 from shared.env import read_float_env
 
 EARTH_RADIUS_M = 6_371_000.0
+
+_STATIONARY = "stationary"
+_MOVING = "moving"
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -43,6 +47,9 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         math.sin(d_lat / 2) ** 2
         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
     )
+    # Clamp: floating-point rounding can nudge `a` just past 1.0, which would make
+    # 1 - a negative and raise "math domain error" in sqrt.
+    a = min(1.0, max(0.0, a))
     return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
@@ -50,23 +57,26 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class GpsFilterConfig:
     """Tunable thresholds for :class:`GpsTrackFilter`.
 
-    Defaults are conservative for a parked truck on a noisy urban multipath
-    fix; all are overridable via environment variables so the fleet can be
-    re-tuned without a code change.
+    All are overridable via environment variables so the fleet can be re-tuned
+    without a code change.
     """
 
-    # At or above this speed the vehicle is treated as moving (never pinned).
+    # At or above this speed the vehicle is treated as moving.
     stationary_speed_kmh: float = 5.0
-    # While slow, fixes within this distance of the anchor are treated as drift.
+    # A parked fix must displace beyond this radius (and read as moving) before we
+    # leave STATIONARY — rejects multipath drift and GPS speed noise.
     stationary_radius_m: float = 20.0
-    # While moving, emit a track point once the vehicle has travelled this far
-    # from the last emitted point (keeps a dense but not redundant track).
+    # While MOVING, "real progress" means advancing at least this far; if the
+    # vehicle stays within it for stationary_hold_seconds it's treated as stopped.
     min_track_distance_m: float = 8.0
-    # Reject fixes whose HDOP exceeds this (0 disables the check). A poor-HDOP
-    # fix is the main source of stationary drift, so it must not move the anchor.
+    # How long without real progress (while speed still reads as moving) before we
+    # declare the vehicle stopped and return to STATIONARY.
+    stationary_hold_seconds: float = 8.0
+    # Reject fixes whose HDOP exceeds this (0 disables the check). A poor-HDOP fix
+    # is the main source of stationary drift, so it must not move the anchor.
     max_hdop: float = 0.0
-    # While stationary, emit one pinned point every N seconds so a long dwell
-    # still leaves a breadcrumb (0 disables; heartbeats already prove liveness).
+    # While STATIONARY, emit one pinned point every N seconds so a long dwell still
+    # leaves a breadcrumb (0 disables; heartbeats already prove liveness).
     keepalive_seconds: float = 0.0
 
     @classmethod
@@ -75,6 +85,7 @@ class GpsFilterConfig:
             stationary_speed_kmh=read_float_env("GPS_STATIONARY_SPEED_KMH", cls.stationary_speed_kmh, minimum=0.0),
             stationary_radius_m=read_float_env("GPS_STATIONARY_RADIUS_M", cls.stationary_radius_m, minimum=0.0),
             min_track_distance_m=read_float_env("GPS_MIN_TRACK_DISTANCE_M", cls.min_track_distance_m, minimum=0.0),
+            stationary_hold_seconds=read_float_env("GPS_STATIONARY_HOLD_SECONDS", cls.stationary_hold_seconds, minimum=0.0),
             max_hdop=read_float_env("GPS_MAX_HDOP", cls.max_hdop, minimum=0.0),
             keepalive_seconds=read_float_env("GPS_TRACK_KEEPALIVE_SECONDS", cls.keepalive_seconds, minimum=0.0),
         )
@@ -93,6 +104,9 @@ class GpsFilterResult:
     pinned: bool
     # True when a track point should be persisted for this fix.
     emit: bool
+    # True while the vehicle is in the MOVING state — the collector samples fast
+    # (~1 Hz) when set, and throttles back when clear.
+    moving: bool
     # Short machine-readable reason, for logging/diagnostics.
     reason: str
 
@@ -102,14 +116,18 @@ class GpsTrackFilter:
 
     def __init__(self, config: GpsFilterConfig | None = None) -> None:
         self.config = config or GpsFilterConfig()
+        self._state: str | None = None
         self._anchor_lat: float | None = None
         self._anchor_lon: float | None = None
+        # Last position where real progress was made (MOVING-state stop detection).
+        self._progress_lat: float | None = None
+        self._progress_lon: float | None = None
+        self._last_progress_monotonic: float = 0.0
         self._last_emit_monotonic: float | None = None
 
-    def _emit(self, lat: float, lon: float, now: float) -> None:
-        self._anchor_lat = lat
-        self._anchor_lon = lon
-        self._last_emit_monotonic = now
+    @property
+    def moving(self) -> bool:
+        return self._state == _MOVING
 
     def process(
         self,
@@ -123,82 +141,79 @@ class GpsTrackFilter:
         cfg = self.config
         speed = speed_kmh or 0.0
 
-        # A poor-quality fix must never establish or move the anchor. If we have
-        # an anchor, report it (pinned) and drop the fix; otherwise report the
-        # raw fix so the live map isn't blank, but still don't anchor on it.
+        # A poor-quality fix must never establish or move the anchor. Report the
+        # pinned anchor if we have one (else the raw fix so the live map isn't
+        # blank), but never emit or change state on it.
         if cfg.max_hdop > 0 and hdop is not None and hdop > cfg.max_hdop:
             if self._anchor_lat is not None and self._anchor_lon is not None:
                 return GpsFilterResult(
-                    latitude=self._anchor_lat,
-                    longitude=self._anchor_lon,
-                    speed_kmh=speed,
-                    pinned=True,
-                    emit=False,
-                    reason="hdop_reject_pinned",
+                    self._anchor_lat, self._anchor_lon, speed,
+                    pinned=True, emit=False, moving=self.moving, reason="hdop_reject_pinned",
                 )
             return GpsFilterResult(
-                latitude=latitude,
-                longitude=longitude,
-                speed_kmh=speed,
-                pinned=False,
-                emit=False,
-                reason="hdop_reject_no_anchor",
+                latitude, longitude, speed,
+                pinned=False, emit=False, moving=self.moving, reason="hdop_reject_no_anchor",
             )
 
-        # First valid fix establishes the anchor and is always emitted.
-        if self._anchor_lat is None or self._anchor_lon is None:
-            self._emit(latitude, longitude, now_monotonic)
-            return GpsFilterResult(
-                latitude=latitude,
-                longitude=longitude,
-                speed_kmh=speed,
-                pinned=False,
-                emit=True,
-                reason="first_fix",
-            )
-
-        distance_m = haversine_m(self._anchor_lat, self._anchor_lon, latitude, longitude)
-        moving = speed >= cfg.stationary_speed_kmh
-
-        # Real movement: the vehicle is moving, or it has stepped outside the
-        # stationary drift radius. Report the raw fix and (when it has covered
-        # the minimum spacing) emit a track point, advancing the anchor.
-        if moving or distance_m > cfg.stationary_radius_m:
-            if moving or distance_m >= cfg.min_track_distance_m:
-                self._emit(latitude, longitude, now_monotonic)
-                return GpsFilterResult(
-                    latitude=latitude,
-                    longitude=longitude,
-                    speed_kmh=speed,
-                    pinned=False,
-                    emit=True,
-                    reason="moving" if moving else "left_radius",
-                )
-            # Outside the radius but a sub-spacing nudge while slow: report raw
-            # but don't spam a point.
-            return GpsFilterResult(
-                latitude=latitude,
-                longitude=longitude,
-                speed_kmh=speed,
-                pinned=False,
-                emit=False,
-                reason="below_min_spacing",
-            )
-
-        # Stationary within the drift radius: pin to the anchor. Optionally drop
-        # a keep-alive breadcrumb on a slow cadence.
-        emit_keepalive = (
-            cfg.keepalive_seconds > 0
-            and self._last_emit_monotonic is not None
-            and (now_monotonic - self._last_emit_monotonic) >= cfg.keepalive_seconds
-        )
-        if emit_keepalive:
+        # First valid fix: anchor here, start parked, always emitted.
+        if self._state is None:
+            self._state = _STATIONARY
+            self._anchor_lat, self._anchor_lon = latitude, longitude
             self._last_emit_monotonic = now_monotonic
+            return GpsFilterResult(
+                latitude, longitude, speed,
+                pinned=False, emit=True, moving=False, reason="first_fix",
+            )
+
+        moving_speed = speed >= cfg.stationary_speed_kmh
+
+        if self._state == _STATIONARY:
+            distance_m = haversine_m(self._anchor_lat, self._anchor_lon, latitude, longitude)
+            # Confirmed departure needs BOTH a moving speed AND real displacement
+            # beyond the drift radius — so speed noise alone can't start a flood.
+            if moving_speed and distance_m > cfg.stationary_radius_m:
+                self._state = _MOVING
+                self._progress_lat, self._progress_lon = latitude, longitude
+                self._last_progress_monotonic = now_monotonic
+                self._last_emit_monotonic = now_monotonic
+                return GpsFilterResult(
+                    latitude, longitude, speed,
+                    pinned=False, emit=True, moving=True, reason="depart",
+                )
+            # Still parked: pin to the anchor; optional keep-alive breadcrumb.
+            emit_keepalive = (
+                cfg.keepalive_seconds > 0
+                and self._last_emit_monotonic is not None
+                and (now_monotonic - self._last_emit_monotonic) >= cfg.keepalive_seconds
+            )
+            if emit_keepalive:
+                self._last_emit_monotonic = now_monotonic
+            return GpsFilterResult(
+                self._anchor_lat, self._anchor_lon, speed,
+                pinned=True, emit=emit_keepalive, moving=False,
+                reason="keepalive" if emit_keepalive else "pinned",
+            )
+
+        # MOVING: emit every fix for a dense track. Track real progress so a fix
+        # that stops advancing (e.g. stopped at a light with noisy speed) returns
+        # us to STATIONARY rather than emitting drift.
+        progressed = haversine_m(self._progress_lat, self._progress_lon, latitude, longitude)
+        if progressed >= cfg.min_track_distance_m:
+            self._progress_lat, self._progress_lon = latitude, longitude
+            self._last_progress_monotonic = now_monotonic
+        no_progress = (now_monotonic - self._last_progress_monotonic) >= cfg.stationary_hold_seconds
+        if not moving_speed or no_progress:
+            # Came to rest: anchor here and start pinning. Emit this final point so
+            # the trail reaches the stopping spot.
+            self._state = _STATIONARY
+            self._anchor_lat, self._anchor_lon = latitude, longitude
+            self._last_emit_monotonic = now_monotonic
+            return GpsFilterResult(
+                latitude, longitude, speed,
+                pinned=False, emit=True, moving=False, reason="arrive",
+            )
+        self._last_emit_monotonic = now_monotonic
         return GpsFilterResult(
-            latitude=self._anchor_lat,
-            longitude=self._anchor_lon,
-            speed_kmh=speed,
-            pinned=True,
-            emit=emit_keepalive,
-            reason="keepalive" if emit_keepalive else "pinned",
+            latitude, longitude, speed,
+            pinned=False, emit=True, moving=True, reason="moving",
         )

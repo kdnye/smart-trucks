@@ -156,7 +156,9 @@ async def _send_priority_beacon() -> None:
             logger.info("Priority beacon delivered current state ahead of %d-row backfill.", len(beacon))
         else:
             logger.warning("Priority beacon got HTTP %s; backfill will catch up.", response.status_code)
-    except (requests.RequestException, OSError) as exc:
+    except Exception as exc:  # pylint: disable=broad-except
+        # Best-effort only: a DB lock, malformed payload, or transport error here
+        # must never crash the sync loop (it's called outside run()'s try/except).
         logger.warning("Priority beacon send failed (%s); backfill will catch up.", exc)
 
 
