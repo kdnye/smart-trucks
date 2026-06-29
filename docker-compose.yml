@@ -41,6 +41,19 @@ services:
       # Power saving: throttle IMU polling while parked (full 10Hz rate resumes
       # on motion). Larger = lower overnight draw, slower motion-wake latency.
       - IMU_PARKED_SAMPLE_INTERVAL_SECONDS=${IMU_PARKED_SAMPLE_INTERVAL_SECONDS:-1.0}
+      # GPS track filter (see telematics-edge/gps_filter.py). Suppresses parked
+      # multipath drift ("starburst") at the source and logs a dense track while
+      # moving. All optional — code defaults apply when unset.
+      #   STATIONARY_SPEED_KMH: at/above this the truck is "moving" (never pinned)
+      #   STATIONARY_RADIUS_M:  slow fixes within this of the anchor are drift
+      #   MIN_TRACK_DISTANCE_M: min travel to log a new point while moving
+      #   MAX_HDOP:             reject fixes worse than this HDOP (0 = off)
+      #   TRACK_KEEPALIVE_SECONDS: emit one pinned breadcrumb per N s parked (0 = off)
+      - GPS_STATIONARY_SPEED_KMH=${GPS_STATIONARY_SPEED_KMH:-5.0}
+      - GPS_STATIONARY_RADIUS_M=${GPS_STATIONARY_RADIUS_M:-20.0}
+      - GPS_MIN_TRACK_DISTANCE_M=${GPS_MIN_TRACK_DISTANCE_M:-8.0}
+      - GPS_MAX_HDOP=${GPS_MAX_HDOP:-0.0}
+      - GPS_TRACK_KEEPALIVE_SECONDS=${GPS_TRACK_KEEPALIVE_SECONDS:-0.0}
 
   ble-sensor:
     build:
@@ -86,6 +99,15 @@ services:
       - WEBHOOK_URL=${WEBHOOK_URL}
       - EDGE_INGEST_KEY=${EDGE_INGEST_KEY}
       - DB_PATH=/data/telematics.db
+      # Store-and-forward draining. After an offline stretch the queue clears in
+      # minutes, not hours: a saturated cycle keeps draining back-to-back
+      # (DRAIN_DELAY) instead of sleeping the full INTERVAL, and a priority
+      # beacon ships the current position first so the map shows the truck
+      # "online and here" while history backfills behind it.
+      - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-60}
+      - SYNC_BATCH_SIZE=${SYNC_BATCH_SIZE:-200}
+      - SYNC_DRAIN_DELAY_SECONDS=${SYNC_DRAIN_DELAY_SECONDS:-0.5}
+      - SYNC_PRIORITY_BEACON_ENABLED=${SYNC_PRIORITY_BEACON_ENABLED:-true}
 
   imu-calibration:
     build:

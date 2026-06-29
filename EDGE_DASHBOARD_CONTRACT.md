@@ -39,7 +39,7 @@ Five containers run on each Pi via Balena (`docker-compose.yml`):
 
 | Table | Producer | Drained by `sync-service`? | Notes |
 |---|---|---|---|
-| `gps_points` | `gps_collector_worker` (`insert_gps_point`) | ❌ no | Rich payload with `local_sequence`, `payload_json`, `attempt_count`, `sent_at_utc` |
+| `gps_points` | `gps_collector_worker` (`insert_gps_point`) | ✅ yes | Filtered track points (drift-suppressed; dense while moving). Payload is an `edge_telematics_heartbeat` with `source=gps_track`, so it lands in `pi_heartbeat_events` and densifies the on-map track with no cloud change. |
 | `heartbeats` | `heartbeat_builder_worker` + `maintenance_worker` (`insert_heartbeat`) | ❌ no | Full `edge_telematics_heartbeat` and `edge_health` payloads as JSON |
 | `edge_health` | `maintenance_worker` (`record_edge_health`) | ❌ no | Structured columns + payload JSON |
 | `power_readings` | `power-monitor/main.py` | ❌ no | INA219 voltage/current/SoC; read in-process by `get_latest_power_snapshot` |
@@ -102,8 +102,15 @@ into `fleet_status_monitor.pi_*` columns; the Streamlit live map reads
 
 ### 3.3 Sync algorithm
 
-`sync-service` becomes a single drain over the rich tables, ordered by
-`captured_at_utc` ascending, batched up to `SYNC_BATCH_SIZE` (default 50):
+`sync-service` is a single drain over the rich tables, ordered by
+`captured_at_utc` ascending, batched up to `SYNC_BATCH_SIZE` (default 200).
+After an outage it **drains aggressively**: a saturated cycle immediately loops
+to the next batch (`SYNC_DRAIN_DELAY_SECONDS`, default 0.5 s) instead of
+sleeping the full `SYNC_INTERVAL_SECONDS`, so a multi-hour backlog clears in
+minutes. On the first cycle of a backlog it also ships a **priority beacon** —
+the newest heartbeat + edge_health, left queued for the normal chronological
+replay — so the live map shows the truck "online and here" before the history
+backfills behind it.
 
 1. `SELECT id, payload_json FROM heartbeats WHERE sent_at_utc IS NULL ORDER BY captured_at_utc ASC LIMIT N`
 2. `SELECT id, payload_json FROM gps_points WHERE sent_at_utc IS NULL ORDER BY captured_at_utc ASC LIMIT N`
@@ -228,8 +235,14 @@ event types can be dropped from `edge-telematics-api` / `edge-telematics-ingest-
    `local_gps`, `local_power`, `local_ble`. Keep migration logic that
    `DROP`s them on first boot if present (preserve unsent rows by
    re-inserting into `gps_points` with `payload_json` first).
-2. `telematics-edge/main.py::_insert_local_gps_point` — remove. The rich
-   `gps_collector_worker` is already calling `insert_gps_point()`.
+2. `telematics-edge/main.py::gps_collector_worker` — **now** persists track
+   points via `insert_gps_point()` (it previously only bumped counters, so the
+   `gps_points` table was always empty and the on-map track was heartbeat-only
+   at 60 s resolution). Each fix is run through `gps_filter.GpsTrackFilter`,
+   which pins the coordinate while parked (kills the multipath "starburst") and
+   emits a dense track on a distance deadband while moving. Points are shaped as
+   `edge_telematics_heartbeat` with `source=gps_track` so no cloud/schema change
+   is required.
 3. `telematics-edge/main.py::heartbeat_builder_worker` — set
    `heartbeat_payload["idempotency_key"]` explicitly using
    `vehicle_id + captured_at_utc + local_sequence`.
