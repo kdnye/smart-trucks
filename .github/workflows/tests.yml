@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # pytest-aiohttp provides the aiohttp_client fixture used by the
+          # wifi-provisioner portal tests (and pulls in pytest-asyncio).
+          pip install pytest pytest-aiohttp
+          # Service runtime deps the tests import (telematics-edge, sync-service,
+          # ble-sensor, wifi-provisioner).
+          pip install -r telematics-edge/requirements.txt \
+                      -r sync-service/requirements.txt \
+                      -r ble-sensor/requirements.txt \
+                      -r wifi-provisioner/requirements.txt
+      - name: Run tests
+        run: python -m pytest tests/ -q
