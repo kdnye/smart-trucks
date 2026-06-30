@@ -78,13 +78,15 @@ class Config:
     hotspot_retry_probe_seconds: int
     portal_port: int
     dry_run: bool
-    watchdog_enabled: bool
-    watchdog_target_service: str
-    watchdog_db_path: str
-    watchdog_stale_seconds: int
-    watchdog_check_interval_seconds: int
-    watchdog_restart_cooldown_seconds: int
-    watchdog_boot_grace_seconds: int
+    # Watchdog fields carry defaults so direct construction (tests) needn't set
+    # them; load_config always passes explicit values from the environment.
+    watchdog_enabled: bool = True
+    watchdog_target_service: str = "edge"
+    watchdog_db_path: str = "/data/telematics.db"
+    watchdog_stale_seconds: int = 600
+    watchdog_check_interval_seconds: int = 120
+    watchdog_restart_cooldown_seconds: int = 300
+    watchdog_boot_grace_seconds: int = 300
 
 
 def _derive_pin(vehicle_id: str) -> str:
