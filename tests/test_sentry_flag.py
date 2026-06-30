@@ -24,6 +24,9 @@ def test_flag_path_precedence():
         # then env
         os.environ["SENTRY_SUSPEND_FLAG_PATH"] = "/env/path"
         assert sf.flag_path() == "/env/path"
+        # a Balena-passed unexpanded ${VAR:-default} literal recovers the default
+        os.environ["SENTRY_SUSPEND_FLAG_PATH"] = "${SENTRY_SUSPEND_FLAG_PATH:-/data/sentry_suspend}"
+        assert sf.flag_path() == "/data/sentry_suspend"
         # then default
         os.environ.pop("SENTRY_SUSPEND_FLAG_PATH", None)
         assert sf.flag_path() == sf.DEFAULT_FLAG_PATH

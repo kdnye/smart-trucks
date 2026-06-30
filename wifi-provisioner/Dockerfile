@@ -1,5 +1,12 @@
 FROM balenalib/raspberrypi3-python:3.11-run
 
+# Route D-Bus to the host OS so nmcli/libnm can reach the host NetworkManager.
+# Without this, nmcli fails with "Could not create NMClient object: Could not
+# connect: No such file or directory" and the service can never raise the setup
+# AP or manage WiFi (the io.balena.features.dbus label mounts the socket here but
+# does not set this address). Mirrors edge/ble-sensor.
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/host/run/dbus/system_bus_socket
+
 # network-manager provides the nmcli binary used to drive WiFi profiles, scans,
 # and AP mode on the host. iproute2 is handy for diagnostics in `balena ssh`.
 RUN apt-get update && apt-get install -yq \

@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 import os
 
+from shared.env import sanitize_env_value
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_FLAG_PATH = "/data/sentry_suspend"
@@ -29,8 +31,10 @@ def flag_path(override: str | None = None) -> str:
     """Resolve the sentinel path: explicit arg, then env, then default.
 
     All three co-processes call this with no arg so they agree on one path
-    (they share the container's environment and the /data volume)."""
-    return override or os.getenv("SENTRY_SUSPEND_FLAG_PATH") or DEFAULT_FLAG_PATH
+    (they share the container's environment and the /data volume). Routed through
+    sanitize_env_value so a Balena-passed literal ``${SENTRY_SUSPEND_FLAG_PATH:-
+    /data/sentry_suspend}`` still resolves to its intended default."""
+    return override or sanitize_env_value(os.getenv("SENTRY_SUSPEND_FLAG_PATH")) or DEFAULT_FLAG_PATH
 
 
 def set_suspended(path: str) -> None:
