@@ -981,8 +981,9 @@ async def run() -> None:
             "DEVICE_ROLE=warehouse detected. GPS and power-monitor dependencies disabled; "
             "heartbeats will use configured warehouse coordinates."
         )
-    # TCP addresses (e.g. tcp://gps-multiplexer:2947) are served by the
-    # gps-multiplexer container and must not be probed as serial ports.
+    # GPS is normally read directly from the serial UART, but NMEAReader still
+    # supports a tcp:// gpsd-style source; such URLs must not be probed as serial
+    # devices, so filter them out of the hardware serial probe.
     serial_probe_candidates = tuple(
         c for c in config.gps_serial_candidates if not c.startswith("tcp://")
     )

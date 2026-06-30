@@ -8,11 +8,14 @@ See [FSI_ECOSYSTEM.md](./FSI_ECOSYSTEM.md) for the full app portfolio and how th
 
 Smart Trucks is a containerized edge telematics stack deployed on Raspberry Pi hardware (Pi Zero 2 W / Pi 3B) via Balena. It collects GPS, BLE temperature/humidity, and power management data from vehicles and syncs to the shared FSI PostgreSQL database consumed by `kdnye/motive-dashboard`.
 
-Four decoupled services are active in the base-model stack:
-- **gps-multiplexer**: Reads GPS from hardware serial and exposes it over TCP (port 2947)
-- **telematics-edge**: Reads GPS via TCP + IMU via I2C; manages SQLite WAL and cloud sync
-- **ble-sensor**: Govee BLE temperature/humidity scanning (battery-saver disabled — full scan cadence, since there is no active `power_readings` writer)
-- **sync-service**: Drains the SQLite store-and-forward queues and POSTs to the cloud ingest endpoint
+Two containers are active in the base-model stack:
+- **edge**: a single data-plane container running three co-processes (supervised by `edge/start.sh`, each restarted on exit):
+  - *telematics-edge*: reads GPS directly from the serial UART (`/dev/serial0`) + IMU via I2C; manages SQLite WAL and builds heartbeat/edge-health payloads
+  - *ble-sensor*: Govee BLE temperature/humidity scanning (battery-saver disabled — full scan cadence, since there is no active `power_readings` writer)
+  - *sync-service*: drains the SQLite store-and-forward queues and POSTs to the cloud ingest endpoint
+- **wifi-provisioner**: sole owner of `wlan0`/NetworkManager (saved-network reconnect + roaming and the setup-AP captive portal) and the cross-service watchdog that restarts the `edge` service via the Balena Supervisor API when its heartbeats go stale; also serves `/healthz`.
+
+(The earlier per-service `gps-multiplexer`, `ble-sensor`, `sync-service`, and `health` containers were consolidated into these two.)
 
 **Parked (not active in the current base-model compose):**
 - **power-monitor**: UPS HAT / power-board battery SOC monitoring via I2C → `power_readings`. Removed from the active stack; see `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later". With it removed, `UPS_*`/`POWER_*` variables are not wired and BLE battery-saver is disabled.
@@ -22,7 +25,7 @@ Four decoupled services are active in the base-model stack:
 - **Runtime:** Python 3.10+, Docker containers on Balena
 - **Edge persistence:** SQLite WAL (offline store-and-forward durability)
 - **Cloud sync:** HTTPS POST to shared Cloud SQL PostgreSQL (via sync worker with retry/backoff)
-- **Hardware I/O:** UART serial (GPS via gps-multiplexer), I2C (IMU, INA219), BLE scan (bleak)
+- **Hardware I/O:** UART serial (GPS read directly from `/dev/serial0`), I2C (IMU, INA219), BLE scan (bleak over the host BlueZ/D-Bus)
 - **OTA updates:** Balena binary delta over cellular/Wi-Fi
 - **No web framework:** This is not a Flask app. Do not add Flask or any HTTP server.
 
@@ -30,9 +33,9 @@ Four decoupled services are active in the base-model stack:
 
 ### Decoupled Services
 
-- Each container (gps-multiplexer, telematics-edge, ble-sensor, sync-service) is independent. Do not create cross-container function calls or shared mutable state.
-- Use Docker Compose environment variable contracts for inter-service configuration.
-- The `gps-multiplexer` container exposes the GPS device over TCP (`tcp://gps-multiplexer:2947`) so `telematics-edge` reads GPS without requiring direct serial access.
+- The `edge` co-processes (telematics-edge, ble-sensor, sync-service) and the `wifi-provisioner` are independent units. They communicate only through the shared SQLite DB (`/data/telematics.db`) — do not create direct cross-process function calls or shared mutable in-memory state.
+- Use Docker Compose environment variable contracts for configuration.
+- `telematics-edge` reads the GPS serial device (`/dev/serial0`) directly. (The former `gps-multiplexer` TCP broker was removed once `telematics-edge` became the only GPS consumer.)
 
 ### Offline Durability
 
@@ -42,7 +45,7 @@ Four decoupled services are active in the base-model stack:
 
 ### Hardware I/O Rules
 
-- **GPS:** Primary device path configured via `GPS_SERIAL_DEVICE` (e.g. `/dev/serial0`); additional probe candidates in `GPS_SERIAL_CANDIDATES`. The `telematics-edge` container connects via `tcp://gps-multiplexer:2947`. Sample interval: `GPS_SAMPLE_INTERVAL_SECONDS` (default 5s). Baud rate: `GPS_BAUD_RATE` (default 9600). Parsed by `NMEAReader`.
+- **GPS:** Primary device path configured via `GPS_SERIAL_DEVICE` (default `/dev/serial0`); additional probe candidates in `GPS_SERIAL_CANDIDATES`. `telematics-edge` opens the serial device directly and parses it with `NMEAReader` (the `edge` container is host-networked and maps the UART devices). Sample interval: `GPS_SAMPLE_INTERVAL_SECONDS` (default 5s). Baud rate: `GPS_BAUD_RATE` (default 9600).
 - **IMU (I2C):** Bus number via `IMU_I2C_BUS` (default 1). Expected I2C addresses via `IMU_EXPECTED_ADDRESSES`. Whether IMU must be present to start: `IMU_REQUIRED` (default `true`). Harsh-event thresholds are managed internally by `IMUReader` — there is no external threshold environment variable.
 - **BLE (`ble-sensor`):** Scan duration is `SCAN_DURATION_SECONDS` (default 20s). Interval between scan cycles is `POLL_INTERVAL` (default 60s). MAC anonymization: `ANONYMIZE_MAC` (default `false`).
 - **Power (parked):** The `power-monitor` service (INA219 / power board → `power_readings`) is **not active** in the current base-model stack, so its `UPS_*`/`POWER_*` variables are not wired. `telematics-edge/db.py::init_db()` still creates an empty `power_readings` table for forward compatibility, and readers fall back to full cadence when it has no rows. Restore details: `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later".
