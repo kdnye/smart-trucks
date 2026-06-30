@@ -159,6 +159,33 @@ def test_small_queue_drains_without_more_pending():
         assert _pending(db_path, "heartbeats") == 0
 
 
+def test_batch_limit_uses_smaller_size_for_ble_scans():
+    sync_main.SYNC_BATCH_SIZE = 100
+    sync_main.SYNC_BLE_BATCH_SIZE = 25
+    assert sync_main._batch_limit("ble_scans") == 25
+    assert sync_main._batch_limit("heartbeats") == 100
+    assert sync_main._batch_limit("gps_points") == 100
+
+
+def test_ble_scans_drain_bounded_by_ble_batch_size():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = _make_db(tmp)
+        _configure(db_path, batch_size=100)  # large so ble batch is the limiter
+        sync_main.SYNC_BLE_BATCH_SIZE = 5
+        _insert(db_path, "ble_scans", _gps_payloads(12))
+
+        sync_main._send_events = lambda events: _FakeResponse(200)
+
+        outcome = asyncio.run(sync_main.sync_cycle())
+
+        assert outcome.ok is True
+        # Only the smaller ble batch drains per cycle; the rest stays pending and
+        # more_pending signals the caller to keep draining.
+        assert outcome.sent == 5
+        assert outcome.more_pending is True
+        assert _pending(db_path, "ble_scans") == 7
+
+
 def test_priority_beacon_sends_newest_heartbeat_without_marking_sent():
     with tempfile.TemporaryDirectory() as tmp:
         db_path = _make_db(tmp)

@@ -13,6 +13,7 @@ from typing import Any
 import uvloop
 from bleak import BleakScanner
 
+from shared import sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
 
 
@@ -610,9 +611,8 @@ def _init_shared_queue_store(db_path: str) -> None:
     upload it alongside heartbeats/gps_points/edge_health. ble-sensor may start
     before telematics-edge, so it creates the table itself (idempotent).
     """
-    with _sqlite3.connect(db_path, timeout=30.0) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+    conn = sqlite_util.connect(db_path)
+    try:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ble_scans (
@@ -630,6 +630,9 @@ def _init_shared_queue_store(db_path: str) -> None:
             ON ble_scans(sent_at_utc, captured_at_utc);
             """
         )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _utc_now_iso() -> str:
@@ -680,17 +683,23 @@ def _sync_tracked_asset_registry(config: Config) -> None:
     if not tracked_rows:
         return
 
-    with _sqlite3.connect(config.local_db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.executemany(
-            """
-            INSERT INTO tracked_asset_registry (tracked_mac_normalized, label, active)
-            VALUES (?, ?, ?)
-            ON CONFLICT(tracked_mac_normalized)
-            DO UPDATE SET label = excluded.label, active = excluded.active
-            """,
-            tracked_rows,
-        )
+    def _op() -> None:
+        conn = sqlite_util.connect(config.local_db_path, isolation_level="IMMEDIATE")
+        try:
+            conn.executemany(
+                """
+                INSERT INTO tracked_asset_registry (tracked_mac_normalized, label, active)
+                VALUES (?, ?, ?)
+                ON CONFLICT(tracked_mac_normalized)
+                DO UPDATE SET label = excluded.label, active = excluded.active
+                """,
+                tracked_rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    sqlite_util.run_with_retry(_op, operation_name="sync_tracked_asset_registry")
 
 
 def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
@@ -729,17 +738,23 @@ def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
     if not rows:
         return
 
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.executemany(
-            """
-            INSERT INTO ble_device_observations (
-                captured_at_utc, pi_id, vehicle_id, tracked_mac_normalized, rssi,
-                latitude, longitude, gps_timestamp, gps_age_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
+    def _op() -> None:
+        conn = sqlite_util.connect(db_path, isolation_level="IMMEDIATE")
+        try:
+            conn.executemany(
+                """
+                INSERT INTO ble_device_observations (
+                    captured_at_utc, pi_id, vehicle_id, tracked_mac_normalized, rssi,
+                    latitude, longitude, gps_timestamp, gps_age_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    sqlite_util.run_with_retry(_op, operation_name="record_scan_observations")
 
 
 def _enqueue_ble_scan(db_path: str, payload: dict[str, Any]) -> None:
@@ -749,13 +764,30 @@ def _enqueue_ble_scan(db_path: str, payload: dict[str, Any]) -> None:
     store-and-forward columns the uploader expects (sent_at_utc / attempt_count).
     """
     captured_at_utc = str(payload.get("captured_at_utc") or _utc_now_iso())
-    # WAL is already enabled persistently by _init_shared_queue_store; no need to
-    # re-issue the pragma on every write.
-    with _sqlite3.connect(db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
-        conn.execute(
-            "INSERT INTO ble_scans (captured_at_utc, payload_json) VALUES (?, ?)",
-            (captured_at_utc, json.dumps(payload)),
-        )
+
+    def _op() -> None:
+        conn = sqlite_util.connect(db_path, isolation_level="IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO ble_scans (captured_at_utc, payload_json) VALUES (?, ?)",
+                (captured_at_utc, json.dumps(payload)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Retry on lock so a transient writer collision doesn't drop a scan
+    # ("Scan loop error: database is locked"). Single INSERT → safe to re-run.
+    sqlite_util.run_with_retry(_op, operation_name="enqueue_ble_scan")
+
+
+def _persist_scan_to_db(config: "Config", payload: dict[str, Any]) -> None:
+    """Run all per-scan SQLite writes. Call via ``asyncio.to_thread`` so the 30s
+    busy-timeout wait + retries never block the BLE scan event loop."""
+    _record_scan_observations(config.local_db_path, payload)
+    _enqueue_ble_scan(config.telematics_db_path, payload)
+    _sync_tracked_asset_registry(config)
+    _resolve_tracked_asset_positions(config)
 
 
 def _score_candidate(
@@ -1344,10 +1376,10 @@ async def run() -> None:
 
                 raise
 
-            _record_scan_observations(config.local_db_path, payload)
-            _enqueue_ble_scan(config.telematics_db_path, payload)
-            _sync_tracked_asset_registry(config)
-            _resolve_tracked_asset_positions(config)
+            # Run the SQLite writes off the event loop: under contention each can
+            # wait up to the busy-timeout (+retries), which must not freeze the
+            # scan loop / Bluetooth radio handling.
+            await asyncio.to_thread(_persist_scan_to_db, config, payload)
             print(
                 f"Recorded BLE scan (sensor_count={payload['sensor_count']}) "
                 f"for captured_at_utc={payload['captured_at_utc']}; "

@@ -129,46 +129,20 @@ services:
       # beacon ships the current position first so the map shows the truck
       # "online and here" while history backfills behind it.
       - SYNC_INTERVAL_SECONDS=${SYNC_INTERVAL_SECONDS:-60}
-      - SYNC_BATCH_SIZE=${SYNC_BATCH_SIZE:-200}
+      # Bounded batches keep peak memory low while draining a backlog on the
+      # 512MB Pi; ble_scans use a smaller batch since their payloads are larger.
+      - SYNC_BATCH_SIZE=${SYNC_BATCH_SIZE:-100}
+      - SYNC_BLE_BATCH_SIZE=${SYNC_BLE_BATCH_SIZE:-50}
       - SYNC_DRAIN_DELAY_SECONDS=${SYNC_DRAIN_DELAY_SECONDS:-0.5}
       - SYNC_PRIORITY_BEACON_ENABLED=${SYNC_PRIORITY_BEACON_ENABLED:-true}
 
-  imu-calibration:
-    build:
-      context: .
-      dockerfile: imu-calibration/Dockerfile
-    privileged: true
-    restart: "no"
-    devices:
-      - "/dev/i2c-1:/dev/i2c-1"
-    volumes:
-      - telematics_data:/data
-    ports:
-      - "8085:8080"
-    environment:
-      - UDEV=1
-      - VEHICLE_ID=${VEHICLE_ID}
-      - ENABLE_CALIBRATION=false
-      - IMU_I2C_BUS
-      - IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS
-
-  ble-calibration:
-    build:
-      context: .
-      dockerfile: ble-calibration/Dockerfile
-    network_mode: host
-    privileged: true
-    restart: "no"
-    labels:
-      io.balena.features.dbus: '1'
-    volumes:
-      - telematics_data:/data
-    environment:
-      - UDEV=1
-      - VEHICLE_ID=${VEHICLE_ID}
-      - ENABLE_CALIBRATION=false
-      - BLE_CALIBRATION_SCAN_DURATION_SECONDS
-      - BLE_CALIBRATION_REFRESH_SECONDS
+  # imu-calibration / ble-calibration are intentionally NOT in the base release.
+  # They are dormant one-shot tools (exit immediately when ENABLE_CALIBRATION is
+  # false), and a `restart: "no"` exited service makes the Balena supervisor
+  # re-reconcile it every ~15 min — wasted I/O + memory churn on the 512MB Pi.
+  # The imu-calibration/ and ble-calibration/ directories remain in the repo; to
+  # run a calibration session, re-add the service here temporarily and set
+  # ENABLE_CALIBRATION=true (see docs/EDGE_REBUILD_RECORD.md).
 
   health:
     build: ./health
@@ -204,4 +178,3 @@ services:
 
 volumes:
   shared-sqlite:
-  telematics_data:

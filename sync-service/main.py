@@ -2,17 +2,21 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
 import requests
 
+from shared import sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
 SYNC_INTERVAL_SECONDS = read_int_env("SYNC_INTERVAL_SECONDS", 60)
-SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 200, minimum=1)
+SYNC_BATCH_SIZE = read_int_env("SYNC_BATCH_SIZE", 100, minimum=1)
+# BLE scan payloads are far larger (tens of sensors each) than heartbeats/gps, so
+# drain them in smaller chunks to bound peak memory while clearing a backlog on
+# the 512 MB Pi (the likely overnight OOM trigger).
+SYNC_BLE_BATCH_SIZE = read_int_env("SYNC_BLE_BATCH_SIZE", 50, minimum=1)
 # Delay between back-to-back drain batches while a backlog is clearing. Small so
 # a multi-hour offline backlog drains in minutes, not hours, but non-zero so we
 # don't busy-spin the CPU or hammer the ingest endpoint.
@@ -26,6 +30,11 @@ PRIORITY_BEACON_ENABLED = read_bool_env("SYNC_PRIORITY_BEACON_ENABLED", True)
 # Tables drained, in the order their rows are loaded. The combined batch is
 # re-sorted by captured_at so the cloud ingests chronologically regardless.
 SYNC_TABLES = ("heartbeats", "gps_points", "edge_health", "ble_scans")
+
+
+def _batch_limit(table: str) -> int:
+    """Per-table drain size: smaller for the large ble_scans payloads."""
+    return SYNC_BLE_BATCH_SIZE if table == "ble_scans" else SYNC_BATCH_SIZE
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -44,7 +53,7 @@ class SyncOutcome:
 
 
 def _load_pending_rows(table: str, limit: int) -> list[tuple[int, str, dict[str, Any]]]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite_util.connect(DB_PATH)
     try:
         rows = conn.execute(
             f"""
@@ -63,7 +72,7 @@ def _load_pending_rows(table: str, limit: int) -> list[tuple[int, str, dict[str,
 
 def _load_latest_payloads(table: str, limit: int = 1) -> list[dict[str, Any]]:
     """Return the newest unsent payloads for a table (for the priority beacon)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite_util.connect(DB_PATH)
     try:
         rows = conn.execute(
             f"""
@@ -84,30 +93,41 @@ def _mark_rows_sent(table: str, row_ids: list[int]) -> None:
     if not row_ids:
         return
     placeholders = ",".join("?" for _ in row_ids)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            f"UPDATE {table} SET sent_at_utc = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
-            row_ids,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+
+    def _op() -> None:
+        conn = sqlite_util.connect(DB_PATH)
+        try:
+            conn.execute(
+                f"UPDATE {table} SET sent_at_utc = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
+                row_ids,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Retry on lock so a transient writer collision doesn't abort the whole
+    # sync_cycle and re-upload the batch (this is the exact failure that wedged
+    # the pipeline). Single UPDATE in one transaction → safe to re-run.
+    sqlite_util.run_with_retry(_op, operation_name=f"mark_rows_sent[{table}]")
 
 
 def _increment_attempts(table: str, row_ids: list[int]) -> None:
     if not row_ids:
         return
     placeholders = ",".join("?" for _ in row_ids)
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute(
-            f"UPDATE {table} SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",
-            row_ids,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+
+    def _op() -> None:
+        conn = sqlite_util.connect(DB_PATH)
+        try:
+            conn.execute(
+                f"UPDATE {table} SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",
+                row_ids,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    sqlite_util.run_with_retry(_op, operation_name=f"increment_attempts[{table}]")
 
 
 async def _apply_all(op, ids_by_table: dict[str, list[int]]) -> None:
@@ -164,12 +184,12 @@ async def _send_priority_beacon() -> None:
 
 async def sync_cycle() -> SyncOutcome:
     pending = {
-        table: await asyncio.to_thread(_load_pending_rows, table, SYNC_BATCH_SIZE)
+        table: await asyncio.to_thread(_load_pending_rows, table, _batch_limit(table))
         for table in SYNC_TABLES
     }
     # A saturated table almost certainly has more rows waiting — signal the
     # caller to drain again immediately instead of sleeping the full interval.
-    more_pending = any(len(rows) >= SYNC_BATCH_SIZE for rows in pending.values())
+    more_pending = any(len(rows) >= _batch_limit(table) for table, rows in pending.items())
 
     all_rows: list[tuple[str, int, str, dict[str, Any]]] = []
     for table_name, rows in pending.items():
@@ -249,11 +269,12 @@ async def run() -> None:
     _validate_startup_config()
     logger.info(
         "Starting sync-service loop: interval=%ss drain_delay=%ss db=%s batch_size=%s "
-        "priority_beacon=%s webhook_url=%s key=%s",
+        "ble_batch_size=%s priority_beacon=%s webhook_url=%s key=%s",
         SYNC_INTERVAL_SECONDS,
         SYNC_DRAIN_DELAY_SECONDS,
         DB_PATH,
         SYNC_BATCH_SIZE,
+        SYNC_BLE_BATCH_SIZE,
         PRIORITY_BEACON_ENABLED,
         "set" if os.environ.get("WEBHOOK_URL") else "UNSET",
         "set" if os.environ.get("EDGE_INGEST_KEY") else "UNSET",

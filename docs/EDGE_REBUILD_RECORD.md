@@ -25,8 +25,7 @@
 | `telematics-edge` | active | Reads GPS (TCP) + IMU; writes GPS/heartbeat/health to shared SQLite. |
 | `ble-sensor` | active | Scans BLE; records observations locally **and enqueues `ble_sensor_scan` for upload**. |
 | `sync-service` | active | Store-and-forward uploader: drains shared-DB queues → cloud ingest. |
-| `imu-calibration` | dormant | `restart: no`, `ENABLE_CALIBRATION=false`; one-shot calibration tool. |
-| `ble-calibration` | dormant | `restart: no`, `ENABLE_CALIBRATION=false`; one-shot calibration tool. |
+| `wifi-provisioner` | active | WiFi failover + captive-portal provisioning. |
 | `health` | active | Lightweight gunicorn health endpoint. |
 
 ## 3. Removed / deferred pieces
@@ -36,6 +35,7 @@
 | **power-monitor** | removed | INA219/UPS battery state-of-charge, brownout-safe shutdown, and BLE battery-saver input. | Simplify base model; was running in dummy mode; reduce RAM/CPU on the Pi Zero 2 W (512 MB). | Paste the compose block from **§5** back into `docker-compose.yml`; set `BLE_BATTERY_SAVER_ENABLED=true` on `ble-sensor`. The `power_readings` table (DDL in **§4.3**) is recreated by the service on boot. Consumers already degrade gracefully, so no other code change is needed. |
 | **IMU / 10-DOF pipeline** | parked | Harsh-event detection + in-motion detection (requires calibration). | Base-model first; needs calibration work before it's useful. | `telematics-edge` still reads the IMU and emits `imu_metrics` in each heartbeat — it lands **only** as raw JSON in `iot_raw_payloads` (Raw Telemetry page). To surface it: add a structured IMU table + extraction in `motive-dashboard/edge-telematics-worker/main.py` + a dashboard view. |
 | **EDGE_INGEST_KEY rename** | done | Decouple the Pi's ingest auth secret from the misleading `MOTIVE_API_KEY` name. | Cutover finished after `EDGE_INGEST_KEY` was set on every Balena device and on the cloud ingest function; `sync-service` now reads `EDGE_INGEST_KEY` only and `docker-compose.yml` no longer passes `MOTIVE_API_KEY`. | n/a — see commit history if a revert is needed. |
+| **imu-calibration / ble-calibration** | removed | One-shot IMU/BLE calibration tools (dormant when `ENABLE_CALIBRATION=false`). | A `restart: "no"` service that exits immediately makes the Balena supervisor re-reconcile it ~every 15 min (install→start→exit→kill), wasting I/O + RAM on the 512MB Pi. | Paste the block(s) from **§5.1** back under `services:`, re-declare the `telematics_data:` volume (or mount `shared-sqlite`), set `ENABLE_CALIBRATION=true` for the device/session, deploy, run the calibration, then remove again. The `imu-calibration/` and `ble-calibration/` dirs remain in the repo. |
 
 > Note: `power_monitor_ok=false` and `power_metrics.status="absent"` in heartbeats are
 > expected after power-monitor removal (graceful degradation in `telematics-edge` and
@@ -192,9 +192,9 @@ Consumers that read `power_readings` (read-only, already degrade to `None` when 
 `ble-sensor/main.py` `_read_latest_power_from_telematics_db()` (battery-saver cadence).
 
 ### 4.4 Other services
-`gps-multiplexer`, `health`, `imu-calibration`, `ble-calibration` keep **no persistent
-SQLite schema** of their own (calibration containers mount `telematics_data:/data` and are
-dormant by default).
+`gps-multiplexer`, `health`, `wifi-provisioner` keep **no persistent SQLite schema** of
+their own. The `imu-calibration` / `ble-calibration` tools (removed from the base release,
+see §3 / §5.1) mounted `telematics_data:/data` and were dormant by default.
 
 ## 5. REMOVED: power-monitor `docker-compose.yml` service block
 
@@ -235,6 +235,52 @@ Paste back verbatim under `services:` to restore. (Also re-add `power-monitor` t
 
 When restored, flip `ble-sensor`'s `BLE_BATTERY_SAVER_ENABLED` back to `true` to re-enable
 battery-aware scan cadence.
+
+## 5.1 REMOVED: calibration `docker-compose.yml` service blocks
+
+Removed from the base release to stop ~15-min supervisor reconciliation churn of these
+exit-immediately containers. Paste back under `services:` for a calibration session, set
+`ENABLE_CALIBRATION=true`, and re-add `telematics_data:` under the top-level `volumes:` (or
+switch the mount to `shared-sqlite:/data`). Remove again when done.
+
+```yaml
+  imu-calibration:
+    build:
+      context: .
+      dockerfile: imu-calibration/Dockerfile
+    privileged: true
+    restart: "no"
+    devices:
+      - "/dev/i2c-1:/dev/i2c-1"
+    volumes:
+      - telematics_data:/data
+    ports:
+      - "8085:8080"
+    environment:
+      - UDEV=1
+      - VEHICLE_ID=${VEHICLE_ID}
+      - ENABLE_CALIBRATION=false
+      - IMU_I2C_BUS
+      - IMU_CALIBRATION_SAMPLE_INTERVAL_SECONDS
+
+  ble-calibration:
+    build:
+      context: .
+      dockerfile: ble-calibration/Dockerfile
+    network_mode: host
+    privileged: true
+    restart: "no"
+    labels:
+      io.balena.features.dbus: '1'
+    volumes:
+      - telematics_data:/data
+    environment:
+      - UDEV=1
+      - VEHICLE_ID=${VEHICLE_ID}
+      - ENABLE_CALIBRATION=false
+      - BLE_CALIBRATION_SCAN_DURATION_SECONDS
+      - BLE_CALIBRATION_REFRESH_SECONDS
+```
 
 ## 6. Cloud table reference map
 Source: `motive-dashboard/edge-telematics-worker/main.py` + dashboard pages. Each accepted
