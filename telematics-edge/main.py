@@ -4,7 +4,6 @@ import logging
 import os
 import shutil
 import socket
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -249,31 +248,16 @@ def is_network_connected() -> bool:
         return False
 
 
-def _run_network_recovery_command(command: list[str]) -> bool:
-    try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=20)
-        if result.returncode == 0:
-            return True
-        logger.warning(
-            "Network watchdog command failed: cmd=%s returncode=%s stderr=%s",
-            command,
-            result.returncode,
-            (result.stderr or "").strip(),
-        )
-        return False
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.warning("Network watchdog command error: cmd=%s error=%s", command, exc)
-        return False
-
-
 async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
     if not config.network_watchdog_enabled:
         logger.info("Network watchdog disabled by configuration.")
         return
-    if not shutil.which("nmcli"):
-        logger.warning("Network watchdog enabled but nmcli is unavailable in container; skipping recovery actions.")
-        return
 
+    # Passive monitor only — this worker issues no nmcli/radio commands (wlan0 /
+    # NetworkManager recovery is owned by the wifi-provisioner). It just observes
+    # connectivity and drops to parked_mode to save power when the truck is parked
+    # and offline, so it must run regardless of whether network-manager / nmcli is
+    # present in the image (the edge container deliberately omits it).
     consecutive_failures = 0
     logger.info(
         "Network watchdog enabled: check_interval=%ss max_failures=%s",
@@ -304,31 +288,34 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
             await asyncio.sleep(config.network_watchdog_check_interval_seconds)
             continue
 
-        # Already in parked mode — skip the radio-cycle recovery and let parked_scan_worker
-        # handle periodic WiFi re-checks.
+        # Already in parked mode — let parked_scan_worker handle periodic WiFi
+        # re-checks.
         if state.parked_mode:
             consecutive_failures = 0
             await asyncio.sleep(config.network_watchdog_check_interval_seconds)
             continue
 
-        logger.error("Network watchdog triggering Wi-Fi recovery sequence via NetworkManager.")
-        _run_network_recovery_command(["nmcli", "device", "wifi", "rescan"])
-        await asyncio.sleep(5)
-        _run_network_recovery_command(["nmcli", "radio", "wifi", "off"])
-        await asyncio.sleep(2)
-        _run_network_recovery_command(["nmcli", "radio", "wifi", "on"])
-        if config.network_watchdog_connection_name:
-            _run_network_recovery_command(["nmcli", "connection", "up", config.network_watchdog_connection_name])
-
+        # wlan0 / NetworkManager recovery is owned SOLELY by the wifi-provisioner
+        # service (it runs `nmcli` reconnect of saved profiles and raises the
+        # setup-AP captive portal). telematics-edge must never drive the radio
+        # here: cycling `nmcli radio wifi off/on` on the shared wlan0 would tear
+        # down the provisioner's AP the moment it comes up. This worker only
+        # OBSERVES connectivity and falls back to parked mode to save power; the
+        # wifi-provisioner restores the link.
+        logger.warning(
+            "Network watchdog: WiFi unreachable after %s checks — recovery delegated "
+            "to the wifi-provisioner service.",
+            consecutive_failures,
+        )
         consecutive_failures = 0
         if not is_network_connected() and not state.parked_mode:
             if _truck_is_active(state):
                 logger.info(
-                    "Network watchdog: WiFi recovery failed but truck is active — "
+                    "Network watchdog: WiFi down but truck is active — "
                     "staying in active mode, data will queue until WiFi returns."
                 )
             else:
-                logger.warning("Network watchdog: WiFi recovery failed and truck inactive — entering parked mode.")
+                logger.warning("Network watchdog: WiFi down and truck inactive — entering parked mode.")
                 state.parked_mode = True
         await asyncio.sleep(config.network_watchdog_recovery_pause_seconds)
 
