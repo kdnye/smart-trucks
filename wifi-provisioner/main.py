@@ -29,6 +29,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from shared.env import sanitize_env_value as _sanitize_env_value  # noqa: E402
 
 import nm  # noqa: E402  (local module)
+from edge_watchdog import watchdog_worker  # noqa: E402  (local module)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +78,15 @@ class Config:
     hotspot_retry_probe_seconds: int
     portal_port: int
     dry_run: bool
+    # Watchdog fields carry defaults so direct construction (tests) needn't set
+    # them; load_config always passes explicit values from the environment.
+    watchdog_enabled: bool = True
+    watchdog_target_service: str = "edge"
+    watchdog_db_path: str = "/data/telematics.db"
+    watchdog_stale_seconds: int = 600
+    watchdog_check_interval_seconds: int = 120
+    watchdog_restart_cooldown_seconds: int = 300
+    watchdog_boot_grace_seconds: int = 300
 
 
 def _derive_pin(vehicle_id: str) -> str:
@@ -104,6 +114,13 @@ def load_config() -> Config:
         ),
         portal_port=_int_env("WIFI_PROVISIONER_PORTAL_PORT", 80, minimum=1),
         dry_run=_bool_env("WIFI_PROVISIONER_DRY_RUN", False),
+        watchdog_enabled=_bool_env("WATCHDOG_ENABLED", True),
+        watchdog_target_service=_env("WATCHDOG_TARGET_SERVICE", "edge") or "edge",
+        watchdog_db_path=_env("WATCHDOG_DB_PATH", "/data/telematics.db") or "/data/telematics.db",
+        watchdog_stale_seconds=_int_env("WATCHDOG_STALE_SECONDS", 600, minimum=60),
+        watchdog_check_interval_seconds=_int_env("WATCHDOG_CHECK_INTERVAL_SECONDS", 120, minimum=10),
+        watchdog_restart_cooldown_seconds=_int_env("WATCHDOG_RESTART_COOLDOWN_SECONDS", 300, minimum=0),
+        watchdog_boot_grace_seconds=_int_env("WATCHDOG_BOOT_GRACE_SECONDS", 300, minimum=0),
     )
 
 
@@ -118,6 +135,10 @@ class State:
     hotspot_active: bool = False
     last_save_message: str | None = None
     rejoin_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Watchdog observability (surfaced on /healthz).
+    watchdog_last_heartbeat_age: float | None = None
+    watchdog_last_restart_monotonic: float | None = None
+    watchdog_restart_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +464,13 @@ def build_portal_app(config: Config, state: State) -> web.Application:
             "hotspot_active": state.hotspot_active,
             "last_up_age_seconds": int(time.monotonic() - state.last_up_monotonic),
             "setup_ssid": config.setup_ssid,
+            "watchdog_enabled": config.watchdog_enabled,
+            "edge_heartbeat_age_seconds": (
+                int(state.watchdog_last_heartbeat_age)
+                if state.watchdog_last_heartbeat_age is not None
+                else None
+            ),
+            "edge_restart_count": state.watchdog_restart_count,
         }
         return web.json_response(payload)
 
@@ -492,7 +520,10 @@ async def run() -> None:
         logger.error("Failed to bind portal on :%s — %s", config.portal_port, exc)
         raise
 
-    await supervisor(config, state)
+    await asyncio.gather(
+        supervisor(config, state),
+        watchdog_worker(config, state),
+    )
 
 
 def main() -> None:
