@@ -252,14 +252,12 @@ async def network_watchdog_worker(config: Config, state: RuntimeState) -> None:
     if not config.network_watchdog_enabled:
         logger.info("Network watchdog disabled by configuration.")
         return
-    if not shutil.which("nmcli"):
-        # No nmcli in this image (e.g. the edge container deliberately omits
-        # network-manager — the wifi-provisioner owns wlan0). Connectivity is
-        # already tracked by maintenance_worker, so the passive watchdog adds
-        # nothing here; skip it.
-        logger.info("Network watchdog: nmcli unavailable; connectivity handled by the maintenance worker.")
-        return
 
+    # Passive monitor only — this worker issues no nmcli/radio commands (wlan0 /
+    # NetworkManager recovery is owned by the wifi-provisioner). It just observes
+    # connectivity and drops to parked_mode to save power when the truck is parked
+    # and offline, so it must run regardless of whether network-manager / nmcli is
+    # present in the image (the edge container deliberately omits it).
     consecutive_failures = 0
     logger.info(
         "Network watchdog enabled: check_interval=%ss max_failures=%s",
