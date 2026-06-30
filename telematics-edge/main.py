@@ -875,6 +875,9 @@ async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonito
             enabled=config.sentry_mode_enabled,
             truck_active=_truck_is_active(state),
             is_charging=is_charging,
+            # WiFi connectivity is a wake signal: a parked truck that regains WiFi
+            # resumes (and flushes uploads) rather than staying suspended.
+            wifi_connected=state.wifi_connected,
             idle_seconds=idle_seconds,
             idle_timeout=config.sentry_idle_timeout_seconds,
         )

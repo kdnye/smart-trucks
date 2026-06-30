@@ -30,19 +30,22 @@ def should_suspend(
     enabled: bool,
     truck_active: bool,
     is_charging: bool,
+    wifi_connected: bool,
     idle_seconds: float,
     idle_timeout: float,
 ) -> bool:
     """Return True when the device should drop into Sentry sleep.
 
     Pure function (no I/O, no shared state) so the policy is trivially testable.
-    Note it never reads ``parked_mode``: idleness is computed directly, so a
-    WiFi-loss park (which also sets ``parked_mode``) does NOT trigger suspension —
-    only genuine idle-timeout does.
+    Sleep requires idle past the timeout AND no wake signal — motion, charging,
+    or WiFi connectivity. Including WiFi means a parked truck that regains WiFi
+    wakes (and resumes uploads); it only sleeps when genuinely idle AND offline.
+    Note it never reads ``parked_mode`` directly (it's transient); idleness is the
+    caller-supplied ``idle_seconds``.
     """
     if not enabled:
         return False
-    if truck_active or is_charging:
+    if truck_active or is_charging or wifi_connected:
         return False
     return idle_seconds >= idle_timeout
 

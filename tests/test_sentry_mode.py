@@ -34,14 +34,23 @@ SPEC.loader.exec_module(sentry)
 
 
 def test_should_suspend():
-    base = dict(enabled=True, truck_active=False, is_charging=False, idle_seconds=400, idle_timeout=300)
+    base = dict(
+        enabled=True,
+        truck_active=False,
+        is_charging=False,
+        wifi_connected=False,
+        idle_seconds=400,
+        idle_timeout=300,
+    )
     assert sentry.should_suspend(**base) is True
     assert sentry.should_suspend(**{**base, "enabled": False}) is False
     assert sentry.should_suspend(**{**base, "truck_active": True}) is False
     assert sentry.should_suspend(**{**base, "is_charging": True}) is False
+    # WiFi connectivity is a wake signal → stay awake (resume uploads)
+    assert sentry.should_suspend(**{**base, "wifi_connected": True}) is False
     # under the idle timeout → stay awake
     assert sentry.should_suspend(**{**base, "idle_seconds": 100}) is False
-    # exactly at the timeout → suspend
+    # exactly at the timeout, idle + offline → suspend
     assert sentry.should_suspend(**{**base, "idle_seconds": 300}) is True
 
 
