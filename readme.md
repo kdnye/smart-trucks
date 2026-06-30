@@ -7,14 +7,36 @@ This repository contains the containerized telematics stack for independent GPS,
 The system provides a forward-thinking solution for cold-chain logistics, ensuring data integrity across intermittent Wi-Fi connections and power-conscious operation.
 
 ## Architecture Overview
-The stack is structured into decoupled services to allow for modular OTA (Over-the-Air) updates and resource optimization.
+The stack runs as **two containers** on the Pi, split by failure domain — a data
+plane and a network/control plane — to keep RAM and Balena supervisor churn low
+on the 512 MB Pi Zero 2 W:
 
 **Active services (base-model stack):**
 
-* **`gps-multiplexer`**: Reads raw NMEA from the hardware UART and broadcasts it over TCP (port 2947) so other containers never touch the serial port directly.
-* **`telematics-edge`**: Reads GPS via TCP + BerryIMU metrics via I2C, manages the SQLite WAL store, and builds heartbeat / edge-health payloads.
-* **`ble-sensor`**: Scans for Govee BLE advertisements. Extracts temperature, humidity, and battery health. Runs at full scan cadence (battery-saver disabled — there is no active `power_readings` writer in the base-model stack).
-* **`sync-service`**: Drains the SQLite store-and-forward queues (`gps_points`, `heartbeats`, `edge_health`, `ble_scans`) and POSTs them to the cloud ingest endpoint.
+* **`edge`** (data plane, host networking, privileged): one container that runs
+  three co-processes — supervised by `edge/start.sh`, each restarted on exit:
+  * *telematics-edge* — reads GPS **directly from the serial UART**
+    (`/dev/serial0`; the old `gps-multiplexer` TCP broker is gone) + BerryIMU
+    metrics via I2C, manages the SQLite WAL store, and builds heartbeat /
+    edge-health payloads.
+  * *ble-sensor* — scans for Govee BLE advertisements (temperature, humidity,
+    battery) over the host BlueZ/D-Bus and enqueues them to the shared SQLite
+    queue. Battery-saver disabled (no active `power_readings` writer in the base
+    stack).
+  * *sync-service* — drains the SQLite store-and-forward queues (`gps_points`,
+    `heartbeats`, `edge_health`, `ble_scans`) and POSTs them to the cloud ingest
+    endpoint.
+* **`wifi-provisioner`** (control plane, host networking, privileged): the **sole
+  owner of `wlan0`/NetworkManager** — saved-network reconnect + roaming and the
+  setup-AP captive portal (see `docs/WIFI_PROVISIONING.md`) — **and** the
+  cross-service watchdog that restarts the `edge` service via the Balena
+  Supervisor API when its heartbeats go stale. Serves `/healthz` (this absorbed
+  the former standalone `health` container).
+
+> The earlier per-service containers (`gps-multiplexer`, `ble-sensor`,
+> `sync-service`, `health`, and the standalone `telematics-edge`) were
+> consolidated into the two above. Each service's code is unchanged; only the
+> packaging (one image, co-processes) and the GPS path (direct serial) changed.
 
 > **Parked (not active in the current base-model compose):**
 > **`power-monitor`** — Dedicated UPS HAT (B) / power-board telemetry service that reads battery metrics via I2C and persists snapshots to `power_readings`. It is removed from the active stack; with it gone, `UPS_*`/`POWER_*` variables are not wired and BLE battery-saver is disabled. `telematics-edge` still creates an empty `power_readings` table for forward compatibility. Restore details: see `EDGE_DASHBOARD_CONTRACT.md` § "Parked / to reintegrate later".
