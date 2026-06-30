@@ -16,6 +16,10 @@ from bleak import BleakScanner
 from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
 
+# While Sentry-suspended, re-check the sentinel on this short cadence so scanning
+# resumes promptly on wake instead of waiting out a full poll interval (up to 900s).
+SENTRY_SUSPEND_POLL_SECONDS = 5
+
 
 @dataclass(frozen=True)
 class Config:
@@ -1310,11 +1314,14 @@ async def run() -> None:
     )
 
     suspend_flag_path = sentry_flag.flag_path()
+    sentry_mode_enabled = read_bool_env("SENTRY_MODE_ENABLED", False)
     while True:
-        # Sentry Mode sleep (set by telematics-edge): skip BLE scanning entirely so
-        # the radio idles. The flag never appears unless Sentry Mode is enabled.
-        if sentry_flag.is_suspended(suspend_flag_path):
-            await asyncio.sleep(config.post_interval_seconds)
+        # Sentry Mode sleep (set by telematics-edge): skip BLE scanning so the
+        # radio idles. Gated on SENTRY_MODE_ENABLED so a stale sentinel can't
+        # strand scanning off when Sentry is disabled; short poll so the loop
+        # resumes promptly on wake.
+        if sentry_mode_enabled and sentry_flag.is_suspended(suspend_flag_path):
+            await asyncio.sleep(SENTRY_SUSPEND_POLL_SECONDS)
             continue
         apply_poll_sleep = True
         # Throttle scan cadence on battery to cut radio power overnight. Read the

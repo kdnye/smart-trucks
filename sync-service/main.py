@@ -26,6 +26,11 @@ HTTP_TIMEOUT_SECONDS = read_int_env("HTTP_TIMEOUT_SECONDS", 30)
 # shows the truck "online and here" immediately, before the historical backfill
 # streams in chronologically behind it.
 PRIORITY_BEACON_ENABLED = read_bool_env("SYNC_PRIORITY_BEACON_ENABLED", True)
+# Sentry Mode suspend: only honor the shared suspend sentinel when Sentry is
+# enabled (so a stale flag can't strand uploads off when it's disabled), and
+# re-check on a short cadence so uploads resume promptly on wake.
+SENTRY_MODE_ENABLED = read_bool_env("SENTRY_MODE_ENABLED", False)
+SENTRY_SUSPEND_POLL_SECONDS = 5
 
 # Tables drained, in the order their rows are loaded. The combined batch is
 # re-sorted by captured_at so the cloud ingests chronologically regardless.
@@ -285,10 +290,12 @@ async def run() -> None:
     suspend_flag_path = sentry_flag.flag_path()
     while True:
         # Sentry Mode sleep (set by telematics-edge): stop uploading so the WiFi
-        # radio can idle. The flag never appears unless Sentry Mode is enabled.
-        if sentry_flag.is_suspended(suspend_flag_path):
+        # radio can idle. Gated on SENTRY_MODE_ENABLED so a stale sentinel can't
+        # strand uploads off when Sentry is disabled; short poll so uploads
+        # resume promptly on wake.
+        if SENTRY_MODE_ENABLED and sentry_flag.is_suspended(suspend_flag_path):
             beacon_sent = False
-            await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+            await asyncio.sleep(SENTRY_SUSPEND_POLL_SECONDS)
             continue
         try:
             outcome = await sync_cycle()

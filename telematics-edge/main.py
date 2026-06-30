@@ -842,11 +842,15 @@ async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonito
     suspend/resume edge so the four other workers that toggle ``parked_mode``
     cannot cause double set/clear of the sentinel.
     """
+    flag_path = sentry_flag.flag_path()
     if not config.sentry_mode_enabled:
         logger.info("Sentry Mode disabled by configuration.")
+        # Clear any leftover suspend flag so disabling Sentry can't strand the
+        # co-processes suspended from a previous enabled run (they also gate on
+        # SENTRY_MODE_ENABLED, so this is belt-and-suspenders).
+        sentry_flag.clear_suspended(flag_path)
         return
 
-    flag_path = sentry_flag.flag_path()
     controller = SentryController(flag_path)
     logger.info(
         "Sentry Mode enabled: idle_timeout=%ss wake_interval=%ss flush_grace=%ss suspend_flag=%s",

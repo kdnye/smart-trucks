@@ -4,12 +4,20 @@ Sentry Mode lives in telematics-edge, but the heavy power consumers it wants to
 pause during sleep — the BLE scan loop and the cloud uploader — now run as
 separate co-processes in the same `edge` container (not separate Balena
 services), so they can't be stopped via the Supervisor API. Instead they
-coordinate through a sentinel file on the shared `/data` volume:
+coordinate through a sentinel file:
 
   * telematics-edge SETS the flag when entering Sentry sleep, CLEARS it on wake,
-    and clears it on boot (so a crash/OTA mid-sleep can't strand them suspended);
-  * the ble-sensor and sync-service loops poll ``is_suspended()`` and skip their
-    work (idle the radio / stop uploading) while the flag is present.
+    clears it on boot, and clears it when Sentry is disabled;
+  * the ble-sensor and sync-service loops (also gated on SENTRY_MODE_ENABLED)
+    poll ``is_suspended()`` and skip their work (idle the radio / stop uploading)
+    while the flag is present.
+
+The default path is **container-local** (``/run``), NOT the persistent ``/data``
+volume: AGENTS.md forbids non-schema files on ``/data`` (they survive OTA), and a
+"currently sleeping" flag must be ephemeral — it should never outlive the
+container. All three co-processes share the edge container's filesystem, so a
+container-local path is visible to all of them (the wifi-provisioner doesn't read
+it).
 
 Stdlib-only and import-light so every service can use it without extra deps.
 Sentry Mode is off by default, so the flag never appears unless it's enabled.
@@ -24,7 +32,7 @@ from shared.env import sanitize_env_value
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FLAG_PATH = "/data/sentry_suspend"
+DEFAULT_FLAG_PATH = "/run/sentry_suspend"
 
 
 def flag_path(override: str | None = None) -> str:
