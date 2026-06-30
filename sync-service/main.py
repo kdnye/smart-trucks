@@ -7,7 +7,7 @@ from typing import Any
 
 import requests
 
-from shared import sqlite_util
+from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env
 
 DB_PATH = os.getenv("DB_PATH", "/data/telematics.db")
@@ -282,7 +282,14 @@ async def run() -> None:
     # Latch so the "online and here" beacon fires once per backlog, not every
     # batch while a long backfill drains.
     beacon_sent = False
+    suspend_flag_path = sentry_flag.flag_path()
     while True:
+        # Sentry Mode sleep (set by telematics-edge): stop uploading so the WiFi
+        # radio can idle. The flag never appears unless Sentry Mode is enabled.
+        if sentry_flag.is_suspended(suspend_flag_path):
+            beacon_sent = False
+            await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+            continue
         try:
             outcome = await sync_cycle()
         except Exception as exc:  # pylint: disable=broad-except

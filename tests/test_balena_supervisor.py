@@ -47,6 +47,25 @@ def test_disabled_without_credentials():
                 os.environ[k] = v
 
 
+def test_enabled_with_credentials():
+    import os
+
+    saved = {k: os.environ.get(k) for k in _BALENA_ENV}
+    try:
+        os.environ["BALENA_SUPERVISOR_ADDRESS"] = "http://127.0.0.1:48484"
+        os.environ["BALENA_SUPERVISOR_API_KEY"] = "secret"
+        os.environ["BALENA_APP_ID"] = "1234567"
+        os.environ.pop("BALENA_SUPERVISOR_APP_ID", None)
+        sup = bsup.BalenaSupervisor()
+        assert sup.enabled is True
+    finally:
+        for k in _BALENA_ENV:
+            os.environ.pop(k, None)
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
 def test_set_services_rejects_invalid_target():
     import os
 

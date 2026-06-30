@@ -1,14 +1,17 @@
-"""Sentry Mode: idle-driven container suspension via the Balena Supervisor API.
+"""Sentry Mode: idle-driven software sleep via an in-process suspend sentinel.
 
 When a truck has been idle for ``SENTRY_IDLE_TIMEOUT_SECONDS`` the master worker
-stops the heavy containers (BLE radio + cloud sync) to cut power draw, waking on
-a short cadence to watch for motion; any motion / charging / WiFi wake restarts
-them. See ``docs/power-optimization.md``.
+puts the heavy work to sleep (the BLE radio + cloud sync) to cut power draw,
+waking on a short cadence to watch for motion; any motion / charging / WiFi wake
+resumes it. See ``docs/power-optimization.md``.
 
-This module is deliberately import-light: only the standard library,
-``shared.env``, and — lazily, inside the one method that makes HTTP calls —
-``aiohttp``. That keeps the decision logic and the Supervisor client
-unit-testable without the telematics-edge hardware import chain
+The BLE scan and cloud-upload loops run as co-processes in the same `edge`
+container, so they can't be stopped via the Balena Supervisor API. Instead this
+toggles a sentinel file on the shared `/data` volume (``shared.sentry_flag``)
+that those loops poll and self-suspend on.
+
+Deliberately import-light (stdlib + ``shared`` only): the decision logic and the
+controller are unit-testable without the telematics-edge hardware import chain
 (uvloop / smbus2 / aiosqlite / pyserial). The async orchestration that ties this
 to GPS/IMU/heartbeats lives in ``main.py::sentry_mode_worker``.
 """
@@ -16,30 +19,10 @@ to GPS/IMU/heartbeats lives in ``main.py::sentry_mode_worker``.
 from __future__ import annotations
 
 import logging
-from typing import Iterable
 
-# BalenaSupervisor moved to shared/ so the wifi-provisioner watchdog can reuse it.
-# Re-exported here for backward compatibility (sentry.BalenaSupervisor, tests).
-from shared.balena_supervisor import BalenaSupervisor
+from shared import sentry_flag
 
 logger = logging.getLogger(__name__)
-
-# Never suspend the container that runs this code.
-SELF_SERVICE_NAME = "telematics-edge"
-
-
-def parse_service_list(raw: str | None) -> tuple[str, ...]:
-    """Parse a comma-separated service list: trimmed, deduped, self-excluded.
-
-    ``telematics-edge`` is filtered out defensively — suspending the container
-    that runs Sentry Mode would deadlock the wake path.
-    """
-    seen: dict[str, None] = {}
-    for name in (raw or "").split(","):
-        name = name.strip()
-        if name and name != SELF_SERVICE_NAME:
-            seen.setdefault(name, None)
-    return tuple(seen)
 
 
 def should_suspend(
@@ -54,8 +37,8 @@ def should_suspend(
 
     Pure function (no I/O, no shared state) so the policy is trivially testable.
     Note it never reads ``parked_mode``: idleness is computed directly, so a
-    WiFi-loss park (which also sets ``parked_mode``) does NOT trigger container
-    suspension — only genuine idle-timeout does.
+    WiFi-loss park (which also sets ``parked_mode``) does NOT trigger suspension —
+    only genuine idle-timeout does.
     """
     if not enabled:
         return False
@@ -64,59 +47,49 @@ def should_suspend(
     return idle_seconds >= idle_timeout
 
 
-def next_action(desired_suspended: bool, prev_paused: bool) -> str | None:
+def next_action(desired_suspended: bool, prev_suspended: bool) -> str | None:
     """Return the single edge transition to perform, or None at steady state."""
-    if desired_suspended and not prev_paused:
-        return "stop"
-    if not desired_suspended and prev_paused:
-        return "start"
+    if desired_suspended and not prev_suspended:
+        return "suspend"
+    if not desired_suspended and prev_suspended:
+        return "resume"
     return None
 
 
 class SentryController:
     """Single owner of the suspend/resume edge decision.
 
-    Holds the private ``prev_paused`` shadow so exactly one stop is issued per
-    falling edge and one start per rising edge, regardless of how many other
+    Holds the private ``prev_suspended`` shadow so exactly one suspend is issued
+    per falling edge and one resume per rising edge, regardless of how many other
     workers toggle the shared ``parked_mode`` flag (which is transient, not
-    latched, and so unsafe to edge-detect directly). On a failed supervisor call
-    the shadow is NOT advanced, so the next poll retries (self-healing).
+    latched, and so unsafe to edge-detect directly). The suspend signal is the
+    ``shared.sentry_flag`` sentinel that the ble-sensor / sync-service
+    co-processes poll.
     """
 
-    def __init__(self, supervisor: BalenaSupervisor, pause_services: Iterable[str]) -> None:
-        self._sup = supervisor
-        self._services = tuple(pause_services)
-        self.prev_paused = False
+    def __init__(self, flag_path: str) -> None:
+        self._flag_path = flag_path
+        self.prev_suspended = False
 
-    async def boot_safety_start(self) -> None:
-        """On boot, ensure the pause-set containers are running (idempotent).
+    def boot_safety_clear(self) -> None:
+        """On boot, clear any stale suspend sentinel a crash/OTA left mid-sleep so
+        the co-processes don't start up already suspended (the file lives on the
+        persistent /data volume)."""
+        sentry_flag.clear_suspended(self._flag_path)
+        self.prev_suspended = False
 
-        Balena persists a stopped service's target state across a telematics-edge
-        restart, so a crash / OTA mid-sleep would otherwise strand them stopped.
+    def apply(self, desired_suspended: bool) -> str | None:
+        """Set/clear the suspend sentinel on the single state transition.
+
+        Returns "suspend"/"resume" on a transition, or None at steady state.
         """
-        if self._services:
-            await self._sup.set_services(self._services, "start")
-        self.prev_paused = False
-
-    async def apply(self, desired_suspended: bool) -> str | None:
-        """Issue at most one transition for the desired level.
-
-        Returns the action actually performed ("stop"/"start"), or None when at
-        steady state, when there are no services to manage, or when the call
-        failed (the shadow is left unchanged so the next poll retries).
-        """
-        action = next_action(desired_suspended, self.prev_paused)
-        if action is None or not self._services:
-            return None
-        ok = await self._sup.set_services(self._services, action)
-        if action == "stop":
-            if ok:
-                self.prev_paused = True
-                return "stop"
-            return None
-        # start: clear the shadow on success, or when the supervisor is a no-op
-        # (no creds / off-Balena) so we don't loop forever "starting" on a dev box.
-        if ok or not self._sup.enabled:
-            self.prev_paused = False
-            return "start"
+        action = next_action(desired_suspended, self.prev_suspended)
+        if action == "suspend":
+            sentry_flag.set_suspended(self._flag_path)
+            self.prev_suspended = True
+            return "suspend"
+        if action == "resume":
+            sentry_flag.clear_suspended(self._flag_path)
+            self.prev_suspended = False
+            return "resume"
         return None

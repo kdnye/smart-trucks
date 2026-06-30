@@ -44,14 +44,15 @@ services:
       - GPS_TRACK_KEEPALIVE_SECONDS=${GPS_TRACK_KEEPALIVE_SECONDS:-0.0}
       # IMU power saving: throttle polling while parked (full rate on motion).
       - IMU_PARKED_SAMPLE_INTERVAL_SECONDS=${IMU_PARKED_SAMPLE_INTERVAL_SECONDS:-1.0}
-      # --- Sentry Mode (software sleep), opt-in (default off). Container-level
-      # service suspension no longer applies now that ble/sync are in-process; the
-      # in-process suspend (sentinel) is a follow-up, so leave the pause-set empty.
+      # --- Sentry Mode (software sleep), opt-in (default off). When idle it sets
+      # the SENTRY_SUSPEND_FLAG_PATH sentinel on the shared volume; the in-process
+      # ble-sensor + sync-service loops poll it and suspend (idle radio + stop
+      # uploads) until wake clears it.
       - SENTRY_MODE_ENABLED=${SENTRY_MODE_ENABLED:-false}
       - SENTRY_IDLE_TIMEOUT_SECONDS=${SENTRY_IDLE_TIMEOUT_SECONDS:-300}
       - SENTRY_WAKE_INTERVAL_SECONDS=${SENTRY_WAKE_INTERVAL_SECONDS:-10}
       - SENTRY_SYNC_FLUSH_GRACE_SECONDS=${SENTRY_SYNC_FLUSH_GRACE_SECONDS:-90}
-      - SENTRY_PAUSE_SERVICES=${SENTRY_PAUSE_SERVICES:-}
+      - SENTRY_SUSPEND_FLAG_PATH=${SENTRY_SUSPEND_FLAG_PATH:-/data/sentry_suspend}
       # --- BLE scanning (ble-sensor) ---
       - ANONYMIZE_MAC=false
       - INCLUDE_DEVICE_NAME=true

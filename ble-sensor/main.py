@@ -13,7 +13,7 @@ from typing import Any
 import uvloop
 from bleak import BleakScanner
 
-from shared import sqlite_util
+from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
 
 
@@ -1309,7 +1309,13 @@ async def run() -> None:
         f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}."
     )
 
+    suspend_flag_path = sentry_flag.flag_path()
     while True:
+        # Sentry Mode sleep (set by telematics-edge): skip BLE scanning entirely so
+        # the radio idles. The flag never appears unless Sentry Mode is enabled.
+        if sentry_flag.is_suspended(suspend_flag_path):
+            await asyncio.sleep(config.post_interval_seconds)
+            continue
         apply_poll_sleep = True
         # Throttle scan cadence on battery to cut radio power overnight. Read the
         # latest battery state (read-only) and fall back to full cadence if the
