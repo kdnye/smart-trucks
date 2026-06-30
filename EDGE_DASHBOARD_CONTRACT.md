@@ -11,29 +11,34 @@ single canonical contract we're moving to.
 
 ## 1. Current edge data flow (as of `main`)
 
-Five containers run on each Pi via Balena (`docker-compose.yml`):
+Two containers run on each Pi via Balena (`docker-compose.yml`):
 
 ```
-┌──────────────────┐  TCP 2947       ┌──────────────────┐  I2C/IMU
-│ gps-multiplexer  │ ───────────────▶│ telematics-edge  │◀────── BerryGPS-IMU
-│  (UART → TCP)    │                 │ (heartbeats,     │
-└──────────────────┘                 │  GPS collector,  │
-                                     │  maintenance)    │
-┌──────────────────┐  I2C INA219     │                  │
-│ power-monitor    │ ───────────────▶│  shared SQLite   │
-│ (UPS HAT)        │                 │  /data/telematics│
-└──────────────────┘                 │       .db        │
-                                     │                  │
-┌──────────────────┐  BLE scan       │                  │
-│ ble-sensor       │ ───────────────▶│                  │
-│ (Govee, beacons) │                 └────────┬─────────┘
-└──────────────────┘                          │
-                                              ▼
-                                     ┌──────────────────┐
-                                     │  sync-service    │  HTTPS POST
-                                     │  (60s loop)      │ ────────────▶ WEBHOOK_URL
-                                     └──────────────────┘
+edge container — host networking; one image, three co-processes (edge/start.sh)
+┌─────────────────────────────────────────────────────────────────┐
+│  /dev/serial0 ──UART──▶ telematics-edge ◀──I2C── BerryGPS-IMU     │
+│                          (GPS collector, heartbeats, maintenance) │
+│  BLE ──scan──▶ ble-sensor ──┐                                     │
+│                             ▼                                     │
+│                     shared SQLite  /data/telematics.db            │
+│                             │                                     │
+│                             ▼                                     │
+│                     sync-service ──HTTPS POST──▶ WEBHOOK_URL      │
+└─────────────────────────────────────────────────────────────────┘
+
+wifi-provisioner container — host networking
+┌─────────────────────────────────────────────────────────────────┐
+│  • sole owner of wlan0 / NetworkManager + setup-AP captive portal │
+│  • watchdog: restarts the `edge` service via the Balena           │
+│    Supervisor API when heartbeats in /data/telematics.db go stale │
+│  • serves /healthz                                                │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+GPS is read directly from the serial UART — the former `gps-multiplexer`
+TCP broker (port 2947) and the standalone `health` container were folded into
+the two containers above; `power-monitor` remains parked (see §"Parked /
+to reintegrate later").
 
 `telematics-edge/db.py::init_db()` owns the telematics-edge SQLite WAL tables, while `power-monitor/main.py` owns the local `power_readings` snapshot table it writes for telematics-edge to read:
 
@@ -335,9 +340,9 @@ map.
 
 ## 9. Parked / to reintegrate later
 
-The base-model stack runs only the four active services (`gps-multiplexer`,
-`telematics-edge`, `ble-sensor`, `sync-service`). The items below are
-intentionally parked. Each lists where to restore it from.
+The base-model stack runs two containers: `edge` (the telematics-edge +
+ble-sensor + sync-service co-processes) and `wifi-provisioner`. The items below
+are intentionally parked. Each lists where to restore it from.
 
 1. **Power-board monitoring.** The `power-monitor` service (CN3791 / IP5356 /
    STM32 power board → `power_readings`) is not in the active compose. With no
