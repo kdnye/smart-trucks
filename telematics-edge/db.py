@@ -547,51 +547,65 @@ async def pop_beacon_wake_signal() -> bool:
 async def purge_old_sent_rows(days: int = 7) -> int:
     """Delete rows already sent to cloud and older than `days` days.
 
-    Retries on "database is locked" (the shared connection's busy_timeout can
-    still expire under a sustained backlog drain) so a transient collision just
-    skips this purge attempt instead of erroring out hard.
+    Runs on its own short-lived connection — never the shared one. A SQLite
+    transaction is connection-global, so wrapping the deletes in
+    BEGIN IMMEDIATE/COMMIT on the shared connection would entangle them with
+    every other coroutine using it: `pop_beacon_wake_signal` issues its own
+    `commit()` (and `parked_scan_worker` runs concurrently with the
+    purge-owning `maintenance_worker`), so an interleaved commit could close
+    this transaction mid-purge and leave our trailing COMMIT to fail with
+    "no transaction is active". A dedicated connection isolates the atomic
+    purge (single fsync) the same way `_execute_write` does.
+
+    Retries on "database is locked" (the busy_timeout can still expire under a
+    sustained backlog drain) so a transient collision just skips this purge
+    attempt instead of erroring out hard.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     attempts = max(1, SQLITE_LOCKED_RETRY_COUNT + 1)
 
     for attempt in range(1, attempts + 1):
         try:
-            db = await _get_db_connection()
-            # The shared connection runs in autocommit (isolation_level=None), so
-            # wrap the deletes in one explicit transaction: a single fsync and
-            # atomic purge.
-            await db.execute("BEGIN IMMEDIATE;")
-            try:
-                gps_cursor = await db.execute(
-                    "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                    (cutoff,),
+            async with aiosqlite.connect(
+                DB_PATH,
+                timeout=SQLITE_CONNECT_TIMEOUT_SECONDS,
+                isolation_level=None,
+            ) as db:
+                await _configure_sqlite_connection(db)
+                # Autocommit connection (isolation_level=None): wrap the deletes
+                # in one explicit transaction for a single fsync + atomic purge.
+                await db.execute("BEGIN IMMEDIATE;")
+                try:
+                    gps_cursor = await db.execute(
+                        "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                        (cutoff,),
+                    )
+                    hb_cursor = await db.execute(
+                        "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                        (cutoff,),
+                    )
+                    health_cursor = await db.execute(
+                        "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                        (cutoff,),
+                    )
+                    ble_cursor = await db.execute(
+                        "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                        (cutoff,),
+                    )
+                    await db.execute("COMMIT;")
+                except Exception:
+                    if db.in_transaction:
+                        await db.execute("ROLLBACK;")
+                    raise
+                deleted_total = (
+                    (gps_cursor.rowcount or 0)
+                    + (hb_cursor.rowcount or 0)
+                    + (health_cursor.rowcount or 0)
+                    + (ble_cursor.rowcount or 0)
                 )
-                hb_cursor = await db.execute(
-                    "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                    (cutoff,),
-                )
-                health_cursor = await db.execute(
-                    "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                    (cutoff,),
-                )
-                ble_cursor = await db.execute(
-                    "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                    (cutoff,),
-                )
-                await db.execute("COMMIT;")
-            except Exception:
-                if db.in_transaction:
-                    await db.execute("ROLLBACK;")
-                raise
-            deleted_total = (
-                (gps_cursor.rowcount or 0)
-                + (hb_cursor.rowcount or 0)
-                + (health_cursor.rowcount or 0)
-                + (ble_cursor.rowcount or 0)
-            )
-            if deleted_total:
-                logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
-            return deleted_total
+                if deleted_total:
+                    logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
+                return deleted_total
         except aiosqlite.OperationalError as exc:
             if _is_locked_error(exc) and attempt < attempts:
                 delay_seconds = SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS * attempt
