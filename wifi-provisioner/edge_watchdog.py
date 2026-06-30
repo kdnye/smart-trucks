@@ -62,8 +62,12 @@ def newest_heartbeat_age_seconds(db_path: str, *, now: datetime | None = None) -
             row = conn.execute(
                 "SELECT captured_at_utc FROM heartbeats ORDER BY captured_at_utc DESC LIMIT 1"
             ).fetchone()
-        except sqlite3.OperationalError:
-            return None  # table not created yet (edge hasn't initialised the DB)
+        except sqlite3.Error as exc:
+            # Table not created yet, or the DB is locked/corrupted (e.g. SD-card
+            # power loss). Never crash the control-plane watchdog over the data
+            # plane's DB — treat it as "no reading" and try again next cycle.
+            logger.debug("watchdog: heartbeat query failed: %s", exc)
+            return None
         if not row or not row[0]:
             return None
         ts = parse_iso_utc(str(row[0]))
@@ -118,9 +122,14 @@ async def watchdog_worker(config, state) -> None:
             config.watchdog_target_service,
         )
         ok = await sup.restart_service(config.watchdog_target_service)
-        state.watchdog_last_restart_monotonic = time.monotonic()
-        state.watchdog_restart_count += 1
-        if not ok:
+        if ok:
+            # Only start the cooldown / count a restart on success, so a failed
+            # call (transient API error / disabled supervisor) retries next check
+            # instead of being blocked for the cooldown while the edge stays wedged.
+            state.watchdog_last_restart_monotonic = time.monotonic()
+            state.watchdog_restart_count += 1
+        else:
             logger.warning(
-                "Edge watchdog: restart call did not succeed (Supervisor API disabled or errored)."
+                "Edge watchdog: restart call did not succeed (Supervisor API disabled or "
+                "errored); will retry on the next check."
             )

@@ -27,8 +27,6 @@ case "${GPS_SERIAL_DEVICE}" in
     ;;
 esac
 
-pids=""
-
 supervise() {
   name="$1"
   shift
@@ -41,12 +39,15 @@ supervise() {
       sleep 5
     done
   ) &
-  pids="${pids} $!"
 }
 
 shutdown() {
   echo "[edge] received signal — stopping co-processes"
-  kill ${pids} 2>/dev/null || true
+  # Reset the trap first, then signal the whole process group so the Python
+  # children (not just the supervise subshells) get a graceful SIGTERM to flush
+  # SQLite / WAL before the container tears down.
+  trap - TERM INT
+  kill 0 2>/dev/null || true
   exit 0
 }
 trap shutdown TERM INT
