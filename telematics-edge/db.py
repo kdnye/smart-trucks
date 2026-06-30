@@ -391,9 +391,10 @@ async def mark_gps_points_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        await _execute_write(
+        await _execute_write_with_retry(
             f"UPDATE gps_points SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
             params,
+            operation_name="mark_gps_points_sent",
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to mark GPS rows sent: %s", exc)
@@ -408,9 +409,10 @@ async def mark_heartbeats_sent(row_ids: list[int], sent_at_utc: str | None = Non
     params = [sent_at, *row_ids]
 
     try:
-        await _execute_write(
+        await _execute_write_with_retry(
             f"UPDATE heartbeats SET sent_at_utc = ? WHERE id IN ({placeholders})",  # nosec B608
             params,
+            operation_name="mark_heartbeats_sent",
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to mark heartbeat rows sent: %s", exc)
@@ -422,9 +424,10 @@ async def increment_gps_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        await _execute_write(
+        await _execute_write_with_retry(
             f"UPDATE gps_points SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
             row_ids,
+            operation_name="increment_gps_attempts",
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to increment GPS attempts: %s", exc)
@@ -436,9 +439,10 @@ async def increment_heartbeat_attempts(row_ids: list[int]) -> None:
 
     placeholders = ",".join("?" for _ in row_ids)
     try:
-        await _execute_write(
+        await _execute_write_with_retry(
             f"UPDATE heartbeats SET attempt_count = attempt_count + 1 WHERE id IN ({placeholders})",  # nosec B608
             row_ids,
+            operation_name="increment_heartbeat_attempts",
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Failed to increment heartbeat attempts: %s", exc)
@@ -541,44 +545,68 @@ async def pop_beacon_wake_signal() -> bool:
 
 
 async def purge_old_sent_rows(days: int = 7) -> int:
-    """Delete rows already sent to cloud and older than `days` days."""
+    """Delete rows already sent to cloud and older than `days` days.
+
+    Retries on "database is locked" (the shared connection's busy_timeout can
+    still expire under a sustained backlog drain) so a transient collision just
+    skips this purge attempt instead of erroring out hard.
+    """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    deleted_total = 0
-    try:
-        db = await _get_db_connection()
-        # The shared connection runs in autocommit (isolation_level=None), so wrap
-        # the deletes in one explicit transaction: a single fsync and atomic purge.
-        await db.execute("BEGIN IMMEDIATE;")
+    attempts = max(1, SQLITE_LOCKED_RETRY_COUNT + 1)
+
+    for attempt in range(1, attempts + 1):
         try:
-            gps_cursor = await db.execute(
-                "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                (cutoff,),
+            db = await _get_db_connection()
+            # The shared connection runs in autocommit (isolation_level=None), so
+            # wrap the deletes in one explicit transaction: a single fsync and
+            # atomic purge.
+            await db.execute("BEGIN IMMEDIATE;")
+            try:
+                gps_cursor = await db.execute(
+                    "DELETE FROM gps_points WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                    (cutoff,),
+                )
+                hb_cursor = await db.execute(
+                    "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                    (cutoff,),
+                )
+                health_cursor = await db.execute(
+                    "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                    (cutoff,),
+                )
+                ble_cursor = await db.execute(
+                    "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
+                    (cutoff,),
+                )
+                await db.execute("COMMIT;")
+            except Exception:
+                if db.in_transaction:
+                    await db.execute("ROLLBACK;")
+                raise
+            deleted_total = (
+                (gps_cursor.rowcount or 0)
+                + (hb_cursor.rowcount or 0)
+                + (health_cursor.rowcount or 0)
+                + (ble_cursor.rowcount or 0)
             )
-            hb_cursor = await db.execute(
-                "DELETE FROM heartbeats WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                (cutoff,),
-            )
-            health_cursor = await db.execute(
-                "DELETE FROM edge_health WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                (cutoff,),
-            )
-            ble_cursor = await db.execute(
-                "DELETE FROM ble_scans WHERE sent_at_utc IS NOT NULL AND captured_at_utc < ?",
-                (cutoff,),
-            )
-            await db.execute("COMMIT;")
-        except Exception:
-            await db.execute("ROLLBACK;")
-            raise
-        deleted_total = (
-            (gps_cursor.rowcount or 0)
-            + (hb_cursor.rowcount or 0)
-            + (health_cursor.rowcount or 0)
-            + (ble_cursor.rowcount or 0)
-        )
-        if deleted_total:
-            logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
-        return deleted_total
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.error("Failed to purge old sent rows: %s", exc)
-        return deleted_total
+            if deleted_total:
+                logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
+            return deleted_total
+        except aiosqlite.OperationalError as exc:
+            if _is_locked_error(exc) and attempt < attempts:
+                delay_seconds = SQLITE_LOCKED_RETRY_BASE_DELAY_SECONDS * attempt
+                logger.warning(
+                    "purge_old_sent_rows hit SQLite lock contention (attempt %d/%d); retrying in %.3fs",
+                    attempt,
+                    attempts,
+                    delay_seconds,
+                )
+                await asyncio.sleep(delay_seconds)
+                continue
+            logger.error("Failed to purge old sent rows: %s", exc)
+            return 0
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Failed to purge old sent rows: %s", exc)
+            return 0
+
+    return 0
