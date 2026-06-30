@@ -28,8 +28,9 @@ from db import (
 from gps_filter import GpsFilterConfig, GpsTrackFilter
 from imu_reader import IMUReader, ImuSnapshot, snapshot_as_dict
 from nmea_reader import GpsReading, NMEAReader
-from sentry import BalenaSupervisor, SentryController, parse_service_list, should_suspend
-from shared.env import read_bool_env, read_int_env, read_str_env
+from sentry import SentryController, should_suspend
+from shared import sentry_flag
+from shared.env import read_bool_env, read_int_env
 from shared.env import sanitize_env_value as _sanitize_env_value
 from shared.hardware_probe import (
     build_hardware_inventory,
@@ -64,12 +65,12 @@ class Config:
     network_watchdog_max_failures: int = 3
     network_watchdog_recovery_pause_seconds: int = 30
     network_watchdog_connection_name: str | None = None
-    # Sentry Mode (software sleep): stop heavy containers while idle to save power.
+    # Sentry Mode (software sleep): suspend the BLE + sync co-processes while idle
+    # to save power (via the shared.sentry_flag sentinel — see sentry.py).
     sentry_mode_enabled: bool = False
     sentry_idle_timeout_seconds: int = 300
     sentry_wake_interval_seconds: int = 10
     sentry_sync_flush_grace_seconds: int = 90
-    sentry_pause_services: tuple[str, ...] = ("ble-sensor", "sync-service")
 
 
 def _read_str_env(name: str, default: str | None = None) -> str | None:
@@ -152,9 +153,6 @@ def load_config() -> Config:
         sentry_idle_timeout_seconds=read_int_env("SENTRY_IDLE_TIMEOUT_SECONDS", 300, minimum=60),
         sentry_wake_interval_seconds=read_int_env("SENTRY_WAKE_INTERVAL_SECONDS", 10, minimum=2),
         sentry_sync_flush_grace_seconds=read_int_env("SENTRY_SYNC_FLUSH_GRACE_SECONDS", 90, minimum=0),
-        sentry_pause_services=parse_service_list(
-            read_str_env("SENTRY_PAUSE_SERVICES", "ble-sensor,sync-service")
-        ),
     )
 
 
@@ -765,7 +763,9 @@ async def _build_heartbeat_payload(
         "sentry_mode": {
             "active": state.sentry_active,
             "since_utc": state.sentry_since_utc,
-            "paused_services": list(config.sentry_pause_services),
+            # The co-processes the suspend sentinel idles during sleep (kept for
+            # the dashboard's Power Monitor view).
+            "paused_services": ["ble-sensor", "sync-service"],
         },
     }
     return captured_at, payload
@@ -806,18 +806,18 @@ async def _emit_sentry_heartbeat(config: Config, state: RuntimeState, imu: ImuMo
 
 
 async def _enter_sentry(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> bool:
-    """Announce the sleep, throttle workers, and let sync flush before the stop.
+    """Announce the sleep, throttle workers, and let sync flush before suspending.
 
     Returns False if motion is detected during the flush grace — the entry is
-    aborted and nothing has been stopped yet.
+    aborted and nothing has been suspended yet.
     """
     state.sentry_active = True
     state.sentry_since_utc = utc_now_iso()
-    logger.info("Sentry Mode: entering sleep — announcing to cloud before suspending containers.")
+    logger.info("Sentry Mode: entering sleep — announcing to cloud before suspending co-processes.")
     await _emit_sentry_heartbeat(config, state, imu)
     # Throttle the periodic heartbeat/GPS workers (reuse the parked-mode machine).
     state.parked_mode = True
-    # Give sync-service a window to ship the announcement before it is stopped.
+    # Give sync-service a window to ship the announcement before it is suspended.
     deadline = time.monotonic() + config.sentry_sync_flush_grace_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -834,29 +834,34 @@ async def _enter_sentry(config: Config, state: RuntimeState, imu: ImuMonitor | N
 
 
 async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonitor | None) -> None:
-    """Idle-driven software sleep: stop the heavy containers while the truck is
-    parked, restart them on motion / charging / WiFi. Opt-in via
-    ``SENTRY_MODE_ENABLED`` (default off).
+    """Idle-driven software sleep: suspend the BLE + sync co-processes (via the
+    shared suspend sentinel) while the truck is parked, resume on motion /
+    charging / WiFi. Opt-in via ``SENTRY_MODE_ENABLED`` (default off).
 
-    A single private ``prev_paused`` shadow (in ``SentryController``) owns the
-    stop/start edge so the four other workers that toggle ``parked_mode`` cannot
-    cause double stop/start calls.
+    A single private ``prev_suspended`` shadow (in ``SentryController``) owns the
+    suspend/resume edge so the four other workers that toggle ``parked_mode``
+    cannot cause double set/clear of the sentinel.
     """
+    flag_path = sentry_flag.flag_path()
     if not config.sentry_mode_enabled:
         logger.info("Sentry Mode disabled by configuration.")
+        # Clear any leftover suspend flag so disabling Sentry can't strand the
+        # co-processes suspended from a previous enabled run (they also gate on
+        # SENTRY_MODE_ENABLED, so this is belt-and-suspenders).
+        sentry_flag.clear_suspended(flag_path)
         return
 
-    supervisor = BalenaSupervisor()
-    controller = SentryController(supervisor, config.sentry_pause_services)
+    controller = SentryController(flag_path)
     logger.info(
-        "Sentry Mode enabled: idle_timeout=%ss wake_interval=%ss flush_grace=%ss pause=%s",
+        "Sentry Mode enabled: idle_timeout=%ss wake_interval=%ss flush_grace=%ss suspend_flag=%s",
         config.sentry_idle_timeout_seconds,
         config.sentry_wake_interval_seconds,
         config.sentry_sync_flush_grace_seconds,
-        ",".join(config.sentry_pause_services) or "(none)",
+        flag_path,
     )
-    # Recover containers a crash/OTA may have left stopped mid-sleep (idempotent).
-    await controller.boot_safety_start()
+    # Clear any stale suspend flag a crash/OTA may have left mid-sleep so the
+    # co-processes don't boot up already suspended (idempotent).
+    controller.boot_safety_clear()
     state.sentry_idle_since_monotonic = time.monotonic()
 
     while True:
@@ -870,6 +875,9 @@ async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonito
             enabled=config.sentry_mode_enabled,
             truck_active=_truck_is_active(state),
             is_charging=is_charging,
+            # WiFi connectivity is a wake signal: a parked truck that regains WiFi
+            # resumes (and flushes uploads) rather than staying suspended.
+            wifi_connected=state.wifi_connected,
             idle_seconds=idle_seconds,
             idle_timeout=config.sentry_idle_timeout_seconds,
         )
@@ -880,14 +888,14 @@ async def sentry_mode_worker(config: Config, state: RuntimeState, imu: ImuMonito
                 await asyncio.sleep(config.sentry_wake_interval_seconds)
                 continue
         elif not desired and state.sentry_active:
-            logger.info("Sentry Mode: wake — restarting suspended containers.")
+            logger.info("Sentry Mode: wake — resuming suspended co-processes.")
             state.sentry_active = False
             state.sentry_since_utc = None
             if state.parked_mode:
                 state.parked_mode = False
                 state.park_wake_event.set()
 
-        await controller.apply(desired)
+        controller.apply(desired)
         await asyncio.sleep(config.sentry_wake_interval_seconds)
 
 
