@@ -272,15 +272,23 @@ The following patterns are expected during supervised updates and should not be 
    * Signatures:
      * `org.bluez.Error.InProgress`
      * `BlueZ scan-start contention detected`
-   * Automated recovery (default on): once contention is persistent, `ble-sensor`
-     power-cycles the adapter over BlueZ D-Bus (`Adapter1.Powered` off→on, the
-     equivalent of `hciconfig hci0 reset`) to clear a wedged discovery session,
-     retrying at most once per `SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS`
-     (default 300s). Re-issuing `StartDiscovery` alone can never clear this — it
-     is the call that keeps failing. Disable with
-     `SCAN_CONTENTION_ADAPTER_RESET_ENABLED=false`; target a non-default radio
-     with `BLE_ADAPTER`.
-   * Manual recovery order (if the automated reset can't clear it):
+   * Automated recovery (default on), in escalating order once contention is persistent:
+     1. **Adapter power-cycle** — `ble-sensor` toggles the adapter over BlueZ
+        D-Bus (`Adapter1.Powered` off→on, the equivalent of `hciconfig hci0
+        reset`), at most once per `SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS`
+        (default 300s). Re-issuing `StartDiscovery` alone can never clear the
+        wedge — it is the call that keeps failing. Note: BlueZ refuses `Powered
+        off` with `Busy` while a discovery is active, and some images ship no
+        `rfkill`/`hciconfig`, so this step can be a no-op — hence step 2. Disable
+        with `SCAN_CONTENTION_ADAPTER_RESET_ENABLED=false`; target a non-default
+        radio with `BLE_ADAPTER`.
+     2. **Supervised self-restart** — if contention stays unrecovered for
+        `SCAN_CONTENTION_RESTART_AFTER_SECONDS` (default 600s), `ble-sensor` exits
+        so `edge/start.sh` respawns it with a fresh BlueZ D-Bus connection, which
+        lets BlueZ reap the stale discovery session (the automated equivalent of
+        the manual "restart the ble-sensor service" below). `ble-sensor` is its
+        own supervised process, so this does not disturb GPS/heartbeats.
+   * Manual recovery order (if the automated steps can't clear it):
      1. First, restart only the `ble-sensor` service.
      2. If BLE scan start remains stuck, reboot the device from the Balena Dashboard to power-cycle `hci0`.
    * Prevention:

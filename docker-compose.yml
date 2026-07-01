@@ -62,6 +62,10 @@ services:
       # D-Bus (hci0 reset) to clear a wedged discovery session. See readme §4.
       - SCAN_CONTENTION_ADAPTER_RESET_ENABLED=${SCAN_CONTENTION_ADAPTER_RESET_ENABLED:-true}
       - SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS=${SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS:-300}
+      # If contention stays unrecovered this long, ble-sensor self-exits so
+      # start.sh respawns it with a fresh BlueZ connection (reaps the stale
+      # discovery). Reliable where the D-Bus power-cycle is refused (Busy).
+      - SCAN_CONTENTION_RESTART_AFTER_SECONDS=${SCAN_CONTENTION_RESTART_AFTER_SECONDS:-600}
       - BLE_ADAPTER=${BLE_ADAPTER:-hci0}
       - SCAN_DURATION_SECONDS=20
       - POLL_INTERVAL=60
