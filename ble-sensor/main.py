@@ -1314,6 +1314,12 @@ async def collect_payload(
     return payload
 
 
+# Hard ceiling on the whole adapter power-cycle. A wedged BlueZ/D-Bus is exactly
+# the state we're recovering from, so any of the D-Bus awaits could hang; without
+# this bound a hang would freeze the scan loop worse than the contention itself.
+ADAPTER_RESET_TIMEOUT_SECONDS = 15.0
+
+
 async def _reset_ble_adapter(adapter: str) -> bool:
     """Best-effort power-cycle of the BlueZ adapter to clear a stuck discovery
     session — the D-Bus equivalent of ``hciconfig <adapter> reset``.
@@ -1324,8 +1330,9 @@ async def _reset_ble_adapter(adapter: str) -> bool:
     without this the scanner stays dead until a human reboots the device. Toggle
     ``Adapter1.Powered`` off→on to force a controller reset. Uses dbus-fast
     (already a bleak runtime dependency) over the system bus; imported lazily so
-    importing this module for unit tests never requires it. Never raises —
-    returns True only if the power-cycle completed.
+    importing this module for unit tests never requires it. The whole exchange is
+    bounded by ``ADAPTER_RESET_TIMEOUT_SECONDS`` so a hung bus can't wedge the
+    scan loop. Never raises — returns True only if the power-cycle completed.
     """
     try:
         from dbus_fast import BusType, Variant
@@ -1336,7 +1343,9 @@ async def _reset_ble_adapter(adapter: str) -> bool:
 
     path = f"/org/bluez/{adapter}"
     bus = None
-    try:
+
+    async def _do_reset() -> None:
+        nonlocal bus
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         introspection = await bus.introspect("org.bluez", path)
         obj = bus.get_proxy_object("org.bluez", path, introspection)
@@ -1352,6 +1361,9 @@ async def _reset_ble_adapter(adapter: str) -> bool:
         await asyncio.sleep(2.0)
         await props.call_set("org.bluez.Adapter1", "Powered", Variant("b", True))
         await asyncio.sleep(2.0)
+
+    try:
+        await asyncio.wait_for(_do_reset(), timeout=ADAPTER_RESET_TIMEOUT_SECONDS)
         logger.info("Power-cycled BlueZ adapter %s to clear stuck discovery.", adapter)
         return True
     except Exception as exc:
@@ -1483,6 +1495,11 @@ async def run() -> None:
 
                     if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
                         scan_retry_attempt = 0
+                        # Refresh: the backoff (+ optional cooldown) sleeps above
+                        # mean the `now` captured at the top of the branch is stale
+                        # by up to tens of seconds, which would skew both the
+                        # elapsed report and the reset/heartbeat throttles.
+                        now = time.monotonic()
                         elapsed = int(now - contention_since_monotonic)
                         # Persistent contention won't clear by re-issuing
                         # StartDiscovery (that's the call that keeps failing), so
