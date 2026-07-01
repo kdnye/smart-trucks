@@ -2,9 +2,11 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import sqlite3 as _sqlite3
+import time
 from urllib.parse import quote as _urlquote
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +17,12 @@ from bleak import BleakScanner
 
 from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [ble-sensor] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # While Sentry-suspended, re-check the sentinel on this short cadence so scanning
 # resumes promptly on wake instead of waiting out a full poll interval (up to 900s).
@@ -35,6 +43,7 @@ class Config:
     scan_contention_backoff_cap_seconds: float
     scan_contention_cooldown_threshold: int
     scan_contention_max_attempts_before_reset: int
+    scan_contention_summary_interval_seconds: float
     local_db_path: str
     telematics_db_path: str
     pi_location_db_path: str
@@ -58,8 +67,8 @@ def load_config() -> Config:
     scan_duration_seconds = read_float_env("SCAN_DURATION_SECONDS", 20.0, minimum=1.0)
     recommended_poll_minimum = scan_duration_seconds + 15
     if poll_interval_seconds < recommended_poll_minimum:
-        print(
-            "Warning: POLL_INTERVAL is shorter than the recommended minimum for long "
+        logger.warning(
+            "POLL_INTERVAL is shorter than the recommended minimum for long "
             f"scans. Current={poll_interval_seconds}s, Recommended>="
             f"{recommended_poll_minimum:.0f}s (SCAN_DURATION_SECONDS + 15)."
         )
@@ -91,6 +100,9 @@ def load_config() -> Config:
         ),
         scan_contention_max_attempts_before_reset=read_int_env(
             "SCAN_CONTENTION_MAX_ATTEMPTS_BEFORE_RESET", 10, minimum=1
+        ),
+        scan_contention_summary_interval_seconds=read_float_env(
+            "SCAN_CONTENTION_SUMMARY_INTERVAL_SECONDS", 600.0, minimum=30.0
         ),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         telematics_db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
@@ -1198,9 +1210,9 @@ def _write_ble_wake_signal() -> None:
                 "INSERT INTO wake_signals (signal_type, created_at) VALUES (?, ?)",
                 ("ble_key_beacon", datetime.now(timezone.utc).isoformat()),
             )
-        print("Key beacon detected: wake signal written to shared DB.")
+        logger.info("Key beacon detected: wake signal written to shared DB.")
     except Exception as exc:  # pylint: disable=broad-except
-        print(f"Failed to write BLE wake signal: {exc}")
+        logger.warning("Failed to write BLE wake signal: %s", exc)
 
 
 async def collect_payload(
@@ -1222,7 +1234,7 @@ async def collect_payload(
             uuids = {str(u).upper() for u in (adv_data.service_uuids or [])}
             mfr_keys = set((adv_data.manufacturer_data or {}).keys())
             if uuids & config.key_beacon_uuids or mfr_keys & config.key_beacon_manufacturer_ids:
-                print(f"Key beacon matched: address={device.address}")
+                logger.info("Key beacon matched: address=%s", device.address)
                 _write_ble_wake_signal()
                 break
 
@@ -1296,21 +1308,29 @@ async def collect_payload(
 async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
+    # Scan-contention episode tracking. A single WARNING is logged when an
+    # episode starts and again (throttled) while it persists, instead of a line
+    # per retry — a permanently stuck radio must not flood the logs. Per-attempt
+    # detail stays available at DEBUG. `contention_since_monotonic` is None
+    # whenever scanning is healthy and is only cleared on recovery.
+    contention_since_monotonic: float | None = None
+    last_contention_log_monotonic = 0.0
     _init_local_store(config.local_db_path)
     _init_shared_queue_store(config.telematics_db_path)
     _sync_tracked_asset_registry(config)
 
     if config.anonymize_mac and not config.mac_hash_salt:
-        print(
-            "Warning: ANONYMIZE_MAC=true but MAC_HASH_SALT is empty. "
+        logger.warning(
+            "ANONYMIZE_MAC=true but MAC_HASH_SALT is empty. "
             "Set a unique secret salt per deployment for stronger privacy guarantees."
         )
 
-    print(
+    logger.info(
         "BLE scan contention config: "
         f"backoff_cap={config.scan_contention_backoff_cap_seconds}s, "
         f"cooldown_threshold={config.scan_contention_cooldown_threshold}, "
-        f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}."
+        f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}, "
+        f"summary_interval={config.scan_contention_summary_interval_seconds}s."
     )
 
     suspend_flag_path = sentry_flag.flag_path()
@@ -1344,6 +1364,12 @@ async def run() -> None:
         try:
             try:
                 payload = await collect_payload(config, scan_duration_seconds)
+                if contention_since_monotonic is not None:
+                    logger.info(
+                        "BlueZ scan-start contention cleared after %ds; scanning resumed.",
+                        int(time.monotonic() - contention_since_monotonic),
+                    )
+                    contention_since_monotonic = None
                 scan_retry_attempt = 0
             except Exception as exc:
                 err_text = f"{exc}".lower()
@@ -1357,6 +1383,18 @@ async def run() -> None:
 
                 if is_op_in_progress:
                     apply_poll_sleep = False
+                    now = time.monotonic()
+                    if contention_since_monotonic is None:
+                        # New contention episode: alert once at WARNING with the
+                        # remediation hint. Subsequent retries stay at DEBUG.
+                        contention_since_monotonic = now
+                        last_contention_log_monotonic = now
+                        logger.warning(
+                            "BlueZ scan-start contention detected; backing off and "
+                            "retrying. Check for competing BLE scanners on the host. "
+                            "(%s)",
+                            exc,
+                        )
                     backoff_seconds = min(
                         config.scan_contention_backoff_cap_seconds,
                         0.75 * (2**scan_retry_attempt),
@@ -1364,25 +1402,36 @@ async def run() -> None:
                     jitter_seconds = random.uniform(0, 0.5)
                     sleep_seconds = backoff_seconds + jitter_seconds
                     scan_retry_attempt += 1
-                    print(
-                        "BlueZ scan-start contention detected "
-                        f"(attempt {scan_retry_attempt}): {exc}. "
-                        f"Retrying in {sleep_seconds:.2f}s."
+                    logger.debug(
+                        "BlueZ scan-start contention (attempt %d): %s. Retrying in %.2fs.",
+                        scan_retry_attempt,
+                        exc,
+                        sleep_seconds,
                     )
                     await asyncio.sleep(sleep_seconds)
                     if scan_retry_attempt % config.scan_contention_cooldown_threshold == 0:
-                        print(
-                            "Repeated scan contention detected. Applying extended "
-                            f"cooldown of {config.post_interval_seconds}s before retry."
+                        logger.debug(
+                            "Repeated scan contention; applying extended cooldown of "
+                            "%ss before retry.",
+                            config.post_interval_seconds,
                         )
                         await asyncio.sleep(config.post_interval_seconds)
 
                     if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
-                        print(
-                            "Persistent BlueZ scan contention detected. Resetting retry "
-                            f"counter after {config.post_interval_seconds}s cooldown. "
-                            "Check for competing BLE scanners on the host."
-                        )
+                        # Persistent contention: emit a throttled heartbeat instead
+                        # of a line per reset so a permanently stuck radio stays
+                        # visible without flooding the logs.
+                        if (
+                            now - last_contention_log_monotonic
+                            >= config.scan_contention_summary_interval_seconds
+                        ):
+                            logger.warning(
+                                "BlueZ scan-start contention persisting for %ds; still "
+                                "unable to start scans. Check for competing BLE "
+                                "scanners on the host.",
+                                int(now - contention_since_monotonic),
+                            )
+                            last_contention_log_monotonic = now
                         scan_retry_attempt = 0
                         await asyncio.sleep(config.post_interval_seconds)
                     continue
@@ -1393,13 +1442,14 @@ async def run() -> None:
             # wait up to the busy-timeout (+retries), which must not freeze the
             # scan loop / Bluetooth radio handling.
             await asyncio.to_thread(_persist_scan_to_db, config, payload)
-            print(
-                f"Recorded BLE scan (sensor_count={payload['sensor_count']}) "
-                f"for captured_at_utc={payload['captured_at_utc']}; "
-                "queued ble_sensor_scan for upload."
+            logger.info(
+                "Recorded BLE scan (sensor_count=%s) for captured_at_utc=%s; "
+                "queued ble_sensor_scan for upload.",
+                payload["sensor_count"],
+                payload["captured_at_utc"],
             )
         except Exception as exc:
-            print(f"Scan loop error: {exc}")
+            logger.error("Scan loop error: %s", exc)
 
         if apply_poll_sleep:
             await asyncio.sleep(poll_interval_seconds)

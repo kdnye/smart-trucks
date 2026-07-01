@@ -604,7 +604,9 @@ async def purge_old_sent_rows(days: int = 7) -> int:
                     + (ble_cursor.rowcount or 0)
                 )
                 if deleted_total:
-                    logger.info("Purged %d old sent rows older than %d days", deleted_total, days)
+                    # Routine housekeeping that runs every drain cycle — keep it at
+                    # DEBUG so it doesn't drown the steady-state logs.
+                    logger.debug("Purged %d old sent rows older than %d days", deleted_total, days)
                 return deleted_total
         except aiosqlite.OperationalError as exc:
             if _is_locked_error(exc) and attempt < attempts:
