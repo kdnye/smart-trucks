@@ -1,0 +1,4 @@
+# Superseded by edge/requirements.txt (anchor-bridge runs as a co-process in
+# the unified edge image). Kept for reference / standalone runs.
+pyserial==3.5
+paho-mqtt==2.1.0

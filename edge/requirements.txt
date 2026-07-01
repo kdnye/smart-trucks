@@ -1,5 +1,5 @@
-# Union of telematics-edge + ble-sensor + sync-service runtime deps. The edge
-# container runs all three as co-processes (see edge/start.sh).
+# Union of telematics-edge + ble-sensor + sync-service + anchor-bridge runtime
+# deps. The edge container runs all four as co-processes (see edge/start.sh).
 pyserial==3.5
 pynmea2==1.19.0
 aiohttp==3.9.3
@@ -8,3 +8,5 @@ aiosqlite==0.19.0
 uvloop==0.19.0
 bleak>=0.21,<0.23
 requests
+# ATOM Lite anchor pipeline (anchor-bridge publisher + ble-sensor ingest).
+paho-mqtt==2.1.0

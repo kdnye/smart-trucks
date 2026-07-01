@@ -75,6 +75,23 @@ services:
       - BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS=${BLE_POLL_INTERVAL_LOW_BATTERY_SECONDS:-900}
       - BLE_LOW_BATTERY_SOC_PCT=${BLE_LOW_BATTERY_SOC_PCT:-25}
       - BLE_SCAN_DURATION_LOW_POWER_SECONDS=${BLE_SCAN_DURATION_LOW_POWER_SECONDS:-10}
+      # --- ATOM Lite anchor pipeline (mosquitto + anchor-bridge + ingest) ---
+      # The container is privileged, so the gateway ATOM's USB serial device
+      # (/dev/ttyACM0 or /dev/ttyUSB0) is reachable without a devices: entry.
+      - ANCHOR_PIPELINE_ENABLED=${ANCHOR_PIPELINE_ENABLED:-true}
+      - ANCHOR_INGEST_ENABLED=${ANCHOR_INGEST_ENABLED:-true}
+      - ANCHOR_SERIAL_CANDIDATES=${ANCHOR_SERIAL_CANDIDATES:-/dev/ttyACM0,/dev/ttyUSB0,/dev/ttyACM1,/dev/ttyUSB1}
+      - ANCHOR_MQTT_HOST=${ANCHOR_MQTT_HOST:-127.0.0.1}
+      - ANCHOR_MQTT_PORT=${ANCHOR_MQTT_PORT:-1883}
+      # Optional scan tuning pushed to the gateway (and broadcast to every
+      # anchor over ESP-NOW) on connect; unset leaves the nodes' NVS values.
+      - ANCHOR_REPORT_INTERVAL_S=${ANCHOR_REPORT_INTERVAL_S:-}
+      - ANCHOR_RSSI_FLOOR=${ANCHOR_RSSI_FLOOR:-}
+      # Registration: JSON file synced from the dashboard's ble_anchor_registry
+      # and/or a comma-separated anchor-id allowlist. Neither set -> open mode
+      # (all anchors accepted; the cloud still auto-registers them inactive).
+      - ANCHOR_REGISTRY_PATH=${ANCHOR_REGISTRY_PATH:-/data/anchor_registry.json}
+      - ANCHOR_ALLOWLIST=${ANCHOR_ALLOWLIST:-}
       # --- Cloud upload (sync-service) ---
       - WEBHOOK_URL=${WEBHOOK_URL}
       - EDGE_INGEST_KEY=${EDGE_INGEST_KEY}

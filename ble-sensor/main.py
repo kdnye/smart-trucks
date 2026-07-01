@@ -15,6 +15,7 @@ from typing import Any
 import uvloop
 from bleak import BleakScanner
 
+import anchor_ingest
 from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
 
@@ -574,6 +575,13 @@ def _device_type_from_metadata(mac_address: str, metadata: dict[str, Any]) -> st
     return KNOWN_OUIS.get(oui, "Unknown")
 
 
+def _ensure_column(conn: "_sqlite3.Connection", table: str, column: str, ddl: str) -> None:
+    """Idempotent ALTER TABLE ... ADD COLUMN for existing on-device DBs."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def _init_local_store(db_path: str) -> None:
     with _sqlite3.connect(db_path, timeout=30.0) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -590,10 +598,15 @@ def _init_local_store(db_path: str) -> None:
                 latitude REAL,
                 longitude REAL,
                 gps_timestamp TEXT,
-                gps_age_seconds INTEGER
+                gps_age_seconds INTEGER,
+                observer_id TEXT
             );
             """
         )
+        # observer_id: which vantage point saw the device — the Pi itself
+        # (== pi_id) or an ATOM Lite anchor ("anchor-a1b2c3"). NULL on rows
+        # written before the anchor feature ⇒ treated as the Pi.
+        _ensure_column(conn, "ble_device_observations", "observer_id", "observer_id TEXT")
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_ble_observations_mac_time
@@ -621,14 +634,44 @@ def _init_local_store(db_path: str) -> None:
                 resolved_longitude REAL,
                 resolution_method TEXT NOT NULL,
                 candidate_count INTEGER NOT NULL,
-                confidence_score REAL NOT NULL
+                confidence_score REAL NOT NULL,
+                nearest_observer_id TEXT,
+                observer_count INTEGER
             );
             """
+        )
+        # Resolver v2 outputs: the strongest vantage point for the asset in the
+        # window (zone-level presence) and how many observers saw it.
+        _ensure_column(
+            conn, "tracked_asset_resolutions", "nearest_observer_id", "nearest_observer_id TEXT"
+        )
+        _ensure_column(
+            conn, "tracked_asset_resolutions", "observer_count", "observer_count INTEGER"
         )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_tracked_asset_resolutions_lookup
             ON tracked_asset_resolutions(tracked_mac_normalized, captured_at_utc DESC);
+            """
+        )
+        # Latest status snapshot per ATOM Lite anchor at this site (fed by
+        # anchor_ingest; edge-side diagnostics + registration state).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS anchor_status (
+                anchor_id TEXT PRIMARY KEY,
+                parent_pi_id TEXT,
+                role TEXT NOT NULL DEFAULT 'anchor',
+                registered INTEGER NOT NULL DEFAULT 0,
+                last_seen_utc TEXT,
+                link_rssi INTEGER,
+                fw_version TEXT,
+                free_heap INTEGER,
+                uptime_s INTEGER,
+                report_interval_s INTEGER,
+                rssi_floor INTEGER,
+                channel INTEGER
+            );
             """
         )
 
@@ -734,6 +777,9 @@ def _sync_tracked_asset_registry(config: Config) -> None:
 def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
     captured_at_utc = str(payload.get("captured_at_utc") or _utc_now_iso())
     pi_id = str(payload.get("pi_id") or "unknown-pi")
+    # Vantage point: the Pi itself for its own scans; an ATOM Lite anchor id
+    # ("anchor-a1b2c3") for payloads built by anchor_ingest.
+    observer_id = str(payload.get("observer_id") or pi_id)
     vehicle_id = str(payload.get("vehicle_id") or "UNKNOWN_TRUCK")
     pi_location = payload.get("pi_location") if isinstance(payload.get("pi_location"), dict) else {}
     latitude = pi_location.get("latitude") if isinstance(pi_location, dict) else None
@@ -762,6 +808,7 @@ def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
                 longitude,
                 gps_timestamp,
                 gps_age_seconds,
+                observer_id,
             )
         )
     if not rows:
@@ -774,8 +821,8 @@ def _record_scan_observations(db_path: str, payload: dict[str, Any]) -> None:
                 """
                 INSERT INTO ble_device_observations (
                     captured_at_utc, pi_id, vehicle_id, tracked_mac_normalized, rssi,
-                    latitude, longitude, gps_timestamp, gps_age_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    latitude, longitude, gps_timestamp, gps_age_seconds, observer_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -837,6 +884,38 @@ def _score_candidate(
     return (0.5 * rssi_score) + (0.3 * scan_score) + (0.2 * gps_score)
 
 
+def _rank_observers(candidates: list[dict[str, Any]]) -> tuple[str | None, int]:
+    """Rank the vantage points that saw an asset within the candidate window.
+
+    Returns ``(nearest_observer_id, observer_count)``: the observer (Pi or
+    ATOM Lite anchor) with the strongest **median** RSSI across its
+    observations in the window — median beats max under multipath — and how
+    many distinct observers saw the asset. Deterministic tie-break by
+    observer id. Pure function; unit-tested without hardware.
+    """
+    by_observer: dict[str, list[int]] = {}
+    for candidate in candidates:
+        observer_id = candidate.get("observer_id")
+        rssi = candidate.get("rssi")
+        if not observer_id or rssi is None:
+            continue
+        by_observer.setdefault(str(observer_id), []).append(int(rssi))
+    if not by_observer:
+        return None, 0
+
+    def median_rssi(values: list[int]) -> float:
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2 == 1:
+            return float(ordered[mid])
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    ranked = sorted(
+        by_observer.items(), key=lambda item: (-median_rssi(item[1]), item[0])
+    )
+    return ranked[0][0], len(by_observer)
+
+
 def _resolve_tracked_asset_positions(config: Config) -> None:
     now = datetime.now(timezone.utc)
     with _sqlite3.connect(config.local_db_path, timeout=30.0, isolation_level="IMMEDIATE") as conn:
@@ -851,7 +930,8 @@ def _resolve_tracked_asset_positions(config: Config) -> None:
         for (tracked_mac,) in tracked_assets:
             candidate_rows = conn.execute(
                 """
-                SELECT id, captured_at_utc, pi_id, rssi, latitude, longitude, gps_age_seconds
+                SELECT id, captured_at_utc, pi_id, rssi, latitude, longitude,
+                       gps_age_seconds, COALESCE(observer_id, pi_id) AS observer_id
                 FROM ble_device_observations
                 WHERE tracked_mac_normalized = ?
                 ORDER BY captured_at_utc DESC, id DESC
@@ -887,6 +967,8 @@ def _resolve_tracked_asset_positions(config: Config) -> None:
                         "latitude": row[4],
                         "longitude": row[5],
                         "score": score,
+                        "rssi": row[3],
+                        "observer_id": str(row[7]) if row[7] is not None else str(row[2]),
                     }
                 )
             if not candidates:
@@ -938,13 +1020,16 @@ def _resolve_tracked_asset_positions(config: Config) -> None:
                         resolved_pi_id = min(winner["pi_id"], second["pi_id"])
 
             confidence_score = max(0.0, min(1.0, float(winner["score"])))
+            # Zone-level presence within the site: strongest median-RSSI
+            # vantage point (Pi or ATOM anchor) among this window's candidates.
+            nearest_observer_id, observer_count = _rank_observers(candidates)
             conn.execute(
                 """
                 INSERT INTO tracked_asset_resolutions (
                     captured_at_utc, tracked_mac_normalized, vehicle_id, resolved_pi_id,
                     resolved_latitude, resolved_longitude, resolution_method, candidate_count,
-                    confidence_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence_score, nearest_observer_id, observer_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _utc_now_iso(),
@@ -956,6 +1041,8 @@ def _resolve_tracked_asset_positions(config: Config) -> None:
                     method,
                     len(candidates),
                     confidence_score,
+                    nearest_observer_id,
+                    observer_count,
                 ),
             )
 
@@ -1289,6 +1376,9 @@ async def collect_payload(
     payload: dict[str, Any] = {
         "vehicle_id": config.vehicle_id,
         "pi_id": config.pi_id,
+        # The Pi is one vantage point among the site's observers (ATOM Lite
+        # anchors are the others — see anchor_ingest.py).
+        "observer_id": config.pi_id,
         "captured_at_utc": captured_at_utc,
         "event_type": "ble_sensor_scan",
         "idempotency_key": (
@@ -1381,6 +1471,48 @@ async def _reset_ble_adapter(adapter: str) -> bool:
                 pass
 
 
+def _build_anchor_ingest_context(config: Config) -> "anchor_ingest.IngestContext":
+    """Wire anchor_ingest to this module's persistence + location helpers.
+
+    Injected as callables (rather than anchor_ingest importing us) to avoid a
+    circular import and keep the handler unit-testable with fakes.
+    """
+
+    def _get_pi_location() -> dict[str, Any]:
+        location = _read_pi_location_from_cache(config.pi_location_cache_path)
+        if location is None:
+            try:
+                location = _read_last_locked_gps_from_db(
+                    db_path=config.telematics_db_path,
+                    lock_timeout_seconds=config.pi_location_query_timeout_seconds,
+                )
+            except Exception:
+                location = None
+        if location is None:
+            return _empty_pi_location()
+        latitude, longitude, gps_timestamp = location
+        return _pi_location_from_last_locked(
+            latitude=latitude,
+            longitude=longitude,
+            gps_timestamp=gps_timestamp,
+            stale_after_seconds=config.pi_location_stale_after_seconds,
+        )
+
+    return anchor_ingest.IngestContext(
+        config=anchor_ingest.load_ingest_config(),
+        pi_id=config.pi_id,
+        vehicle_id=config.vehicle_id,
+        local_db_path=config.local_db_path,
+        record_observations=lambda payload: _record_scan_observations(
+            config.local_db_path, payload
+        ),
+        enqueue_scan=lambda payload: _enqueue_ble_scan(config.telematics_db_path, payload),
+        get_pi_location=_get_pi_location,
+        classify_mac=lambda mac: KNOWN_OUIS.get(mac[:8], "Unknown"),
+        canonicalize_mac=_canonicalize_mac_address,
+    )
+
+
 async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
@@ -1395,6 +1527,14 @@ async def run() -> None:
     _init_local_store(config.local_db_path)
     _init_shared_queue_store(config.telematics_db_path)
     _sync_tracked_asset_registry(config)
+
+    # ATOM Lite anchor ingest (MQTT -> observation store). Additive feature:
+    # runs on paho's own network thread and must never take down the Pi's own
+    # BLE scanning, so failures only log.
+    try:
+        anchor_ingest.start_ingest(_build_anchor_ingest_context(config))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Anchor ingest failed to start: %s", exc)
 
     if config.anonymize_mac and not config.mac_hash_salt:
         logger.warning(

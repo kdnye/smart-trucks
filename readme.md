@@ -26,6 +26,13 @@ on the 512 MB Pi Zero 2 W:
   * *sync-service* — drains the SQLite store-and-forward queues (`gps_points`,
     `heartbeats`, `edge_health`, `ble_scans`) and POSTs them to the cloud ingest
     endpoint.
+  * *anchor-bridge* + *mosquitto* — optional ATOM Lite BLE-anchor pipeline
+    (`ANCHOR_PIPELINE_ENABLED`, default on): a gateway ATOM on the Pi's USB
+    port streams ESP-NOW anchor scans as NDJSON; anchor-bridge republishes
+    them to the loopback-only mosquitto broker and ble-sensor's in-process
+    ingest folds them into the observation store as extra `observer_id`
+    vantage points (nearest-anchor presence). See `anchor-firmware/README.md`.
+    Idles cheaply when no gateway is plugged in.
 * **`wifi-provisioner`** (control plane, host networking, privileged): the **sole
   owner of `wlan0`/NetworkManager** — saved-network reconnect + roaming and the
   setup-AP captive portal (see `docs/WIFI_PROVISIONING.md`) — **and** the
@@ -58,6 +65,11 @@ telematics-fleet/
 ├── sync-service/              # drains SQLite queues → cloud              (co-process)
 │   ├── main.py
 │   └── requirements.txt
+├── anchor-bridge/             # gateway-ATOM USB serial → local MQTT      (co-process)
+│   └── main.py
+├── anchor-firmware/           # M5 ATOM Lite anchor/gateway firmware (PlatformIO)
+│   ├── platformio.ini
+│   └── src/
 ├── wifi-provisioner/          # wlan0/NetworkManager + captive portal + edge watchdog
 │   ├── Dockerfile
 │   ├── main.py

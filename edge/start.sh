@@ -56,4 +56,14 @@ supervise telematics-edge python /usr/src/app/telematics-edge/main.py
 supervise ble-sensor      python /usr/src/app/ble-sensor/main.py
 supervise sync-service    python /usr/src/app/sync-service/main.py
 
+# ATOM Lite anchor pipeline (opt-out with ANCHOR_PIPELINE_ENABLED=false):
+# mosquitto is the loopback-only broker (edge/mosquitto.conf); anchor-bridge
+# pumps the gateway ATOM's USB serial NDJSON into it; ble-sensor's in-process
+# anchor ingest subscribes. anchor-bridge idles cheaply (30s probes) when no
+# gateway is plugged in, so sites without anchors pay ~zero cost.
+if [ "${ANCHOR_PIPELINE_ENABLED:-true}" = "true" ]; then
+  supervise mosquitto     mosquitto -c /usr/src/app/edge/mosquitto.conf
+  supervise anchor-bridge python /usr/src/app/anchor-bridge/main.py
+fi
+
 wait
