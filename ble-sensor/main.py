@@ -18,10 +18,9 @@ from bleak import BleakScanner
 from shared import sentry_flag, sqlite_util
 from shared.env import read_bool_env, read_float_env, read_int_env, read_str_env
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s [ble-sensor] %(message)s",
-)
+# Root-logger config is applied in __main__ only (see bottom of file) so importing
+# this module — e.g. from unit tests — doesn't install a handler on the root logger
+# or override the test runner's logging setup.
 logger = logging.getLogger(__name__)
 
 # While Sentry-suspended, re-check the sentinel on this short cadence so scanning
@@ -1456,5 +1455,9 @@ async def run() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s [ble-sensor] %(message)s",
+    )
     uvloop.install()
     asyncio.run(run())
