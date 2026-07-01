@@ -293,6 +293,35 @@ class RegistryLoaderTests(unittest.TestCase):
             registry = anchor_ingest.load_anchor_registry(path, frozenset({"anchor-a1b2c3"}))
             self.assertEqual(registry, {"anchor-a1b2c3": True})
 
+    def test_empty_registry_file_fails_closed_not_open(self):
+        """A configured-but-empty registry means 'no anchors approved' — it
+        must NOT fall back to open mode (allowlist bypass)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "empty.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[]")
+            registry = anchor_ingest.load_anchor_registry(path, frozenset())
+            self.assertEqual(registry, {})  # closed: quarantine everything
+
+    def test_corrupt_registry_file_without_allowlist_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "broken.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{not json")
+            registry = anchor_ingest.load_anchor_registry(path, frozenset())
+            self.assertEqual(registry, {})  # fail closed, not open
+
+    def test_empty_registry_file_quarantines_scans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "empty.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[]")
+            recorder = _Recorder()
+            ctx = _make_ctx(tmp, recorder, registry_path=path)
+            anchor_ingest.handle_frame(ctx, "anchors/anchor-a1b2c3/scan", _scan_frame())
+            self.assertEqual(recorder.enqueued, [])
+            self.assertEqual(recorder.observations, [])
+
 
 class SchemaMigrationTests(unittest.TestCase):
     def test_observer_id_added_to_pre_anchor_database(self):

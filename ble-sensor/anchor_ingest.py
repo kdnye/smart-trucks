@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -109,7 +111,14 @@ def load_anchor_registry(path: str, allowlist: frozenset[str]) -> dict[str, bool
     File format (synced down from the dashboard's ble_anchor_registry):
         [{"anchor_id": "anchor-a1b2c3", "active": true, "label": "..."}, ...]
     The env allowlist is merged in as active=True (bootstrap without a file).
+
+    Open mode is decided by *configuration*, not by the loaded result: an
+    existing-but-empty registry file means "no anchor is approved here" and
+    must quarantine everything — returning None for it would silently bypass
+    the allowlist.
     """
+    if not allowlist and not (path and os.path.exists(path)):
+        return None  # nothing configured -> open mode
     registry: dict[str, bool] = {anchor_id: True for anchor_id in allowlist}
     if path and os.path.exists(path):
         try:
@@ -125,7 +134,7 @@ def load_anchor_registry(path: str, allowlist: frozenset[str]) -> dict[str, bool
                 anchor_id = item.get("anchor_id")
                 if valid_anchor_id(anchor_id):
                     registry[str(anchor_id)] = bool(item.get("active", True))
-    return registry if registry else None
+    return registry
 
 
 def _refresh_registry(ctx: IngestContext) -> None:
@@ -328,10 +337,23 @@ def handle_frame(ctx: IngestContext, topic: str, frame: dict[str, Any]) -> None:
         _upsert_anchor_status(ctx, anchor_id, role="gateway", registered=allowed, frame=frame)
 
 
+# Bounded hand-off between the paho network thread and the SQLite writer
+# thread. Sized for minutes of backlog at real anchor rates (7 anchors ×
+# ~5 msgs/min); beyond that we shed load rather than grow without bound.
+_WORK_QUEUE_MAX = 256
+
+
 def start_ingest(ctx: IngestContext) -> Any:
-    """Start the paho-mqtt network thread. Returns the client (or None when
-    disabled/unavailable). Never raises: anchor ingest is an additive feature
-    and must not take down the Pi's own BLE scanning."""
+    """Start the paho-mqtt network thread + a dedicated SQLite writer thread.
+    Returns the client (or None when disabled/unavailable). Never raises:
+    anchor ingest is an additive feature and must not take down the Pi's own
+    BLE scanning.
+
+    The paho callback only enqueues: SQLite writes can stall for the full
+    busy-timeout (+retries) under lock contention, and blocking the network
+    thread that long would starve MQTT keepalives and drop the connection.
+    The writer thread absorbs the stall; a full queue sheds the newest frame
+    (anchors re-report every window anyway)."""
     if not ctx.config.enabled:
         logger.info("Anchor ingest disabled (ANCHOR_INGEST_ENABLED=false).")
         return None
@@ -341,6 +363,20 @@ def start_ingest(ctx: IngestContext) -> Any:
         logger.warning("paho-mqtt not installed; anchor ingest disabled.")
         return None
 
+    work_queue: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue(maxsize=_WORK_QUEUE_MAX)
+
+    def writer_loop() -> None:
+        while True:
+            topic, frame = work_queue.get()
+            try:
+                handle_frame(ctx, topic, frame)
+            except Exception as exc:  # never kill the writer thread
+                logger.error("Anchor ingest failed on %s: %s", topic, exc)
+            finally:
+                work_queue.task_done()
+
+    threading.Thread(target=writer_loop, name="anchor-ingest-writer", daemon=True).start()
+
     def on_connect(client, _userdata, _flags, reason_code, _properties=None) -> None:
         logger.info("Anchor ingest connected to MQTT (%s)", reason_code)
         client.subscribe([("anchors/+/scan", 0), ("anchors/+/status", 0), ("anchors/+/gateway", 0)])
@@ -348,10 +384,17 @@ def start_ingest(ctx: IngestContext) -> Any:
     def on_message(_client, _userdata, message) -> None:
         try:
             frame = json.loads(message.payload.decode("utf-8"))
-            if isinstance(frame, dict):
-                handle_frame(ctx, message.topic, frame)
+            if not isinstance(frame, dict):
+                return
+            work_queue.put_nowait((message.topic, frame))
+        except queue.Full:
+            logger.warning(
+                "Anchor ingest queue full (%d); dropping frame on %s.",
+                _WORK_QUEUE_MAX,
+                message.topic,
+            )
         except Exception as exc:  # never kill the network thread
-            logger.error("Anchor ingest failed on %s: %s", message.topic, exc)
+            logger.error("Anchor ingest failed to enqueue %s: %s", message.topic, exc)
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ble-sensor-anchor-ingest")
     client.on_connect = on_connect

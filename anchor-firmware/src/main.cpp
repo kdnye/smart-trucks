@@ -14,6 +14,8 @@
 #include <ArduinoJson.h>
 #include <FastLED.h>
 
+#include <cstdarg>
+
 #include "config.h"
 #include "espnow_link.h"
 #include "frames.h"
@@ -100,33 +102,56 @@ size_t anchors_recent_count() {
 
 // ── Gateway: NDJSON emit ─────────────────────────────────────────────────────
 
+// Append printf-formatted text to g_json at `off`, clamping to the buffer.
+// Returns false once the buffer is full (snprintf reports the would-be length
+// on truncation, so an unchecked `sizeof - off` would underflow and overflow
+// the buffer on the next write). On false, callers drop the whole line — a
+// truncated frame is worse than a missing one (the bridge rejects bad JSON).
+bool json_append(int &off, const char *fmt, ...) {
+    if (off < 0 || off >= (int)sizeof(g_json)) return false;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(g_json + off, sizeof(g_json) - off, fmt, args);
+    va_end(args);
+    if (written < 0 || written >= (int)sizeof(g_json) - off) {
+        off = (int)sizeof(g_json);  // mark full
+        return false;
+    }
+    off += written;
+    return true;
+}
+
 // link_rssi_valid=false emits `"link_rssi":null` (the gateway's own scans).
 void emit_scan_json(const String &anchor_id, uint32_t seq, uint8_t part,
                     uint8_t part_count, uint16_t window_s, bool link_rssi_valid,
                     int link_rssi, const DeviceRecord *devices, size_t count) {
-    int off = snprintf(g_json, sizeof(g_json),
-                       "{\"type\":\"anchor_scan\",\"anchor_id\":\"%s\","
-                       "\"gateway_id\":\"%s\",\"seq\":%lu,\"part\":%u,"
-                       "\"part_count\":%u,\"window_s\":%u,",
-                       anchor_id.c_str(), g_node_id.c_str(), (unsigned long)seq,
-                       part, part_count, window_s);
-    if (link_rssi_valid && link_rssi != 0) {
-        off += snprintf(g_json + off, sizeof(g_json) - off, "\"link_rssi\":%d,",
-                        link_rssi);
-    } else {
-        off += snprintf(g_json + off, sizeof(g_json) - off, "\"link_rssi\":null,");
+    int off = 0;
+    if (!json_append(off,
+                     "{\"type\":\"anchor_scan\",\"anchor_id\":\"%s\","
+                     "\"gateway_id\":\"%s\",\"seq\":%lu,\"part\":%u,"
+                     "\"part_count\":%u,\"window_s\":%u,",
+                     anchor_id.c_str(), g_node_id.c_str(), (unsigned long)seq,
+                     part, part_count, window_s)) {
+        return;
     }
-    off += snprintf(g_json + off, sizeof(g_json) - off, "\"devices\":[");
+    if (link_rssi_valid && link_rssi != 0) {
+        if (!json_append(off, "\"link_rssi\":%d,", link_rssi)) return;
+    } else {
+        if (!json_append(off, "\"link_rssi\":null,")) return;
+    }
+    if (!json_append(off, "\"devices\":[")) return;
     for (size_t i = 0; i < count; i++) {
         char mac_str[18];
         format_mac(devices[i].mac, mac_str);
-        off += snprintf(g_json + off, sizeof(g_json) - off,
-                        "%s{\"mac\":\"%s\",\"rssi\":%d,\"max_rssi\":%d,\"count\":%u}",
-                        i == 0 ? "" : ",", mac_str, devices[i].median_rssi,
-                        devices[i].max_rssi, devices[i].sample_count);
-        if (off >= (int)sizeof(g_json) - 64) break;  // never overflow the buffer
+        if (off >= (int)sizeof(g_json) - 64) break;  // leave room for "]}"
+        if (!json_append(off,
+                         "%s{\"mac\":\"%s\",\"rssi\":%d,\"max_rssi\":%d,\"count\":%u}",
+                         i == 0 ? "" : ",", mac_str, devices[i].median_rssi,
+                         devices[i].max_rssi, devices[i].sample_count)) {
+            return;
+        }
     }
-    snprintf(g_json + off, sizeof(g_json) - off, "]}");
+    if (!json_append(off, "]}")) return;
     Serial.println(g_json);
 }
 
@@ -135,21 +160,24 @@ void emit_heartbeat_json(const String &anchor_id, const HeartbeatFrame &hb,
     char fw[13];
     memcpy(fw, hb.fw, 12);
     fw[12] = '\0';
-    int off = snprintf(g_json, sizeof(g_json),
-                       "{\"type\":\"anchor_heartbeat\",\"anchor_id\":\"%s\","
-                       "\"gateway_id\":\"%s\",\"seq\":%lu,\"uptime_s\":%lu,"
-                       "\"free_heap\":%lu,\"scan_devices_total\":%lu,"
-                       "\"report_interval_s\":%u,\"rssi_floor\":%d,"
-                       "\"channel\":%u,\"fw\":\"%s\",",
-                       anchor_id.c_str(), g_node_id.c_str(),
-                       (unsigned long)hb.hdr.seq, (unsigned long)hb.uptime_s,
-                       (unsigned long)hb.free_heap,
-                       (unsigned long)hb.scan_devices_total,
-                       hb.report_interval_s, hb.rssi_floor, hb.channel, fw);
+    int off = 0;
+    if (!json_append(off,
+                     "{\"type\":\"anchor_heartbeat\",\"anchor_id\":\"%s\","
+                     "\"gateway_id\":\"%s\",\"seq\":%lu,\"uptime_s\":%lu,"
+                     "\"free_heap\":%lu,\"scan_devices_total\":%lu,"
+                     "\"report_interval_s\":%u,\"rssi_floor\":%d,"
+                     "\"channel\":%u,\"fw\":\"%s\",",
+                     anchor_id.c_str(), g_node_id.c_str(),
+                     (unsigned long)hb.hdr.seq, (unsigned long)hb.uptime_s,
+                     (unsigned long)hb.free_heap,
+                     (unsigned long)hb.scan_devices_total,
+                     hb.report_interval_s, hb.rssi_floor, hb.channel, fw)) {
+        return;
+    }
     if (link_rssi_valid && link_rssi != 0) {
-        snprintf(g_json + off, sizeof(g_json) - off, "\"link_rssi\":%d}", link_rssi);
+        if (!json_append(off, "\"link_rssi\":%d}", link_rssi)) return;
     } else {
-        snprintf(g_json + off, sizeof(g_json) - off, "\"link_rssi\":null}");
+        if (!json_append(off, "\"link_rssi\":null}")) return;
     }
     Serial.println(g_json);
 }
