@@ -45,6 +45,7 @@ class Config:
     scan_contention_summary_interval_seconds: float
     scan_contention_adapter_reset_enabled: bool
     scan_contention_adapter_reset_interval_seconds: float
+    scan_contention_restart_after_seconds: float
     ble_adapter: str
     local_db_path: str
     telematics_db_path: str
@@ -111,6 +112,9 @@ def load_config() -> Config:
         ),
         scan_contention_adapter_reset_interval_seconds=read_float_env(
             "SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS", 300.0, minimum=30.0
+        ),
+        scan_contention_restart_after_seconds=read_float_env(
+            "SCAN_CONTENTION_RESTART_AFTER_SECONDS", 600.0, minimum=60.0
         ),
         ble_adapter=read_str_env("BLE_ADAPTER", "hci0"),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
@@ -1406,7 +1410,8 @@ async def run() -> None:
         f"summary_interval={config.scan_contention_summary_interval_seconds}s, "
         f"adapter_reset={config.scan_contention_adapter_reset_enabled} "
         f"(adapter={config.ble_adapter}, "
-        f"interval={config.scan_contention_adapter_reset_interval_seconds}s)."
+        f"interval={config.scan_contention_adapter_reset_interval_seconds}s), "
+        f"restart_after={config.scan_contention_restart_after_seconds}s."
     )
 
     suspend_flag_path = sentry_flag.flag_path()
@@ -1501,6 +1506,22 @@ async def run() -> None:
                         # elapsed report and the reset/heartbeat throttles.
                         now = time.monotonic()
                         elapsed = int(now - contention_since_monotonic)
+                        # Last resort: if contention has stayed unrecovered this
+                        # long, exit so the supervisor (edge/start.sh) respawns
+                        # ble-sensor with a FRESH BlueZ D-Bus connection. That lets
+                        # BlueZ reap the stale discovery session — the readme's
+                        # documented "restart the ble-sensor service" remedy — and
+                        # is the reliable recovery where an in-process adapter
+                        # power-cycle is refused (BlueZ returns Busy while a scan is
+                        # active) or no reset tooling is present. ble-sensor is its
+                        # own supervised process, so this doesn't disturb GPS/HB.
+                        if elapsed >= config.scan_contention_restart_after_seconds:
+                            logger.warning(
+                                "BLE scan-start contention unrecovered for %ds; exiting "
+                                "for a supervised restart to reset the BlueZ connection.",
+                                elapsed,
+                            )
+                            raise SystemExit(1)
                         # Persistent contention won't clear by re-issuing
                         # StartDiscovery (that's the call that keeps failing), so
                         # periodically power-cycle the adapter to break a wedged
