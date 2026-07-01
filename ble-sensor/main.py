@@ -43,6 +43,9 @@ class Config:
     scan_contention_cooldown_threshold: int
     scan_contention_max_attempts_before_reset: int
     scan_contention_summary_interval_seconds: float
+    scan_contention_adapter_reset_enabled: bool
+    scan_contention_adapter_reset_interval_seconds: float
+    ble_adapter: str
     local_db_path: str
     telematics_db_path: str
     pi_location_db_path: str
@@ -103,6 +106,13 @@ def load_config() -> Config:
         scan_contention_summary_interval_seconds=read_float_env(
             "SCAN_CONTENTION_SUMMARY_INTERVAL_SECONDS", 600.0, minimum=30.0
         ),
+        scan_contention_adapter_reset_enabled=read_bool_env(
+            "SCAN_CONTENTION_ADAPTER_RESET_ENABLED", default=True
+        ),
+        scan_contention_adapter_reset_interval_seconds=read_float_env(
+            "SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS", 300.0, minimum=30.0
+        ),
+        ble_adapter=read_str_env("BLE_ADAPTER", "hci0"),
         local_db_path=os.getenv("BLE_LOCAL_DB_PATH", "/data/ble-sensor.db"),
         telematics_db_path=os.getenv("TELEMATICS_DB_PATH", "/data/telematics.db"),
         pi_location_db_path=os.getenv(
@@ -1304,6 +1314,69 @@ async def collect_payload(
     return payload
 
 
+# Hard ceiling on the whole adapter power-cycle. A wedged BlueZ/D-Bus is exactly
+# the state we're recovering from, so any of the D-Bus awaits could hang; without
+# this bound a hang would freeze the scan loop worse than the contention itself.
+ADAPTER_RESET_TIMEOUT_SECONDS = 15.0
+
+
+async def _reset_ble_adapter(adapter: str) -> bool:
+    """Best-effort power-cycle of the BlueZ adapter to clear a stuck discovery
+    session — the D-Bus equivalent of ``hciconfig <adapter> reset``.
+
+    Persistent ``org.bluez.Error.InProgress`` scan-start contention means the
+    controller is wedged with an orphaned discovery that re-issuing
+    StartDiscovery can never clear (it is the very call that keeps failing), so
+    without this the scanner stays dead until a human reboots the device. Toggle
+    ``Adapter1.Powered`` off→on to force a controller reset. Uses dbus-fast
+    (already a bleak runtime dependency) over the system bus; imported lazily so
+    importing this module for unit tests never requires it. The whole exchange is
+    bounded by ``ADAPTER_RESET_TIMEOUT_SECONDS`` so a hung bus can't wedge the
+    scan loop. Never raises — returns True only if the power-cycle completed.
+    """
+    try:
+        from dbus_fast import BusType, Variant
+        from dbus_fast.aio import MessageBus
+    except Exception as exc:  # pragma: no cover - runtime-only dependency
+        logger.warning("Cannot reset adapter %s: dbus-fast import failed: %s", adapter, exc)
+        return False
+
+    path = f"/org/bluez/{adapter}"
+    bus = None
+
+    async def _do_reset() -> None:
+        nonlocal bus
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        introspection = await bus.introspect("org.bluez", path)
+        obj = bus.get_proxy_object("org.bluez", path, introspection)
+        adapter_iface = obj.get_interface("org.bluez.Adapter1")
+        props = obj.get_interface("org.freedesktop.DBus.Properties")
+        # Try a polite StopDiscovery first (clears a session this bus can see);
+        # the power-cycle below is the real hammer for sessions it cannot.
+        try:
+            await adapter_iface.call_stop_discovery()
+        except Exception:
+            pass
+        await props.call_set("org.bluez.Adapter1", "Powered", Variant("b", False))
+        await asyncio.sleep(2.0)
+        await props.call_set("org.bluez.Adapter1", "Powered", Variant("b", True))
+        await asyncio.sleep(2.0)
+
+    try:
+        await asyncio.wait_for(_do_reset(), timeout=ADAPTER_RESET_TIMEOUT_SECONDS)
+        logger.info("Power-cycled BlueZ adapter %s to clear stuck discovery.", adapter)
+        return True
+    except Exception as exc:
+        logger.warning("Power-cycle of BlueZ adapter %s failed: %s", adapter, exc)
+        return False
+    finally:
+        if bus is not None:
+            try:
+                bus.disconnect()
+            except Exception:
+                pass
+
+
 async def run() -> None:
     config = load_config()
     scan_retry_attempt = 0
@@ -1314,6 +1387,7 @@ async def run() -> None:
     # whenever scanning is healthy and is only cleared on recovery.
     contention_since_monotonic: float | None = None
     last_contention_log_monotonic = 0.0
+    last_adapter_reset_monotonic = 0.0
     _init_local_store(config.local_db_path)
     _init_shared_queue_store(config.telematics_db_path)
     _sync_tracked_asset_registry(config)
@@ -1329,7 +1403,10 @@ async def run() -> None:
         f"backoff_cap={config.scan_contention_backoff_cap_seconds}s, "
         f"cooldown_threshold={config.scan_contention_cooldown_threshold}, "
         f"max_attempts_before_reset={config.scan_contention_max_attempts_before_reset}, "
-        f"summary_interval={config.scan_contention_summary_interval_seconds}s."
+        f"summary_interval={config.scan_contention_summary_interval_seconds}s, "
+        f"adapter_reset={config.scan_contention_adapter_reset_enabled} "
+        f"(adapter={config.ble_adapter}, "
+        f"interval={config.scan_contention_adapter_reset_interval_seconds}s)."
     )
 
     suspend_flag_path = sentry_flag.flag_path()
@@ -1417,21 +1494,45 @@ async def run() -> None:
                         await asyncio.sleep(config.post_interval_seconds)
 
                     if scan_retry_attempt >= config.scan_contention_max_attempts_before_reset:
-                        # Persistent contention: emit a throttled heartbeat instead
-                        # of a line per reset so a permanently stuck radio stays
-                        # visible without flooding the logs.
+                        scan_retry_attempt = 0
+                        # Refresh: the backoff (+ optional cooldown) sleeps above
+                        # mean the `now` captured at the top of the branch is stale
+                        # by up to tens of seconds, which would skew both the
+                        # elapsed report and the reset/heartbeat throttles.
+                        now = time.monotonic()
+                        elapsed = int(now - contention_since_monotonic)
+                        # Persistent contention won't clear by re-issuing
+                        # StartDiscovery (that's the call that keeps failing), so
+                        # periodically power-cycle the adapter to break a wedged
+                        # discovery session. Throttled so we don't thrash the radio.
                         if (
+                            config.scan_contention_adapter_reset_enabled
+                            and now - last_adapter_reset_monotonic
+                            >= config.scan_contention_adapter_reset_interval_seconds
+                        ):
+                            last_adapter_reset_monotonic = now
+                            last_contention_log_monotonic = now
+                            logger.warning(
+                                "BlueZ scan-start contention persisting for %ds; "
+                                "power-cycling %s to clear a stuck discovery session.",
+                                elapsed,
+                                config.ble_adapter,
+                            )
+                            await _reset_ble_adapter(config.ble_adapter)
+                        elif (
                             now - last_contention_log_monotonic
                             >= config.scan_contention_summary_interval_seconds
                         ):
+                            # Reset disabled or between reset attempts: keep a
+                            # throttled heartbeat so a stuck radio stays visible
+                            # without flooding the logs.
+                            last_contention_log_monotonic = now
                             logger.warning(
                                 "BlueZ scan-start contention persisting for %ds; still "
                                 "unable to start scans. Check for competing BLE "
                                 "scanners on the host.",
-                                int(now - contention_since_monotonic),
+                                elapsed,
                             )
-                            last_contention_log_monotonic = now
-                        scan_retry_attempt = 0
                         await asyncio.sleep(config.post_interval_seconds)
                     continue
 

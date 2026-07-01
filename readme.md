@@ -272,7 +272,15 @@ The following patterns are expected during supervised updates and should not be 
    * Signatures:
      * `org.bluez.Error.InProgress`
      * `BlueZ scan-start contention detected`
-   * Recovery order:
+   * Automated recovery (default on): once contention is persistent, `ble-sensor`
+     power-cycles the adapter over BlueZ D-Bus (`Adapter1.Powered` off→on, the
+     equivalent of `hciconfig hci0 reset`) to clear a wedged discovery session,
+     retrying at most once per `SCAN_CONTENTION_ADAPTER_RESET_INTERVAL_SECONDS`
+     (default 300s). Re-issuing `StartDiscovery` alone can never clear this — it
+     is the call that keeps failing. Disable with
+     `SCAN_CONTENTION_ADAPTER_RESET_ENABLED=false`; target a non-default radio
+     with `BLE_ADAPTER`.
+   * Manual recovery order (if the automated reset can't clear it):
      1. First, restart only the `ble-sensor` service.
      2. If BLE scan start remains stuck, reboot the device from the Balena Dashboard to power-cycle `hci0`.
    * Prevention:
