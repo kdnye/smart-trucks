@@ -49,8 +49,16 @@ stream**. Each is written up below as a self-contained project.
    `event_type`** and uses different names (`last_gps_fix_utc`, `wifi_state` string,
    `process_state`, `queue_depth`, `last_upload_success_utc=None`). Because
    `edge_health` is in `SYNC_TABLES`, `sync-service` POSTs these rows too — but the
-   cloud **rejects** them (missing `event_type`), after which the edge marks them sent
-   and purges them. Pure wasted bandwidth + a confusing duplicate schema.
+   cloud **rejects** them (missing `event_type`; the ingest fn returns `400` only when
+   *every* event in a batch is rejected, else `200`). `sync-service` marks rows sent
+   only on a `2xx` (`sync-service/main.py:225-226`); on a `4xx` it just increments
+   attempts (`main.py:235-236`) and never marks them sent. So a batch containing **only**
+   reduced `edge_health` rows gets `400` → those rows keep `sent_at_utc IS NULL` forever,
+   are never ingested, and are never purged (`purge_old_sent_rows` only deletes
+   `sent_at_utc IS NOT NULL` rows) — they **accumulate indefinitely** in local SQLite (a
+   disk-space leak) while `attempt_count` climbs. When they instead ride along in a mixed
+   `2xx` batch, they're silently marked sent and their data is dropped. Either way: wasted
+   bandwidth, likely local disk bloat, and a confusing duplicate schema.
 
 Downstream, the cloud's `edge_health_events` table therefore never receives
 `uploader_ok`, `last_upload_success_age_sec`, `queue_depth`, or `process_state` (see
@@ -72,7 +80,10 @@ sync path (drop it from `SYNC_TABLES`), keeping only the live `heartbeats`-table
 `queue_depth`, `process_state`, `uploader_ok`, and a real `last_upload_success_utc`
 (currently hardcoded `None`) plus a derived `last_upload_success_age_sec`. Wiring a
 real upload-success timestamp means `sync-service` recording its last successful POST
-time where `maintenance_worker` can read it.
+time where `maintenance_worker` can read it. Also update `EDGE_DASHBOARD_CONTRACT.md`
+to match — it currently lists `edge_health` under "3.1 Tables we keep" (line 98) and
+tells `sync-service` to drain `edge_health` in "4. Required edge code changes"
+(line 272); both should be revised once the local table is removed.
 
 **Acceptance / verification.** After the change, exactly one `edge_health` event per
 cycle leaves the Pi, the cloud accepts it, and every `edge_health_events` column
