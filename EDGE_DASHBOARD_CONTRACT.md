@@ -244,6 +244,49 @@ that omits it leaves the prior dashboard value untouched (`COALESCE`).
 keep the existing column-projecting shape consumed by
 `_insert_edge_health_event`.
 
+#### ATOM Lite anchor extension (`observer_id`)
+
+Sites with M5 ATOM Lite BLE anchors (see `anchor-firmware/README.md`) ship
+additional `ble_sensor_scan` payloads — one per anchor report — through the
+same `ble_scans` queue. They carry three additive fields consumers may ignore:
+
+```jsonc
+{
+  "event_type": "ble_sensor_scan",
+  "vehicle_id": "TRK-905",
+  "pi_id": "smart-truck-pi-01",
+  "observer_id": "anchor-a1b2c3",   // vantage point; == pi_id on the Pi's own scans
+  "parent_pi_id": "smart-truck-pi-01",
+  "captured_at_utc": "2026-07-01T12:00:00Z",   // Pi receipt time (anchors have no clock)
+  "idempotency_key": "TRK-905:ble_sensor_scan:2026-07-01T12:00:00Z:anchor-a1b2c3:42:0",
+  "scan_duration_seconds": 15,       // the anchor's aggregation window
+  "sensor_count": 1,
+  "sensors": [
+    {
+      "device_id": "A4:C1:38:11:22:33",
+      "mac_address": "A4:C1:38:11:22:33",
+      "rssi": -67,                   // median RSSI over the anchor's window
+      "device_type": "Govee",
+      "metadata": { "max_rssi": -60, "sample_count": 5, "source": "ble_anchor" }
+    }
+  ],
+  "pi_location": { "latitude": 41.96, "longitude": -88.02, "fix_status": "locked", "location_age_sec": 12 },
+  "anchor": {                        // upserts ble_anchor_registry cloud-side
+    "anchor_id": "anchor-a1b2c3",
+    "gateway_id": "anchor-ffeedd",
+    "link_rssi": -58,                // ESP-NOW RSSI anchor->gateway (ranging signal)
+    "fw": "1.0.0", "uptime_s": 3600, "free_heap": 123456, "seq": 42
+  }
+}
+```
+
+Anchor **heartbeats** ride the same shape with `sensor_count: 0` (liveness +
+registry upsert only, no sightings). The cloud worker projects `observer_id`
+into `ble_asset_sightings.observer_id` (NULL ⇒ the Pi itself) and the `anchor`
+block into `ble_anchor_registry`. The Pi's own scans now also carry
+`observer_id == pi_id`; older payloads without the field are unchanged
+semantics.
+
 `unified_heartbeat`, `ble_sensor_scan` continue to be **accepted** by the
 ingest endpoint (backward compat for older Pis) but are no longer **emitted**
 by current edge builds. After all fleet devices are on the new build, those

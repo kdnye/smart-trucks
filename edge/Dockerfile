@@ -16,10 +16,11 @@ WORKDIR /usr/src/app
 
 # build-essential compiles uvloop + aiohttp C extensions (no armv7 wheels) and is
 # purged afterward to keep the image slim. i2c-tools + python3-smbus drive the
-# IMU; coreutils provides stty for the GPS UART.
+# IMU; coreutils provides stty for the GPS UART; mosquitto is the loopback-only
+# MQTT broker for the ATOM Lite anchor pipeline (see edge/mosquitto.conf).
 COPY edge/requirements.txt .
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential i2c-tools python3-smbus coreutils \
+    && apt-get install -y --no-install-recommends build-essential i2c-tools python3-smbus coreutils mosquitto \
     && pip install --no-cache-dir -r requirements.txt \
     && apt-get purge -y --auto-remove build-essential \
     && apt-get clean \
@@ -29,6 +30,8 @@ COPY shared/ /usr/src/app/shared/
 COPY telematics-edge/ /usr/src/app/telematics-edge/
 COPY ble-sensor/ /usr/src/app/ble-sensor/
 COPY sync-service/ /usr/src/app/sync-service/
+COPY anchor-bridge/ /usr/src/app/anchor-bridge/
+COPY edge/mosquitto.conf /usr/src/app/edge/mosquitto.conf
 COPY edge/start.sh /usr/src/app/start.sh
 RUN chmod +x /usr/src/app/start.sh
 
